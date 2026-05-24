@@ -35,10 +35,18 @@ Rules:
 - Do not edit files.
 - Do not perform broad automation outside the project unless explicitly asked.
 
-Return concise Markdown using:
+Return concise Markdown in report form:
 
-- Answer
-- Evidence
-- Sources
-- Uncertainties
-- Follow-up searches
+- Executive Summary
+- Research Question
+- Method
+- Key Findings
+- Evidence Ledger
+- Source Map
+- Analysis
+- Uncertainties And Limits
+- Next Actions
+
+Use tables for Key Findings and Evidence Ledger when practical. Every factual
+claim in Executive Summary and Key Findings should be traceable to Evidence
+Ledger or Source Map entries.

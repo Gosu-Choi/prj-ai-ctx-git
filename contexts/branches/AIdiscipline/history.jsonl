@@ -1,1 +1,5 @@
 {"branch": "AIdiscipline", "createdAt": "2026-05-24T12:35:08Z", "role": "user", "schemaVersion": 1, "text": "What disciplines or rituals help me use AI without outsourcing my judgment?"}
+{"branch": "AIdiscipline", "createdAt": "2026-05-24T12:57:43Z", "role": "user", "schemaVersion": 1, "text": "AI 사용하는 애들은 누구누구 있는지 말해봐"}
+{"branch": "AIdiscipline", "createdAt": "2026-05-24T13:09:18Z", "role": "user", "schemaVersion": 1, "text": "ai 사용하는 애들은 누구누구 있는지 짧게 말해봐"}
+{"artifacts": [], "branch": "AIdiscipline", "createdAt": "2026-05-24T13:09:29Z", "provider": "codex", "role": "assistant", "schemaVersion": 1, "text": "특정 몇 명이라기보다, 학생, 개발자, 디자이너, 마케터, 연구자, 작가, 기획자, 창업자, 직장인들이 많이 써요. 용도는 글쓰기, 코딩, 조사, 요약, 아이디어 정리, 자동화가 많습니다."}
+{"branch": "AIdiscipline", "createdAt": "2026-05-24T13:10:21Z", "role": "user", "schemaVersion": 1, "text": "이제 좀 길게 문서로 정리해봐. 영역으로, 코딩, 글쓰기, 그림 말고 또 뭐 있나? 다 저거 안으로 귀결이 되지 않나 싶은데, 리뷰 논문 기반으로 해서 좀 찾아서 정리해봐."}

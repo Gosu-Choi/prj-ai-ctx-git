@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ctxgit</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-title">ctxgit</div>
+          <div class="brand-subtitle">Git-backed research chat</div>
+        </div>
+
+        <section class="sidebar-section">
+          <div class="section-title">Project</div>
+          <div id="projectSummary" class="git-summary"></div>
+          <form id="projectForm" class="project-form">
+            <input id="projectPathInput" type="text" placeholder="/path/to/project" />
+            <div class="project-buttons">
+              <button id="openProjectButton" type="submit">Open</button>
+              <button id="initProjectButton" type="button">Init/Open</button>
+              <button id="browseProjectButton" type="button">Browse</button>
+            </div>
+            <div id="projectStatus" class="settings-status"></div>
+          </form>
+          <div id="recentProjects" class="recent-projects"></div>
+          <div id="projectBrowser" class="project-browser"></div>
+        </section>
+
+        <section class="sidebar-section">
+          <div class="section-title">Branches</div>
+          <div id="branchList" class="nav-list"></div>
+        </section>
+
+        <section class="sidebar-section">
+          <div class="section-title">Views</div>
+          <div id="viewList" class="nav-list"></div>
+        </section>
+
+        <section class="sidebar-section">
+          <div class="section-title">Git</div>
+          <div id="gitSummary" class="git-summary"></div>
+          <button id="refreshButton" class="wide-button" type="button">Refresh</button>
+        </section>
+
+        <section class="sidebar-section">
+          <div class="section-title">LLM Provider</div>
+          <div id="providerSummary" class="git-summary"></div>
+          <form id="providerSettings" class="provider-settings">
+            <label class="checkbox-label">
+              <input id="webSearchInput" type="checkbox" />
+              <span>Web search</span>
+            </label>
+            <label for="timeoutSecondsInput">Timeout seconds</label>
+            <div class="settings-row">
+              <input id="timeoutSecondsInput" min="1" step="1" type="number" />
+              <button id="saveProviderButton" type="submit">Save</button>
+            </div>
+            <div id="providerSettingsStatus" class="settings-status"></div>
+          </form>
+        </section>
+      </aside>
+
+      <main class="workspace">
+        <header class="topbar">
+          <div>
+            <div id="activeTitle" class="active-title">No branch selected</div>
+            <div id="activeMeta" class="active-meta"></div>
+          </div>
+          <div class="tabs" role="tablist">
+            <button class="tab active" data-tab="chat" type="button">Chat</button>
+            <button class="tab" data-tab="report" type="button">Report</button>
+            <button class="tab" data-tab="version" type="button">Version</button>
+          </div>
+        </header>
+
+        <section id="chatTab" class="tab-panel active">
+          <div id="messageList" class="message-list"></div>
+          <form id="composer" class="composer">
+            <textarea id="messageInput" rows="3" placeholder="Ask the branch-aware AI"></textarea>
+            <button id="sendButton" type="submit">Send</button>
+            <button id="appendOnlyButton" type="button">Append only</button>
+          </form>
+        </section>
+
+        <section id="reportTab" class="tab-panel">
+          <article id="reportView" class="markdown"></article>
+        </section>
+
+        <section id="versionTab" class="tab-panel">
+          <div class="version-grid">
+            <section>
+              <h2>Tracked Files</h2>
+              <dl id="trackedFiles" class="definition-list"></dl>
+            </section>
+            <section>
+              <h2>Branch History Log</h2>
+              <pre id="historyLog" class="code-block"></pre>
+            </section>
+            <section>
+              <h2>Current Diff</h2>
+              <pre id="currentDiff" class="code-block"></pre>
+            </section>
+            <section>
+              <h2>Research Notes And Artifacts</h2>
+              <div id="researchList" class="document-list"></div>
+            </section>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

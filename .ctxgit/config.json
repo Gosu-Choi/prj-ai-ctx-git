@@ -2,5 +2,14 @@
   "contextsDir": "contexts",
   "createdAt": "2026-05-24T12:35:08Z",
   "defaultResearchProvider": "opencode",
+  "llm": {
+    "codex": {
+      "bin": "codex",
+      "model": "",
+      "timeoutSeconds": 6000,
+      "webSearch": true
+    },
+    "provider": "codex"
+  },
   "schemaVersion": 1
 }
