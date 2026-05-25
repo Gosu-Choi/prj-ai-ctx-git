@@ -31,6 +31,7 @@ ctxgit branch AItrust --title "AI trust"
 ctxgit branch AIdiscipline --title "AI discipline"
 ctxgit append AItrust --role user "What makes an AI trustworthy?"
 ctxgit merge-view AItrust AIdiscipline --name trust-discipline
+ctxgit merge AItrust AIdiscipline --name integrated-research
 ```
 
 `ctxgit init` creates `.ctxgit/` and `contexts/`; it also runs `git init` when
@@ -59,15 +60,37 @@ The installer adds this repo's `bin\` folder to the user `PATH`. Windows uses
 
 ## Research
 
-OpenCode-backed agentic research:
+Hybrid research is the default:
 
 ```bash
 ctxgit research AItrust \
-  "current research on AI trust calibration" \
-  --provider opencode
+  "current research on AI trust calibration"
 ```
 
-Direct Brave LLM Context retrieval:
+Hybrid research collects sources before synthesis. It uses Brave Web Search and
+Brave LLM Context when `BRAVE_API_KEY` is set, and also queries scholarly
+indexes such as Semantic Scholar, Crossref, and arXiv to avoid relying on a
+single search surface. The final note is synthesized from collected source
+records and includes coverage and hallucination-check sections instead of
+forcing a rigid report template.
+
+For hallucination control, ctxgit stores the collected source records in the
+note, fetches readable excerpts from a bounded number of URLs, warns when source
+coverage is thin, and refuses to synthesize claims if zero sources were
+collected.
+
+Set `BRAVE_API_KEY` either in the shell environment or in the ctxgit repository
+`.env` file:
+
+```dotenv
+BRAVE_API_KEY=...
+```
+
+The repository includes `.env.example`; copy it to `.env` and fill the key.
+`.env` is ignored by Git. A project-local `.ctxgit/.env` can still override the
+shared repository value when needed.
+
+Direct Brave retrieval is still available:
 
 ```bash
 export BRAVE_API_KEY=...
@@ -78,7 +101,76 @@ ctxgit research AItrust \
 ```
 
 The project-level OpenCode research agent lives at
-`.opencode/agents/research.md`.
+`.opencode/agents/research.md` and is used for synthesis in hybrid mode.
+
+## Source Files
+
+Branch-local source files live under `contexts/branches/<branch>/sources/`.
+Chat turns automatically try to ingest readable source files from that folder
+before calling the model. Text-like files are copied/extracted directly; PDFs
+are extracted when `pypdf`, `PyPDF2`, or `pdftotext` is available, otherwise the
+file is recorded with `needs-extractor` status so the missing capability is
+visible.
+
+You can also ingest a file explicitly:
+
+```bash
+ctxgit ingest initial ./paper.pdf
+```
+
+## Agent Memory
+
+Project-level agent instructions and memory live under `contexts/`:
+
+- `contexts/AGENTS.md`
+- `contexts/USER.md`
+- `contexts/MEMORY.md`
+- `contexts/agents/`
+
+These files are global to the opened project. They are not branch-local and are
+not copied or merged when ctxgit branches are merged. `.ctxgit/` is reserved
+for tool configuration and metadata; AI prompts are built from `contexts/` so
+the operational context is visible and Git-reviewable.
+
+On first `ctxgit init`, ctxgit also looks for an existing workspace context
+folder in the project root, such as `workspace/`, `openclaw-workspace/`, or
+`.openclaw/workspace/`. If it finds OpenClaw-style memory files like
+`MEMORY.md`, `AGENTS.md`, `SOUL.md`, `DREAMS.md`, or `memory/*.md`, it imports a
+reviewable digest into `contexts/imports/workspace-summary.md` and seeds the
+`initial` branch with a system history entry that points to that summary.
+Top-level uppercase OpenClaw files such as `AGENTS.md`, `USER.md`, `MEMORY.md`,
+`SOUL.md`, `TOOLS.md`, and `DREAMS.md` are also copied verbatim into
+`contexts/imports/workspace-files/`; `AGENTS.md`, `USER.md`, and `MEMORY.md` are
+appended into the matching ctxgit global files, while the others are appended
+under `contexts/MEMORY.md` with provenance-only source headers. Runtime prompts
+use the copied files under `contexts/`; deleting the original workspace does
+not remove the imported AI context.
+
+If the workspace lives somewhere else or the project is already initialized,
+import it explicitly:
+
+```bash
+ctxgit import-workspace C:\Users\work\Desktop\openclaw\workspace
+```
+
+You can also combine this with first initialization:
+
+```bash
+ctxgit init --import-workspace C:\Users\work\Desktop\openclaw\workspace
+```
+
+## Branch Merge
+
+`ctxgit merge` creates a new ctxgit branch from two or more source branches:
+
+```bash
+ctxgit merge AItrust AIdiscipline --name integrated-research
+```
+
+The merged branch starts with a summarized system history entry. Source branch
+histories are archived under
+`contexts/branches/<merged>/archives/<source>/history.jsonl` and can be viewed
+from the UI's Archives tab.
 
 ## Chat Interface
 
@@ -98,7 +190,12 @@ project keeps its own version-managed conversation history.
 
 The primary `Send` button calls the configured LLM provider. The default
 provider is OpenAI Codex through the local `codex` CLI, using its existing
-ChatGPT OAuth login:
+ChatGPT OAuth login. ctxgit runs Codex with `--sandbox workspace-write` by
+default, so chat turns can edit files inside the opened project workspace
+without asking for per-edit approval. If a turn needs to write outside the
+opened project, the assistant must request approval first; approving it reruns
+that turn with only the approved external directory added through Codex
+`--add-dir`.
 
 ```bash
 codex login status
@@ -111,10 +208,23 @@ One chat turn always records the user message and assistant reply in
 `history.jsonl`. It may also create zero, one, or many markdown artifacts under
 `contexts/branches/<branch>/artifacts/`.
 
+The UI `Research` button runs the hybrid research pipeline for the selected
+branch and writes the request plus result pointer into `history.jsonl`. The
+research report itself is saved under `contexts/branches/<branch>/research/`.
+
+Long histories are not truncated to a fixed message count. ctxgit keeps raw
+history append-only and, once a branch grows past the compaction threshold,
+uses the configured LLM to write reviewable summaries under
+`contexts/branches/<branch>/compactions/`. If AI compaction is unavailable,
+ctxgit writes an explicit extractive fallback summary and marks it as fallback.
+Future chat and research prompts include project memory, branch context,
+source-file extracts, compactions, and the most relevant raw history selected
+within the configured context budget.
+
 ## Report Shape
 
-Branch contexts and research notes are meant to read like managed research
-reports, not loose chat notes. The default sections are:
+Branch contexts are meant to read like managed research reports, not loose chat
+notes. The default branch report has these sections:
 
 - Executive Summary
 - Research Question
@@ -127,3 +237,7 @@ reports, not loose chat notes. The default sections are:
 - Source Map
 - Next Actions
 - Change Log
+
+Research notes are flexible. They should use headings that fit the request,
+especially for literature review work where the important unit is often paper
+coverage, argument mapping, and claim support rather than a fixed RQ template.

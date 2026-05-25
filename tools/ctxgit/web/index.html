@@ -26,8 +26,6 @@
             </div>
             <div id="projectStatus" class="settings-status"></div>
           </form>
-          <div id="recentProjects" class="recent-projects"></div>
-          <div id="projectBrowser" class="project-browser"></div>
         </section>
 
         <section class="sidebar-section">
@@ -38,6 +36,16 @@
         <section class="sidebar-section">
           <div class="section-title">Views</div>
           <div id="viewList" class="nav-list"></div>
+        </section>
+
+        <section class="sidebar-section">
+          <div class="section-title">Merge</div>
+          <form id="mergeForm" class="merge-form">
+            <input id="mergeSourcesInput" type="text" placeholder="source branches" />
+            <input id="mergeNameInput" type="text" placeholder="new branch id" />
+            <button id="mergeButton" type="submit">Merge</button>
+            <div id="mergeStatus" class="settings-status"></div>
+          </form>
         </section>
 
         <section class="sidebar-section">
@@ -59,6 +67,11 @@
               <input id="timeoutSecondsInput" min="1" step="1" type="number" />
               <button id="saveProviderButton" type="submit">Save</button>
             </div>
+            <label for="sandboxInput">File access</label>
+            <select id="sandboxInput">
+              <option value="workspace-write">Project write</option>
+              <option value="read-only">Read only</option>
+            </select>
             <div id="providerSettingsStatus" class="settings-status"></div>
           </form>
         </section>
@@ -73,21 +86,50 @@
           <div class="tabs" role="tablist">
             <button class="tab active" data-tab="chat" type="button">Chat</button>
             <button class="tab" data-tab="report" type="button">Report</button>
+            <button class="tab" data-tab="archives" type="button">Archives</button>
             <button class="tab" data-tab="version" type="button">Version</button>
           </div>
         </header>
 
         <section id="chatTab" class="tab-panel active">
-          <div id="messageList" class="message-list"></div>
-          <form id="composer" class="composer">
-            <textarea id="messageInput" rows="3" placeholder="Ask the branch-aware AI"></textarea>
-            <button id="sendButton" type="submit">Send</button>
-            <button id="appendOnlyButton" type="button">Append only</button>
-          </form>
+          <div class="chat-main">
+            <div id="messageList" class="message-list"></div>
+            <div id="progressPanel" class="progress-panel" hidden>
+              <div id="progressTitle" class="progress-title"></div>
+              <div id="progressEvents" class="progress-events"></div>
+            </div>
+            <form id="composer" class="composer">
+              <textarea id="messageInput" rows="3" placeholder="Ask the branch-aware AI"></textarea>
+              <button id="sendButton" type="submit">Send</button>
+              <button id="researchButton" type="button">Research</button>
+              <button id="historyChatButton" type="button">Info chat</button>
+            </form>
+          </div>
+          <aside id="eventPanel" class="event-panel" hidden>
+            <div class="event-panel-header">
+              <span>Events</span>
+              <div class="event-header-actions">
+                <span id="eventStatus" class="event-status"></span>
+                <button id="copyEventLogButton" type="button">로그 복사</button>
+              </div>
+            </div>
+            <div id="eventCopyStatus" class="event-copy-status"></div>
+            <div id="eventMeta" class="event-meta"></div>
+            <div id="eventList" class="event-list"></div>
+          </aside>
         </section>
 
         <section id="reportTab" class="tab-panel">
           <article id="reportView" class="markdown"></article>
+        </section>
+
+        <section id="archivesTab" class="tab-panel">
+          <div class="archive-layout">
+            <aside id="archiveList" class="archive-list"></aside>
+            <section id="archiveViewer" class="archive-viewer">
+              <div class="muted">No archived source branch selected.</div>
+            </section>
+          </div>
         </section>
 
         <section id="versionTab" class="tab-panel">

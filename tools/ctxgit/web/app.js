@@ -1,11 +1,14 @@
 const state = {
   project: null,
-  browser: null,
   activeBranch: null,
   branches: [],
   views: [],
   payload: null,
   provider: null,
+  currentJob: null,
+  jobs: {},
+  branchJobs: {},
+  startingBranches: {},
 };
 
 const els = {
@@ -16,21 +19,37 @@ const els = {
   initProjectButton: document.querySelector("#initProjectButton"),
   browseProjectButton: document.querySelector("#browseProjectButton"),
   projectStatus: document.querySelector("#projectStatus"),
-  recentProjects: document.querySelector("#recentProjects"),
-  projectBrowser: document.querySelector("#projectBrowser"),
   branchList: document.querySelector("#branchList"),
   viewList: document.querySelector("#viewList"),
   gitSummary: document.querySelector("#gitSummary"),
   providerSummary: document.querySelector("#providerSummary"),
+  mergeForm: document.querySelector("#mergeForm"),
+  mergeSourcesInput: document.querySelector("#mergeSourcesInput"),
+  mergeNameInput: document.querySelector("#mergeNameInput"),
+  mergeButton: document.querySelector("#mergeButton"),
+  mergeStatus: document.querySelector("#mergeStatus"),
   providerSettings: document.querySelector("#providerSettings"),
   webSearchInput: document.querySelector("#webSearchInput"),
   timeoutSecondsInput: document.querySelector("#timeoutSecondsInput"),
+  sandboxInput: document.querySelector("#sandboxInput"),
   saveProviderButton: document.querySelector("#saveProviderButton"),
   providerSettingsStatus: document.querySelector("#providerSettingsStatus"),
   activeTitle: document.querySelector("#activeTitle"),
   activeMeta: document.querySelector("#activeMeta"),
+  chatTab: document.querySelector("#chatTab"),
   messageList: document.querySelector("#messageList"),
+  progressPanel: document.querySelector("#progressPanel"),
+  progressTitle: document.querySelector("#progressTitle"),
+  progressEvents: document.querySelector("#progressEvents"),
+  eventPanel: document.querySelector("#eventPanel"),
+  eventStatus: document.querySelector("#eventStatus"),
+  copyEventLogButton: document.querySelector("#copyEventLogButton"),
+  eventCopyStatus: document.querySelector("#eventCopyStatus"),
+  eventMeta: document.querySelector("#eventMeta"),
+  eventList: document.querySelector("#eventList"),
   reportView: document.querySelector("#reportView"),
+  archiveList: document.querySelector("#archiveList"),
+  archiveViewer: document.querySelector("#archiveViewer"),
   trackedFiles: document.querySelector("#trackedFiles"),
   historyLog: document.querySelector("#historyLog"),
   currentDiff: document.querySelector("#currentDiff"),
@@ -38,7 +57,8 @@ const els = {
   composer: document.querySelector("#composer"),
   messageInput: document.querySelector("#messageInput"),
   sendButton: document.querySelector("#sendButton"),
-  appendOnlyButton: document.querySelector("#appendOnlyButton"),
+  researchButton: document.querySelector("#researchButton"),
+  historyChatButton: document.querySelector("#historyChatButton"),
   refreshButton: document.querySelector("#refreshButton"),
 };
 
@@ -79,10 +99,56 @@ async function api(path, options = {}) {
   return payload;
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function formatEventTime(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function formatDuration(seconds) {
+  const total = Number.parseInt(seconds, 10);
+  if (!Number.isFinite(total) || total < 0) return "0s";
+  const minutes = Math.floor(total / 60);
+  const rest = total % 60;
+  return minutes ? `${minutes}m ${rest}s` : `${rest}s`;
+}
+
 function renderInline(text) {
   return escapeHtml(text)
     .replace(/`([^`]+)`/g, "<code>$1</code>")
     .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+}
+
+function projectAbsolutePath(path) {
+  const root = state.project?.path || "";
+  if (!root) return path;
+  const separator = root.includes("\\") || /^[A-Za-z]:/.test(root) ? "\\" : "/";
+  const cleanRoot = root.replace(/[\\/]+$/, "");
+  const cleanPath = String(path || "").replace(/^[\\/]+/, "");
+  return `${cleanRoot}${separator}${cleanPath.replace(/[\\/]+/g, separator)}`;
+}
+
+function obsidianFileUrl(path) {
+  const absolutePath = projectAbsolutePath(path);
+  return `obsidian://open?path=${encodeURIComponent(absolutePath)}&paneType=tab`;
+}
+
+function renderProjectFileLinks(text) {
+  const escaped = escapeHtml(text);
+  return escaped.replace(
+    /(^|[\s(`])((?:contexts|\.ctxgit)\/[^\s<>"'`)]*\.(?:md|txt|json|jsonl|pdf|csv|tsv|html?))/g,
+    (_match, prefix, path) =>
+      `${prefix}<a class="file-link" href="${escapeHtml(obsidianFileUrl(path))}" title="Open in Obsidian">${path}</a>`,
+  );
+}
+
+function renderMessageText(text) {
+  return renderProjectFileLinks(text);
 }
 
 function renderMarkdown(markdown) {
@@ -170,12 +236,17 @@ function clearWorkspace(message = "Select or initialize a ctxgit project.") {
   els.activeMeta.textContent = message;
   els.messageList.innerHTML = `<div class="muted">${escapeHtml(message)}</div>`;
   els.reportView.innerHTML = "";
+  els.archiveList.innerHTML = "";
+  els.archiveViewer.innerHTML = '<div class="muted">No archived source branch selected.</div>';
   els.trackedFiles.innerHTML = "";
   els.historyLog.textContent = "";
   els.currentDiff.textContent = "";
   els.researchList.innerHTML = "";
   els.gitSummary.innerHTML = "";
   els.providerSummary.innerHTML = "";
+  els.mergeStatus.textContent = "";
+  hideProgress();
+  hideEventPanel();
 }
 
 function renderProject(project) {
@@ -189,69 +260,75 @@ function renderProject(project) {
     <div class="muted">${escapeHtml(path)}</div>
     <div class="muted">ctxgit: ${initialized ? "ready" : "not initialized"} · git: ${gitInitialized ? "ready" : "not initialized"}</div>
   `;
-  els.recentProjects.innerHTML =
-    (project?.recent || [])
-      .map(
-        (recentPath) => `
-          <button class="recent-project" data-project-path="${escapeHtml(recentPath)}" type="button">
-            ${escapeHtml(recentPath)}
-          </button>
-        `,
-      )
-      .join("");
-  els.recentProjects.querySelectorAll("[data-project-path]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      els.projectPathInput.value = button.dataset.projectPath;
-      await openProject(button.dataset.projectPath, { init: false });
-    });
-  });
-}
-
-function renderBrowser(browser) {
-  state.browser = browser;
-  els.projectBrowser.innerHTML = `
-    <div class="browser-path">${escapeHtml(browser.path)}</div>
-    <div class="browser-row">
-      <button class="browser-button" data-browse-path="${escapeHtml(browser.parent || browser.path)}" type="button">..</button>
-      <button class="browser-button" data-use-path="${escapeHtml(browser.path)}" type="button">Use</button>
-    </div>
-    ${browser.entries
-      .map(
-        (entry) => `
-          <div class="browser-row">
-            <button class="browser-button" data-browse-path="${escapeHtml(entry.path)}" type="button">
-              ${escapeHtml(entry.name)}${entry.initialized ? " · ctxgit" : ""}${entry.gitInitialized ? " · git" : ""}
-            </button>
-            <button class="browser-button" data-use-path="${escapeHtml(entry.path)}" type="button">Use</button>
-          </div>
-        `,
-      )
-      .join("")}
-  `;
-  els.projectBrowser.querySelectorAll("[data-browse-path]").forEach((button) => {
-    button.addEventListener("click", () => browseProject(button.dataset.browsePath));
-  });
-  els.projectBrowser.querySelectorAll("[data-use-path]").forEach((button) => {
-    button.addEventListener("click", () => {
-      els.projectPathInput.value = button.dataset.usePath;
-      setProjectStatus("Path selected. Open or Init/Open.", "");
-    });
-  });
 }
 
 function renderBranches() {
   els.branchList.innerHTML = state.branches
-    .map(
-      (branch) => `
-        <button class="nav-item ${branch.id === state.activeBranch ? "active" : ""}" data-branch="${escapeHtml(branch.id)}" type="button">
-          <span class="nav-title">${escapeHtml(branch.title)}</span>
-          <span class="nav-meta">${escapeHtml(branch.id)} · ${branch.historyCount} messages</span>
-        </button>
-      `,
-    )
+    .map((branch) => {
+      const job = branchJob(branch.id);
+      const jobLabel =
+        job?.status === "running"
+          ? ` · 실행 중 ${job.mode || job.kind || "job"}`
+          : job?.status === "failed"
+          ? " · 최근 작업 실패"
+          : "";
+      return `
+        <div class="branch-row ${branch.id === state.activeBranch ? "active" : ""}">
+          <button class="nav-item branch-main ${branch.id === state.activeBranch ? "active" : ""}" data-branch="${escapeHtml(branch.id)}" type="button">
+            <span class="nav-title">${escapeHtml(branch.title)}</span>
+            <span class="nav-meta">${escapeHtml(branch.id)} · ${branch.historyCount} messages${escapeHtml(jobLabel)}</span>
+          </button>
+          <button class="branch-options-button" data-branch-options="${escapeHtml(branch.id)}" type="button" aria-label="Branch options">...</button>
+          <div class="branch-options-menu">
+            <button data-branch-rename="${escapeHtml(branch.id)}" data-branch-title="${escapeHtml(branch.title)}" type="button">Rename branch</button>
+            <button data-branch-clone="${escapeHtml(branch.id)}" type="button">Clone branch</button>
+            <button class="danger" data-branch-remove="${escapeHtml(branch.id)}" type="button">Remove branch</button>
+          </div>
+        </div>
+      `;
+    })
     .join("") || '<div class="muted">No branches yet</div>';
   els.branchList.querySelectorAll("[data-branch]").forEach((button) => {
     button.addEventListener("click", () => loadBranch(button.dataset.branch));
+  });
+  els.branchList.querySelectorAll("[data-branch-options]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const row = button.closest(".branch-row");
+      const wasOpen = row.classList.contains("open");
+      closeBranchMenus();
+      row.classList.toggle("open", !wasOpen);
+    });
+  });
+  els.branchList.querySelectorAll("[data-branch-clone]").forEach((button) => {
+    button.addEventListener("click", async (event) => {
+      event.stopPropagation();
+      closeBranchMenus();
+      const source = button.dataset.branchClone;
+      const target = window.prompt(`Clone ${source} as:`, `${source}-copy`);
+      if (!target) return;
+      await cloneBranch(source, target.trim());
+    });
+  });
+  els.branchList.querySelectorAll("[data-branch-rename]").forEach((button) => {
+    button.addEventListener("click", async (event) => {
+      event.stopPropagation();
+      closeBranchMenus();
+      const branch = button.dataset.branchRename;
+      const currentTitle = button.dataset.branchTitle || branch;
+      const title = window.prompt(`Rename ${branch} to:`, currentTitle);
+      if (!title) return;
+      await renameBranch(branch, title.trim());
+    });
+  });
+  els.branchList.querySelectorAll("[data-branch-remove]").forEach((button) => {
+    button.addEventListener("click", async (event) => {
+      event.stopPropagation();
+      closeBranchMenus();
+      const branch = button.dataset.branchRemove;
+      if (!window.confirm(`Remove branch "${branch}"? This deletes its ctxgit files from the project.`)) return;
+      await removeBranch(branch);
+    });
   });
 
   els.viewList.innerHTML =
@@ -270,6 +347,10 @@ function renderBranches() {
   });
 }
 
+function closeBranchMenus() {
+  document.querySelectorAll(".branch-row.open").forEach((row) => row.classList.remove("open"));
+}
+
 function renderGit(status) {
   els.gitSummary.innerHTML = `
     <div>Branch: <strong>${escapeHtml(status.branch || "(none)")}</strong></div>
@@ -281,10 +362,17 @@ function renderProvider(status) {
   state.provider = status;
   const webSearch = status.webSearch === false ? "off" : "on";
   const timeoutSeconds = status.timeoutSeconds || 900;
+  const sandbox = status.sandbox || "workspace-write";
+  const braveStatus = status.braveApiKeyConfigured
+    ? `configured via ${status.braveApiKeySource || "environment"}`
+    : "not configured";
   els.providerSummary.innerHTML = `
     <div>Provider: <strong>${escapeHtml(status.provider || "codex")}</strong></div>
     <div>${escapeHtml(status.message || status.status || "")}</div>
     <div class="muted">Web search: ${webSearch} · Timeout: ${escapeHtml(String(timeoutSeconds))}s</div>
+    <div class="muted">Brave search: ${escapeHtml(braveStatus)}</div>
+    <div class="muted">Sandbox: ${escapeHtml(sandbox)}</div>
+    <div class="muted">External writes: approval required</div>
     ${
       status.ok
         ? ""
@@ -293,6 +381,7 @@ function renderProvider(status) {
   `;
   els.webSearchInput.checked = webSearch === "on";
   els.timeoutSecondsInput.value = timeoutSeconds;
+  els.sandboxInput.value = sandbox;
   els.providerSettingsStatus.textContent = "";
   els.providerSettingsStatus.className = "settings-status";
 }
@@ -303,12 +392,361 @@ function renderArtifacts(artifacts) {
     <div class="artifact-links">
       ${artifacts
         .map(
-          (artifact) =>
-            `<div>${escapeHtml(artifact.kind || "artifact")}: <code>${escapeHtml(artifact.path || "")}</code></div>`,
+          (artifact) => {
+            const path = artifact.path || "";
+            const label = path ? `<a class="file-link" href="${escapeHtml(obsidianFileUrl(path))}" title="Open in Obsidian"><code>${escapeHtml(path)}</code></a>` : "<code></code>";
+            return `<div>${escapeHtml(artifact.kind || "artifact")}: ${label}</div>`;
+          },
         )
         .join("")}
     </div>
   `;
+}
+
+function renderApprovalRequests(requests, statuses = {}) {
+  if (!Array.isArray(requests) || requests.length === 0) return "";
+  return `
+    <div class="approval-requests">
+      ${requests
+        .map((request) => {
+          const id = request.id || "";
+          const status = statuses[id] || request.status || "pending";
+          const path = request.path || "";
+          const operation = request.operation || "write-outside-workspace";
+          const reason = request.reason || "";
+          const actions =
+            status === "pending"
+              ? `
+                <div class="approval-actions">
+                  <button data-approval="${escapeHtml(id)}" data-decision="approved" data-path="${escapeHtml(path)}" type="button">Approve</button>
+                  <button data-approval="${escapeHtml(id)}" data-decision="denied" data-path="${escapeHtml(path)}" type="button">Deny</button>
+                </div>
+              `
+              : `<div class="approval-status">${escapeHtml(status)}</div>`;
+          return `
+            <div class="approval-request">
+              <div><strong>External file access</strong>: ${escapeHtml(operation)}</div>
+              <div><code>${escapeHtml(path)}</code></div>
+              <div class="nav-meta">${escapeHtml(reason)}</div>
+              ${actions}
+            </div>
+          `;
+        })
+        .join("")}
+    </div>
+  `;
+}
+
+function scrollChatToBottom() {
+  window.requestAnimationFrame(() => {
+    window.requestAnimationFrame(() => {
+      els.messageList.scrollTop = els.messageList.scrollHeight;
+      const scroller = document.scrollingElement || document.documentElement;
+      scroller.scrollTo({ top: scroller.scrollHeight, behavior: "auto" });
+    });
+  });
+}
+
+function showProgress(title) {
+  els.progressPanel.hidden = false;
+  els.progressTitle.textContent = title;
+  els.progressEvents.innerHTML = "";
+  scrollChatToBottom();
+}
+
+function updateProgress(job) {
+  const events = Array.isArray(job.events) ? job.events.slice(-5) : [];
+  const latest = events.length ? events[events.length - 1].message : job.status || "Working";
+  els.progressTitle.textContent =
+    job.status === "done" ? "완료됨" : job.status === "failed" ? "실패" : latest || "작업 중";
+  els.progressEvents.innerHTML = events
+    .map((event) => `<div>${escapeHtml(event.message || "")}</div>`)
+    .join("");
+}
+
+function hideProgress() {
+  els.progressPanel.hidden = true;
+  els.progressTitle.textContent = "";
+  els.progressEvents.innerHTML = "";
+}
+
+function renderEventPanel(job) {
+  if (!job || !job.id) return;
+  state.currentJob = job;
+  els.chatTab.classList.add("event-visible");
+  els.eventPanel.hidden = false;
+  els.copyEventLogButton.disabled = false;
+  const diagnostics = job.diagnostics || {};
+  els.eventStatus.textContent = diagnostics.state || job.status || "";
+  const eventCount = Array.isArray(job.events) ? job.events.length : 0;
+  const started = formatEventTime(job.createdAt);
+  const updated = formatEventTime(job.updatedAt);
+  els.eventMeta.innerHTML = `
+    <div>작업: <code>${escapeHtml(job.id)}</code></div>
+    <div>종류: ${escapeHtml(job.kind || "")}</div>
+    <div>경과: ${escapeHtml(formatDuration(diagnostics.elapsedSeconds))} · 유휴: ${escapeHtml(formatDuration(diagnostics.idleSeconds))}</div>
+    ${diagnostics.detail ? `<div>${escapeHtml(diagnostics.detail)}</div>` : ""}
+    <div>시작: ${escapeHtml(started)} · 갱신: ${escapeHtml(updated)} · 이벤트: ${eventCount}</div>
+    ${job.message ? `<div>오류: ${escapeHtml(job.message)}</div>` : ""}
+  `;
+  els.eventList.innerHTML =
+    (job.events || [])
+      .map(
+        (event) => `
+          <div class="event-item">
+            <div class="event-time">${escapeHtml(formatEventTime(event.createdAt))}</div>
+            <div class="event-message">${escapeHtml(event.message || "")}</div>
+          </div>
+        `,
+      )
+      .join("") || '<div class="muted">아직 이벤트가 없습니다.</div>';
+  els.eventList.scrollTop = els.eventList.scrollHeight;
+}
+
+function hideEventPanel() {
+  state.currentJob = null;
+  els.chatTab.classList.remove("event-visible");
+  els.eventPanel.hidden = true;
+  els.eventStatus.textContent = "";
+  els.eventCopyStatus.textContent = "";
+  els.copyEventLogButton.disabled = true;
+  els.eventMeta.innerHTML = "";
+  els.eventList.innerHTML = "";
+}
+
+function buildEventLogText(job) {
+  const diagnostics = job.diagnostics || {};
+  const lines = [
+    "ctxgit event log",
+    `작업: ${job.id || ""}`,
+    `종류: ${job.kind || ""}`,
+    `상태: ${diagnostics.state || job.status || ""}`,
+    `생성: ${job.createdAt || ""}`,
+    `갱신: ${job.updatedAt || ""}`,
+    `경과: ${formatDuration(diagnostics.elapsedSeconds)}`,
+    `유휴: ${formatDuration(diagnostics.idleSeconds)}`,
+  ];
+  if (diagnostics.detail) lines.push(`상세: ${diagnostics.detail}`);
+  if (job.message) lines.push(`오류: ${job.message}`);
+  lines.push("", "이벤트:");
+  (job.events || []).forEach((event, index) => {
+    lines.push(`${index + 1}. [${event.createdAt || ""}] ${event.message || ""}`);
+  });
+  return lines.join("\n");
+}
+
+async function copyTextToClipboard(text) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  document.body.appendChild(textarea);
+  textarea.select();
+  document.execCommand("copy");
+  textarea.remove();
+}
+
+async function copyEventLog() {
+  if (!state.currentJob) return;
+  try {
+    await copyTextToClipboard(buildEventLogText(state.currentJob));
+    els.eventCopyStatus.textContent = "복사됨.";
+  } catch (error) {
+    els.eventCopyStatus.textContent = `복사 실패: ${error.message}`;
+  }
+  window.setTimeout(() => {
+    els.eventCopyStatus.textContent = "";
+  }, 1800);
+}
+
+function hideProgressSoon() {
+  window.setTimeout(() => {
+    if (els.progressTitle.textContent === "완료됨") hideProgress();
+  }, 900);
+}
+
+function rememberJob(job, meta = {}) {
+  if (!job || !job.id) return job;
+  const previous = state.jobs[job.id] || {};
+  const remembered = {
+    ...previous,
+    ...job,
+    branch: meta.branch || previous.branch || job.branch || "",
+    mode: meta.mode || previous.mode || job.mode || "",
+  };
+  state.jobs[job.id] = remembered;
+  if (remembered.branch) {
+    state.branchJobs[remembered.branch] = remembered.id;
+  }
+  return remembered;
+}
+
+function branchJob(branch = state.activeBranch) {
+  const jobId = branch ? state.branchJobs[branch] : "";
+  return jobId ? state.jobs[jobId] : null;
+}
+
+function activeBranchRunningJob(branch = state.activeBranch) {
+  const job = branchJob(branch);
+  return job?.status === "running" ? job : null;
+}
+
+function updateComposerState() {
+  const running = activeBranchRunningJob();
+  const startingMode = state.activeBranch ? state.startingBranches[state.activeBranch] : "";
+  const disabled = !state.activeBranch || Boolean(running) || Boolean(startingMode);
+  els.sendButton.disabled = disabled;
+  els.researchButton.disabled = disabled;
+  els.historyChatButton.disabled = disabled;
+  const busyMode = running?.mode || startingMode;
+  els.sendButton.textContent = busyMode === "chat" ? "생각 중" : "Send";
+  els.researchButton.textContent = busyMode === "research" ? "리서치 중" : "Research";
+  els.historyChatButton.textContent = busyMode === "info-chat" ? "Info..." : "Info chat";
+}
+
+function renderActiveBranchJob() {
+  const job = branchJob();
+  if (!job) {
+    hideProgress();
+    hideEventPanel();
+    updateComposerState();
+    return;
+  }
+  renderEventPanel(job);
+  if (job.status === "running") {
+    updateProgress(job);
+  } else {
+    hideProgress();
+  }
+  updateComposerState();
+}
+
+async function refreshBranchNavigation() {
+  const data = await api("/api/branches");
+  state.branches = data.branches || [];
+  state.views = data.views || [];
+  renderBranches();
+}
+
+async function startTrackedJob(endpoint, body, { branch, mode, title }) {
+  const started = await api(endpoint, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+  const remembered = rememberJob(started, { branch, mode });
+  if (state.activeBranch === branch) {
+    showProgress(title);
+    updateProgress(remembered);
+    renderEventPanel(remembered);
+  }
+  updateComposerState();
+  refreshBranchNavigation().catch(() => {});
+  monitorTrackedJob(remembered.id).catch((error) => handleMonitorError(remembered, error));
+  return remembered;
+}
+
+function handleMonitorError(job, error) {
+  const now = new Date().toISOString();
+  const failed = rememberJob(
+    {
+      ...job,
+      status: "failed",
+      error: "monitor_failed",
+      message: error.message || "작업 모니터링 실패",
+      updatedAt: now,
+      events: [...(job.events || []), { message: `실패: ${error.message || "작업 모니터링 실패"}`, createdAt: now }],
+      diagnostics: {
+        elapsedSeconds: 0,
+        idleSeconds: 0,
+        state: "monitor_failed",
+        detail: error.message || "작업 모니터링 실패",
+        lastEvent: "모니터링 실패",
+      },
+    },
+    { branch: job.branch, mode: job.mode },
+  );
+  if (state.activeBranch === failed.branch) {
+    renderEventPanel(failed);
+    els.messageList.insertAdjacentHTML(
+      "beforebegin",
+      `<div class="error-banner">작업 모니터링 실패: ${escapeHtml(failed.message)}</div>`,
+    );
+    hideProgress();
+  }
+  updateComposerState();
+}
+
+async function monitorTrackedJob(jobId) {
+  const tracked = state.jobs[jobId];
+  if (!tracked) return;
+  const branch = tracked.branch;
+  let waitMs = 500;
+  while (true) {
+    await sleep(waitMs);
+    let job;
+    try {
+      job = await api(`/api/job?id=${encodeURIComponent(jobId)}`);
+    } catch (error) {
+      if (error instanceof ApiError && error.payload?.error === "job_not_found") {
+        const message =
+          "ctxgit 서버가 이 작업을 더 이상 갖고 있지 않습니다. 서버가 재시작되었거나 브라우저가 다른 ctxgit 서버를 조회 중일 수 있습니다.";
+        const now = new Date().toISOString();
+        job = {
+          ...tracked,
+          status: "failed",
+          error: "job_not_found",
+          message,
+          updatedAt: now,
+        events: [...(tracked.events || []), { message: `실패: ${message}`, createdAt: now }],
+          diagnostics: {
+            elapsedSeconds: 0,
+            idleSeconds: 0,
+            state: "job_not_found",
+            detail: message,
+            lastEvent: "job not found",
+          },
+        };
+      } else {
+        throw error;
+      }
+    }
+    const remembered = rememberJob(job, { branch, mode: tracked.mode });
+    if (state.activeBranch === branch) {
+      updateProgress(remembered);
+      renderEventPanel(remembered);
+      updateComposerState();
+    }
+    if (remembered.status === "done") {
+      await refreshBranchNavigation().catch(() => {});
+      if (state.activeBranch === branch) {
+        renderBranch(remembered.payload);
+        renderGit(await api("/api/git/status"));
+        renderProvider(await api("/api/provider/status"));
+        hideProgressSoon();
+      }
+      updateComposerState();
+      return;
+    }
+    if (remembered.status === "failed") {
+      renderBranches();
+      if (state.activeBranch === branch) {
+        const prefix = remembered.error === "timeout" ? "시간 초과" : remembered.error === "job_not_found" ? "중단됨" : remembered.mode === "research" ? "리서치 실패" : "채팅 실패";
+        els.messageList.insertAdjacentHTML(
+          "beforebegin",
+          `<div class="error-banner">${prefix}: ${escapeHtml(remembered.message || "작업 실패")}</div>`,
+        );
+        hideProgress();
+      }
+      updateComposerState();
+      return;
+    }
+    waitMs = Math.min(1200, waitMs + 100);
+  }
 }
 
 function renderBranch(payload) {
@@ -320,18 +758,37 @@ function renderBranch(payload) {
   els.messageList.innerHTML =
     payload.history
       .map(
-        (message) => `
+        (message, index) => `
           <article class="message">
             <div class="message-header">
               <span class="message-role">${escapeHtml(message.role)}</span>
-              <span>${escapeHtml(message.createdAt)}</span>
+              <span class="message-meta-actions">
+                <span>${escapeHtml(message.createdAt)}</span>
+                <button
+                  class="message-options-button"
+                  data-history-delete="${index}"
+                  data-history-created-at="${escapeHtml(message.createdAt || "")}"
+                  data-history-role="${escapeHtml(message.role || "")}"
+                  type="button"
+                  title="Delete message"
+                  aria-label="Delete message"
+                >...</button>
+              </span>
             </div>
-            <div class="message-text">${escapeHtml(message.text)}</div>
+            <div class="message-text">${renderMessageText(message.text)}</div>
             ${renderArtifacts(message.artifacts)}
+            ${renderApprovalRequests(message.approvalRequests, payload.approvalStatuses || {})}
           </article>
         `,
       )
       .join("") || '<div class="muted">No messages yet.</div>';
+  els.messageList.querySelectorAll("[data-approval]").forEach((button) => {
+    button.addEventListener("click", () => decideApproval(button));
+  });
+  els.messageList.querySelectorAll("[data-history-delete]").forEach((button) => {
+    button.addEventListener("click", () => deleteHistoryMessage(button));
+  });
+  scrollChatToBottom();
 
   els.reportView.innerHTML = renderMarkdown(payload.context);
   els.trackedFiles.innerHTML = `
@@ -344,16 +801,54 @@ function renderBranch(payload) {
     [payload.git.status, payload.git.historyDiff, payload.git.contextDiff].filter(Boolean).join("\n\n") ||
     "No uncommitted branch file diff.";
   els.researchList.innerHTML =
-    [...(payload.research || []), ...(payload.artifacts || [])]
+    [
+      ...(payload.sources || []).map((source) => ({
+        title: source.sourcePath || "source",
+        path: source.textPath || source.sourcePath || "",
+        status: source.status || "",
+      })),
+      ...(payload.compactions || []).map((compaction) => ({
+        title: compaction.title || "history compaction",
+        path: compaction.path || "",
+        status: "history compaction",
+      })),
+      ...(payload.research || []),
+      ...(payload.artifacts || []),
+    ]
       .map(
         (doc) => `
           <div class="document-item">
             <strong>${escapeHtml(doc.title)}</strong>
             <div class="nav-meta">${escapeHtml(doc.path)}</div>
+            ${doc.status ? `<div class="nav-meta">${escapeHtml(doc.status)}</div>` : ""}
           </div>
         `,
       )
       .join("") || '<div class="muted">No research notes yet.</div>';
+  renderArchives(payload.archives || []);
+  updateComposerState();
+}
+
+function renderArchives(archives) {
+  if (!archives.length) {
+    els.archiveList.innerHTML = '<div class="muted">No merged source archives.</div>';
+    els.archiveViewer.innerHTML = '<div class="muted">This branch has no archived parent histories.</div>';
+    return;
+  }
+  els.archiveList.innerHTML = archives
+    .map(
+      (archive) => `
+        <button class="nav-item" data-archive="${escapeHtml(archive.id)}" type="button">
+          <span class="nav-title">${escapeHtml(archive.title || archive.id)}</span>
+          <span class="nav-meta">${escapeHtml(archive.id)} · ${archive.historyCount || 0} messages</span>
+        </button>
+      `,
+    )
+    .join("");
+  els.archiveList.querySelectorAll("[data-archive]").forEach((button) => {
+    button.addEventListener("click", () => loadArchive(button.dataset.archive));
+  });
+  els.archiveViewer.innerHTML = '<div class="muted">Select an archived source branch.</div>';
 }
 
 async function loadBranches() {
@@ -389,6 +884,7 @@ async function openProject(path, { init }) {
   if (!path) return;
   els.openProjectButton.disabled = true;
   els.initProjectButton.disabled = true;
+  els.browseProjectButton.disabled = true;
   setProjectStatus(init ? "Initializing project..." : "Opening project...");
   try {
     const project = await api(init ? "/api/project/init" : "/api/project/open", {
@@ -410,27 +906,189 @@ async function openProject(path, { init }) {
   } finally {
     els.openProjectButton.disabled = false;
     els.initProjectButton.disabled = false;
+    els.browseProjectButton.disabled = false;
   }
 }
 
-async function browseProject(path) {
+async function chooseProjectDirectory() {
+  els.browseProjectButton.disabled = true;
+  setProjectStatus("Opening directory picker...");
   try {
-    const browser = await api(`/api/project/browse?path=${encodeURIComponent(path || els.projectPathInput.value)}`);
-    renderBrowser(browser);
-    setProjectStatus("Choose a directory, then Open or Init/Open.", "");
+    const selected = await api("/api/project/choose-directory", {
+      method: "POST",
+      body: JSON.stringify({ path: els.projectPathInput.value.trim() || state.project?.path || "" }),
+    });
+    els.projectPathInput.value = selected.path;
+    setProjectStatus("Directory selected.", "ok");
+    return selected;
   } catch (error) {
-    setProjectStatus(`Browse failed: ${error.message}`, "error");
+    const canceled = error.message.toLowerCase().includes("canceled");
+    setProjectStatus(canceled ? "Directory selection canceled." : `Browse failed: ${error.message}`, canceled ? "" : "error");
+    return null;
+  } finally {
+    els.browseProjectButton.disabled = false;
   }
+}
+
+async function projectPathForAction() {
+  const path = els.projectPathInput.value.trim();
+  if (path) return path;
+  const selected = await chooseProjectDirectory();
+  return selected?.path || "";
 }
 
 async function loadBranch(branch) {
   state.activeBranch = branch;
+  selectTab("chat");
   renderBranches();
   const payload = await api(`/api/branch?id=${encodeURIComponent(branch)}`);
+  if (state.activeBranch !== branch) return;
   renderBranch(payload);
   const git = await api("/api/git/status");
+  if (state.activeBranch !== branch) return;
   renderGit(git);
   renderProvider(await api("/api/provider/status"));
+  if (state.activeBranch !== branch) return;
+  renderActiveBranchJob();
+}
+
+async function decideApproval(button) {
+  if (!state.activeBranch) return;
+  const approvalId = button.dataset.approval || "";
+  const decision = button.dataset.decision || "";
+  const path = button.dataset.path || "";
+  if (!approvalId || !decision) return;
+  if (
+    decision === "approved" &&
+    !window.confirm(`Allow this turn to write outside the project?\n\n${path}`)
+  ) {
+    return;
+  }
+  button.disabled = true;
+  try {
+    const payload = await api("/api/approval", {
+      method: "POST",
+      body: JSON.stringify({
+        branch: state.activeBranch,
+        approvalId,
+        decision,
+      }),
+    });
+    renderBranch(payload);
+    renderGit(await api("/api/git/status"));
+    renderProvider(await api("/api/provider/status"));
+  } catch (error) {
+    window.alert(`Approval failed: ${error.message}`);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function deleteHistoryMessage(button) {
+  if (!state.activeBranch) return;
+  const index = Number.parseInt(button.dataset.historyDelete || "", 10);
+  if (!Number.isInteger(index)) return;
+  if (!window.confirm("이 메시지를 history.jsonl에서 삭제할까?")) return;
+  button.disabled = true;
+  const branch = state.activeBranch;
+  try {
+    const payload = await api("/api/history/delete", {
+      method: "POST",
+      body: JSON.stringify({
+        branch,
+        index,
+        createdAt: button.dataset.historyCreatedAt || "",
+        role: button.dataset.historyRole || "",
+      }),
+    });
+    if (state.activeBranch === branch) {
+      renderBranch(payload);
+      renderGit(await api("/api/git/status"));
+      await refreshBranchNavigation();
+    }
+  } catch (error) {
+    window.alert(`Delete failed: ${error.message}`);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function cloneBranch(source, target) {
+  if (!target) return;
+  try {
+    const payload = await api("/api/branch/clone", {
+      method: "POST",
+      body: JSON.stringify({ source, target }),
+    });
+    state.activeBranch = target;
+    await loadBranches();
+    renderBranch(payload);
+  } catch (error) {
+    window.alert(`Clone failed: ${error.message}`);
+  }
+}
+
+async function renameBranch(branch, title) {
+  if (!title) return;
+  try {
+    const payload = await api("/api/branch/rename", {
+      method: "POST",
+      body: JSON.stringify({ branch, title }),
+    });
+    state.activeBranch = branch;
+    await loadBranches();
+    renderBranch(payload);
+  } catch (error) {
+    window.alert(`Rename failed: ${error.message}`);
+  }
+}
+
+async function removeBranch(branch) {
+  try {
+    await api("/api/branch/remove", {
+      method: "POST",
+      body: JSON.stringify({ branch }),
+    });
+    if (state.activeBranch === branch) {
+      state.activeBranch = null;
+      state.payload = null;
+    }
+    await loadBranches();
+  } catch (error) {
+    window.alert(`Remove failed: ${error.message}`);
+  }
+}
+
+async function loadArchive(archiveId) {
+  if (!state.activeBranch) return;
+  const payload = await api(
+    `/api/archive?branch=${encodeURIComponent(state.activeBranch)}&id=${encodeURIComponent(archiveId)}`,
+  );
+  els.archiveList.querySelectorAll("[data-archive]").forEach((button) => {
+    button.classList.toggle("active", button.dataset.archive === archiveId);
+  });
+  const title = payload.meta?.title || archiveId;
+  const messages =
+    payload.history
+      .map(
+        (message) => `
+          <article class="message">
+            <div class="message-header">
+              <span class="message-role">${escapeHtml(message.role)}</span>
+              <span>${escapeHtml(message.createdAt)}</span>
+            </div>
+            <div class="message-text">${renderMessageText(message.text)}</div>
+          </article>
+        `,
+      )
+      .join("") || '<div class="muted">No archived messages.</div>';
+  els.archiveViewer.innerHTML = `
+    <div class="archive-heading">
+      <h2>${escapeHtml(title)}</h2>
+      <div class="active-meta">${escapeHtml(payload.paths?.history || "")}</div>
+    </div>
+    <div class="message-list">${messages}</div>
+  `;
 }
 
 async function loadView(view) {
@@ -440,70 +1098,161 @@ async function loadView(view) {
   els.activeTitle.textContent = payload.id;
   els.activeMeta.textContent = payload.path;
   els.reportView.innerHTML = renderMarkdown(payload.text);
-  document.querySelector('[data-tab="report"]').click();
+  selectTab("report");
+}
+
+function selectTab(tab) {
+  const button = document.querySelector(`[data-tab="${tab}"]`);
+  const panel = document.querySelector(`#${tab}Tab`);
+  if (!button || !panel) return;
+  document.querySelectorAll(".tab").forEach((item) => item.classList.remove("active"));
+  document.querySelectorAll(".tab-panel").forEach((item) => item.classList.remove("active"));
+  button.classList.add("active");
+  panel.classList.add("active");
+  if (tab === "chat") scrollChatToBottom();
 }
 
 document.querySelectorAll(".tab").forEach((button) => {
-  button.addEventListener("click", () => {
-    document.querySelectorAll(".tab").forEach((item) => item.classList.remove("active"));
-    document.querySelectorAll(".tab-panel").forEach((item) => item.classList.remove("active"));
-    button.classList.add("active");
-    document.querySelector(`#${button.dataset.tab}Tab`).classList.add("active");
-  });
+  button.addEventListener("click", () => selectTab(button.dataset.tab));
+});
+
+document.addEventListener("click", (event) => {
+  if (!event.target.closest(".branch-row")) {
+    closeBranchMenus();
+  }
 });
 
 els.projectForm.addEventListener("submit", async (event) => {
   event.preventDefault();
-  await openProject(els.projectPathInput.value.trim(), { init: false });
+  const path = await projectPathForAction();
+  await openProject(path, { init: false });
 });
 
 els.initProjectButton.addEventListener("click", async () => {
-  await openProject(els.projectPathInput.value.trim(), { init: true });
+  const path = await projectPathForAction();
+  await openProject(path, { init: true });
 });
 
 els.browseProjectButton.addEventListener("click", async () => {
-  await browseProject(els.projectPathInput.value.trim());
+  const selected = await chooseProjectDirectory();
+  if (!selected) return;
+  if (selected.project?.initialized) {
+    await openProject(selected.path, { init: false });
+  } else {
+    setProjectStatus("Directory selected. Use Init/Open to initialize it.", "");
+  }
 });
 
-async function sendComposerMessage({ ai }) {
+els.mergeForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const branches = els.mergeSourcesInput.value
+    .split(/[,\s]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const name = els.mergeNameInput.value.trim();
+  if (branches.length < 2 || !name) {
+    els.mergeStatus.textContent = "Use two sources and a new branch id.";
+    els.mergeStatus.className = "settings-status error";
+    return;
+  }
+  els.mergeButton.disabled = true;
+  els.mergeStatus.textContent = "Merging...";
+  els.mergeStatus.className = "settings-status";
+  try {
+    const payload = await api("/api/merge", {
+      method: "POST",
+      body: JSON.stringify({ branches, name }),
+    });
+    state.activeBranch = name;
+    await loadBranches();
+    renderBranch(payload);
+    els.mergeSourcesInput.value = "";
+    els.mergeNameInput.value = "";
+    els.mergeStatus.textContent = "Merged.";
+    els.mergeStatus.classList.add("ok");
+    selectTab("archives");
+  } catch (error) {
+    els.mergeStatus.textContent = `Merge failed: ${error.message}`;
+    els.mergeStatus.classList.add("error");
+  } finally {
+    els.mergeButton.disabled = false;
+  }
+});
+
+async function sendComposerMessage({ mode }) {
   if (!state.activeBranch) return;
+  const branch = state.activeBranch;
   const text = els.messageInput.value.trim();
   if (!text) return;
-  els.sendButton.disabled = true;
-  els.appendOnlyButton.disabled = true;
-  const previousTitle = els.sendButton.textContent;
-  els.sendButton.textContent = ai ? "Thinking" : "Saving";
+  const isChat = mode === "chat";
+  const isResearch = mode === "research";
+  const isInfoChat = mode === "info-chat";
+  if (activeBranchRunningJob(branch) || state.startingBranches[branch]) {
+    window.alert("이 브랜치에는 이미 실행 중인 작업이 있습니다. 다른 브랜치로 이동하면 별도 작업을 시작할 수 있습니다.");
+    return;
+  }
+  const requestedMode = isResearch ? "research" : isInfoChat ? "info-chat" : "chat";
+  state.startingBranches[branch] = requestedMode;
+  updateComposerState();
   try {
-    const payload = await api(ai ? "/api/chat" : "/api/append", {
-      method: "POST",
-      body: JSON.stringify(
-        ai
-          ? { branch: state.activeBranch, text, provider: "codex" }
-          : { branch: state.activeBranch, role: "user", text },
-      ),
-    });
-    els.messageInput.value = "";
-    renderBranch(payload);
-    renderGit(await api("/api/git/status"));
-    renderProvider(await api("/api/provider/status"));
+    if (isResearch) {
+      await startTrackedJob(
+        "/api/research/start",
+        { branch, text, provider: "hybrid" },
+        { branch, mode: "research", title: "리서치 시작 중" },
+      );
+      els.messageInput.value = "";
+      return;
+    }
+    if (isChat) {
+      await startTrackedJob(
+        "/api/chat/start",
+        { branch, text, provider: "codex" },
+        { branch, mode: "chat", title: "채팅 턴 시작 중" },
+      );
+      els.messageInput.value = "";
+      return;
+    }
+    if (isInfoChat) {
+      await startTrackedJob(
+        "/api/info-chat/start",
+        { branch, text, provider: "codex" },
+        { branch, mode: "info-chat", title: "정보 챗 시작 중" },
+      );
+      els.messageInput.value = "";
+      return;
+    }
   } catch (error) {
     const isTimeout = error instanceof ApiError && error.payload?.error === "timeout";
-    const prefix = isTimeout ? "Timeout" : "Chat failed";
-    els.messageList.insertAdjacentHTML(
-      "beforebegin",
-      `<div class="error-banner">${prefix}: ${escapeHtml(error.message)}</div>`,
-    );
+    const isMissingJob = error instanceof ApiError && error.payload?.error === "job_not_found";
+    const prefix = isTimeout ? "시간 초과" : isMissingJob ? "중단됨" : isResearch ? "리서치 실패" : "채팅 실패";
+    if (state.activeBranch === branch) {
+      els.messageList.insertAdjacentHTML(
+        "beforebegin",
+        `<div class="error-banner">${prefix}: ${escapeHtml(error.message)}</div>`,
+      );
+      hideProgress();
+    } else {
+      window.alert(`${prefix} on ${branch}: ${error.message}`);
+    }
   } finally {
-    els.sendButton.disabled = false;
-    els.appendOnlyButton.disabled = false;
-    els.sendButton.textContent = previousTitle;
+    delete state.startingBranches[branch];
+    updateComposerState();
   }
 }
 
 els.composer.addEventListener("submit", async (event) => {
   event.preventDefault();
-  await sendComposerMessage({ ai: true });
+  await sendComposerMessage({ mode: "chat" });
 });
+
+els.messageInput.addEventListener("keydown", async (event) => {
+  if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
+  event.preventDefault();
+  await sendComposerMessage({ mode: "chat" });
+});
+
+els.copyEventLogButton.addEventListener("click", copyEventLog);
 
 els.providerSettings.addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -523,6 +1272,7 @@ els.providerSettings.addEventListener("submit", async (event) => {
         body: JSON.stringify({
           timeoutSeconds,
           webSearch: els.webSearchInput.checked,
+          sandbox: els.sandboxInput.value,
         }),
       }),
     );
@@ -537,8 +1287,12 @@ els.providerSettings.addEventListener("submit", async (event) => {
   }
 });
 
-els.appendOnlyButton.addEventListener("click", async () => {
-  await sendComposerMessage({ ai: false });
+els.historyChatButton.addEventListener("click", async () => {
+  await sendComposerMessage({ mode: "info-chat" });
+});
+
+els.researchButton.addEventListener("click", async () => {
+  await sendComposerMessage({ mode: "research" });
 });
 
 els.refreshButton.addEventListener("click", async () => {
