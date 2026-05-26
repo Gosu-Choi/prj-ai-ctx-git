@@ -995,6 +995,69 @@ class CtxgitTest(unittest.TestCase):
             self.assertTrue((second / "contexts" / "branches" / "initial" / "history.jsonl").exists())
             self.assertFalse((first / "contexts").samefile(second / "contexts") if (second / "contexts").exists() else True)
 
+    def test_project_state_read_does_not_upgrade_existing_project(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".ctxgit").mkdir()
+            ctxgit.dump_json(root / ".ctxgit" / "config.json", {"schemaVersion": 1})
+            branch = root / "contexts" / "branches" / "legacy"
+            branch.mkdir(parents=True)
+            now = ctxgit.utc_now()
+            ctxgit.dump_json(
+                branch / "branch.json",
+                {
+                    "schemaVersion": 1,
+                    "id": "legacy",
+                    "title": "Legacy",
+                    "parent": None,
+                    "tags": [],
+                    "createdAt": now,
+                    "updatedAt": now,
+                },
+            )
+            ctxgit.write_text(branch / "context.md", "# Legacy\n")
+            ctxgit.write_text(branch / "history.jsonl", "")
+
+            state = ctxgit.ProjectState(root)
+            opened_root, store = state.context(require_initialized=True)
+
+            self.assertEqual(opened_root, root.resolve())
+            self.assertEqual([item["id"] for item in store.list_branches()], ["legacy"])
+            self.assertFalse((root / "contexts" / "AGENTS.md").exists())
+            self.assertFalse((root / "contexts" / "branches" / "initial").exists())
+            self.assertFalse((root / ".gitignore").exists())
+
+    def test_project_open_does_not_upgrade_existing_project(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".ctxgit").mkdir()
+            ctxgit.dump_json(root / ".ctxgit" / "config.json", {"schemaVersion": 1})
+            (root / "contexts").mkdir()
+
+            state = ctxgit.ProjectState(Path(tmp) / "unused")
+            payload = state.open(str(root), init=False)
+
+            self.assertTrue(payload["initialized"])
+            self.assertFalse((root / "contexts" / "AGENTS.md").exists())
+            self.assertFalse((root / "contexts" / "branches" / "initial").exists())
+            self.assertFalse((root / ".gitignore").exists())
+
+    def test_serve_root_ignores_tool_repo_without_explicit_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            (root / ".ctxgit").mkdir()
+            ctxgit.dump_json(root / ".ctxgit" / "config.json", {"schemaVersion": 1})
+            original_cwd = Path.cwd()
+            original_tool_repo = ctxgit.TOOL_REPO_ROOT
+            try:
+                ctxgit.TOOL_REPO_ROOT = root
+                os.chdir(root)
+                self.assertEqual(ctxgit.resolve_serve_root(None), Path.home().resolve())
+                self.assertEqual(ctxgit.resolve_serve_root(str(root)), root)
+            finally:
+                os.chdir(original_cwd)
+                ctxgit.TOOL_REPO_ROOT = original_tool_repo
+
     def test_browse_directories_marks_project_dirs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

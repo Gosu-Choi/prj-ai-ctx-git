@@ -349,6 +349,21 @@ def resolve_workspace_root(root_arg: str | None) -> Path:
     return Path.cwd().resolve()
 
 
+def is_tool_repo_root(root: Path) -> bool:
+    return root.resolve() == TOOL_REPO_ROOT.resolve()
+
+
+def resolve_serve_root(root_arg: str | None) -> Path:
+    if root_arg:
+        return resolve_workspace_root(root_arg)
+    discovered = discover_workspace_root(Path.cwd())
+    if discovered and not is_tool_repo_root(discovered):
+        return discovered
+    if discovered and is_tool_repo_root(discovered):
+        return Path.home().resolve()
+    return Path.cwd().resolve()
+
+
 def is_ctxgit_project(root: Path) -> bool:
     return (root / ".ctxgit" / "config.json").exists()
 
@@ -4200,11 +4215,7 @@ class ProjectState:
         store = ContextStore(root)
         if require_initialized:
             store.require_initialized()
-            ensure_project_gitignore(root)
             load_project_env(root)
-            store.ensure_agent_files()
-            if store.ensure_initial_branch():
-                store.write_index()
         return root, store
 
     def payload(self) -> dict[str, Any]:
@@ -4223,11 +4234,7 @@ class ProjectState:
             store.init()
         else:
             store.require_initialized()
-            ensure_project_gitignore(root)
             load_project_env(root)
-            store.ensure_agent_files()
-            if store.ensure_initial_branch():
-                store.write_index()
         with self._lock:
             self._root = root
         load_project_env(root)
@@ -4955,7 +4962,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    root = resolve_workspace_root(args.root)
+    root = resolve_serve_root(args.root) if args.command == "serve" else resolve_workspace_root(args.root)
     store = ContextStore(root)
     load_project_env(root)
 
