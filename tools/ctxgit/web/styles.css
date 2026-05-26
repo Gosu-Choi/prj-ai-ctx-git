@@ -278,6 +278,18 @@ textarea {
   background: var(--accent-soft);
 }
 
+.branch-row.job-running .branch-main,
+.branch-row.job-running .branch-options-button {
+  border-color: #c56a12;
+  box-shadow: inset 0 0 0 1px #c56a12;
+}
+
+.branch-row.job-done .branch-main,
+.branch-row.job-done .branch-options-button {
+  border-color: #2f8f46;
+  box-shadow: inset 0 0 0 1px #2f8f46;
+}
+
 .nav-title {
   display: block;
   font-weight: 650;

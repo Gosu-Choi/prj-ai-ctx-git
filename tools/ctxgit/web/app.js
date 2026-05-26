@@ -8,6 +8,8 @@ const state = {
   currentJob: null,
   jobs: {},
   branchJobs: {},
+  branchActivityAt: {},
+  acknowledgedBranchJobs: {},
   startingBranches: {},
 };
 
@@ -263,17 +265,23 @@ function renderProject(project) {
 }
 
 function renderBranches() {
-  els.branchList.innerHTML = state.branches
+  els.branchList.innerHTML = orderedBranches()
     .map((branch) => {
       const job = branchJob(branch.id);
+      const startingMode = state.startingBranches[branch.id] || "";
+      const isRunning = Boolean(startingMode) || job?.status === "running";
+      const isDoneUnseen = job?.status === "done" && !isBranchJobAcknowledged(branch.id);
+      const statusClass = isRunning ? "job-running" : isDoneUnseen ? "job-done" : job?.status === "failed" ? "job-failed" : "";
       const jobLabel =
-        job?.status === "running"
-          ? ` · 실행 중 ${job.mode || job.kind || "job"}`
+        isRunning
+          ? ` · 실행 중 ${startingMode || job?.mode || job?.kind || "job"}`
+          : isDoneUnseen
+          ? " · 완료됨"
           : job?.status === "failed"
           ? " · 최근 작업 실패"
           : "";
       return `
-        <div class="branch-row ${branch.id === state.activeBranch ? "active" : ""}">
+        <div class="branch-row ${branch.id === state.activeBranch ? "active" : ""} ${statusClass}">
           <button class="nav-item branch-main ${branch.id === state.activeBranch ? "active" : ""}" data-branch="${escapeHtml(branch.id)}" type="button">
             <span class="nav-title">${escapeHtml(branch.title)}</span>
             <span class="nav-meta">${escapeHtml(branch.id)} · ${branch.historyCount} messages${escapeHtml(jobLabel)}</span>
@@ -353,6 +361,49 @@ function closeBranchMenus() {
 
 function closeMessageMenus() {
   document.querySelectorAll(".message-options.open").forEach((item) => item.classList.remove("open"));
+}
+
+function jobStartedAt(job) {
+  return Date.parse(job?.createdAt || job?.updatedAt || "") || 0;
+}
+
+function markBranchActivity(branchId, timestamp = Date.now()) {
+  if (!branchId) return;
+  state.branchActivityAt[branchId] = timestamp || Date.now();
+}
+
+function isBranchJobAcknowledged(branchId) {
+  const job = branchJob(branchId);
+  return Boolean(job?.id && state.acknowledgedBranchJobs[branchId] === job.id);
+}
+
+function acknowledgeBranchJob(branchId) {
+  const job = branchJob(branchId);
+  if (job?.id && job.status !== "running") {
+    state.acknowledgedBranchJobs[branchId] = job.id;
+  }
+}
+
+function branchActivityTime(branchId) {
+  const job = branchJob(branchId);
+  return state.branchActivityAt[branchId] || jobStartedAt(job);
+}
+
+function orderedBranches() {
+  return state.branches
+    .map((branch, index) => ({ branch, index }))
+    .sort((left, right) => {
+      const leftActivity = branchActivityTime(left.branch.id);
+      const rightActivity = branchActivityTime(right.branch.id);
+      if (leftActivity || rightActivity) {
+        if (!leftActivity) return 1;
+        if (!rightActivity) return -1;
+        const timeDiff = rightActivity - leftActivity;
+        if (timeDiff) return timeDiff;
+      }
+      return left.index - right.index;
+    })
+    .map((item) => item.branch);
 }
 
 function branchTitle(branchId) {
@@ -609,7 +660,12 @@ function rememberJob(job, meta = {}) {
   };
   state.jobs[job.id] = remembered;
   if (remembered.branch) {
+    const previousBranchJobId = state.branchJobs[remembered.branch];
     state.branchJobs[remembered.branch] = remembered.id;
+    if (previousBranchJobId !== remembered.id) {
+      markBranchActivity(remembered.branch, jobStartedAt(remembered));
+      delete state.acknowledgedBranchJobs[remembered.branch];
+    }
   }
   return remembered;
 }
@@ -744,12 +800,16 @@ async function monitorTrackedJob(jobId) {
       }
     }
     const remembered = rememberJob(job, { branch, mode: tracked.mode });
+    const isActiveBranch = state.activeBranch === branch;
     if (state.activeBranch === branch) {
       updateProgress(remembered);
       renderEventPanel(remembered);
       updateComposerState();
     }
     if (remembered.status === "done") {
+      if (isActiveBranch) {
+        acknowledgeBranchJob(branch);
+      }
       await refreshBranchNavigation().catch(() => {});
       if (state.activeBranch === branch) {
         renderBranch(remembered.payload);
@@ -1002,6 +1062,7 @@ async function projectPathForAction() {
 
 async function loadBranch(branch) {
   state.activeBranch = branch;
+  acknowledgeBranchJob(branch);
   selectTab("chat");
   renderBranches();
   const payload = await api(`/api/branch?id=${encodeURIComponent(branch)}`);
@@ -1296,7 +1357,9 @@ async function sendComposerMessage({ mode }) {
   }
   const requestedMode = isResearch ? "research" : isInfoChat ? "info-chat" : "chat";
   state.startingBranches[branch] = requestedMode;
+  markBranchActivity(branch);
   updateComposerState();
+  renderBranches();
   try {
     if (isResearch) {
       await startTrackedJob(
