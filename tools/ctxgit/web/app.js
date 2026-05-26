@@ -351,6 +351,10 @@ function closeBranchMenus() {
   document.querySelectorAll(".branch-row.open").forEach((row) => row.classList.remove("open"));
 }
 
+function closeMessageMenus() {
+  document.querySelectorAll(".message-options.open").forEach((item) => item.classList.remove("open"));
+}
+
 function renderGit(status) {
   els.gitSummary.innerHTML = `
     <div>Branch: <strong>${escapeHtml(status.branch || "(none)")}</strong></div>
@@ -759,15 +763,30 @@ function renderBranch(payload) {
               <span class="message-role">${escapeHtml(message.role)}</span>
               <span class="message-meta-actions">
                 <span>${escapeHtml(message.createdAt)}</span>
-                <button
-                  class="message-options-button"
-                  data-history-delete="${index}"
-                  data-history-created-at="${escapeHtml(message.createdAt || "")}"
-                  data-history-role="${escapeHtml(message.role || "")}"
-                  type="button"
-                  title="Delete message"
-                  aria-label="Delete message"
-                >...</button>
+                <span class="message-options">
+                  <button
+                    class="message-options-button"
+                    data-message-options="${index}"
+                    type="button"
+                    title="Message options"
+                    aria-label="Message options"
+                  >...</button>
+                  <span class="message-options-menu">
+                    <button
+                      data-history-fork="${index}"
+                      data-history-created-at="${escapeHtml(message.createdAt || "")}"
+                      data-history-role="${escapeHtml(message.role || "")}"
+                      type="button"
+                    >Fork here</button>
+                    <button
+                      class="danger"
+                      data-history-delete="${index}"
+                      data-history-created-at="${escapeHtml(message.createdAt || "")}"
+                      data-history-role="${escapeHtml(message.role || "")}"
+                      type="button"
+                    >Delete message</button>
+                  </span>
+                </span>
               </span>
             </div>
             <div class="message-text">${renderMessageText(message.text)}</div>
@@ -780,8 +799,28 @@ function renderBranch(payload) {
   els.messageList.querySelectorAll("[data-approval]").forEach((button) => {
     button.addEventListener("click", () => decideApproval(button));
   });
+  els.messageList.querySelectorAll("[data-message-options]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const menu = button.closest(".message-options");
+      const wasOpen = menu?.classList.contains("open");
+      closeMessageMenus();
+      if (menu && !wasOpen) menu.classList.add("open");
+    });
+  });
+  els.messageList.querySelectorAll("[data-history-fork]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      closeMessageMenus();
+      forkHistoryMessage(button);
+    });
+  });
   els.messageList.querySelectorAll("[data-history-delete]").forEach((button) => {
-    button.addEventListener("click", () => deleteHistoryMessage(button));
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      closeMessageMenus();
+      deleteHistoryMessage(button);
+    });
   });
   scrollChatToBottom();
 
@@ -1008,6 +1047,39 @@ async function deleteHistoryMessage(button) {
   }
 }
 
+async function forkHistoryMessage(button) {
+  if (!state.activeBranch) return;
+  const index = Number.parseInt(button.dataset.historyFork || "", 10);
+  if (!Number.isInteger(index)) return;
+  const branch = state.activeBranch;
+  const target = window.prompt(`Fork ${branch} through this message as:`, `${branch}-fork-${index + 1}`);
+  if (!target) return;
+  const targetId = target.trim();
+  if (!targetId) return;
+  button.disabled = true;
+  try {
+    const payload = await api("/api/history/fork", {
+      method: "POST",
+      body: JSON.stringify({
+        branch,
+        target: targetId,
+        index,
+        createdAt: button.dataset.historyCreatedAt || "",
+        role: button.dataset.historyRole || "",
+      }),
+    });
+    state.activeBranch = targetId;
+    await loadBranches();
+    renderBranch(payload);
+    renderGit(await api("/api/git/status"));
+    renderProvider(await api("/api/provider/status"));
+  } catch (error) {
+    window.alert(`Fork failed: ${error.message}`);
+  } finally {
+    button.disabled = false;
+  }
+}
+
 async function cloneBranch(source, target) {
   if (!target) return;
   try {
@@ -1114,6 +1186,9 @@ document.querySelectorAll(".tab").forEach((button) => {
 document.addEventListener("click", (event) => {
   if (!event.target.closest(".branch-row")) {
     closeBranchMenus();
+  }
+  if (!event.target.closest(".message-options")) {
+    closeMessageMenus();
   }
 });
 

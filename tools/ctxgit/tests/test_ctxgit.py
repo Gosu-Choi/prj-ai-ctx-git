@@ -168,6 +168,49 @@ class CtxgitTest(unittest.TestCase):
             self.assertEqual(meta["id"], "copy")
             self.assertEqual(meta["clonedFrom"], "source")
 
+    def test_fork_branch_copies_context_and_truncates_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("source", title="Source")
+            first = store.append_history("source", "user", "First")
+            second = store.append_history("source", "assistant", "Second")
+            store.append_history("source", "user", "Third")
+            ctxgit.write_text(root / "contexts" / "branches" / "source" / "context.md", "# Source\n\nKeep context.\n")
+            store.add_note("source", "Note", "Body")
+
+            store.fork_branch_at_history(
+                "source",
+                "forked",
+                1,
+                expected_created_at=second["createdAt"],
+                expected_role=second["role"],
+            )
+
+            self.assertEqual([item["text"] for item in store.iter_history("forked")], ["First", "Second"])
+            self.assertEqual([item["text"] for item in store.iter_history("source")], ["First", "Second", "Third"])
+            self.assertEqual(
+                (root / "contexts" / "branches" / "forked" / "context.md").read_text(encoding="utf-8"),
+                "# Source\n\nKeep context.\n",
+            )
+            self.assertTrue(any((root / "contexts" / "branches" / "forked" / "notes").glob("*.md")))
+            meta = ctxgit.load_json(root / "contexts" / "branches" / "forked" / "branch.json")
+            self.assertEqual(meta["id"], "forked")
+            self.assertEqual(meta["forkedFrom"], "source")
+            self.assertEqual(meta["forkedAtIndex"], 1)
+            self.assertEqual(meta["forkedAtCreatedAt"], second["createdAt"])
+            self.assertEqual(list(store.iter_history("forked"))[0]["createdAt"], first["createdAt"])
+
+    def test_fork_branch_rejects_stale_history_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("source")
+            store.append_history("source", "user", "First")
+
+            with self.assertRaises(ValueError):
+                store.fork_branch_at_history("source", "forked", 0, expected_created_at="stale")
+
     def test_rename_branch_updates_title_and_context_heading(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

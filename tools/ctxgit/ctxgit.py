@@ -844,6 +844,47 @@ class ContextStore:
         dump_json(target_paths.meta, meta)
         self.write_index()
 
+    def fork_branch_at_history(
+        self,
+        source_id: str,
+        target_id: str,
+        index: int,
+        expected_created_at: str = "",
+        expected_role: str = "",
+        title: str | None = None,
+    ) -> None:
+        self.require_initialized()
+        source_paths = self.branch_paths(source_id)
+        target_paths = self.branch_paths(target_id)
+        if not source_paths.root.exists():
+            die(f"branch does not exist: {source_id}")
+        if target_paths.root.exists():
+            die(f"branch already exists: {target_id}")
+        records = self.read_history_file(source_paths.history)
+        if index < 0 or index >= len(records):
+            raise ValueError(f"history record index out of range: {index}")
+        record = records[index]
+        if expected_created_at and str(record.get("createdAt") or "") != expected_created_at:
+            raise ValueError("history record changed before fork; refresh and try again")
+        if expected_role and str(record.get("role") or "") != expected_role:
+            raise ValueError("history record changed before fork; refresh and try again")
+        target_paths.root.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source_paths.root, target_paths.root)
+        now = utc_now()
+        meta = load_json(target_paths.meta)
+        source_title = str(meta.get("title") or source_id)
+        meta["id"] = validate_id(target_id, "branch")
+        meta["title"] = title or f"{source_title} fork"
+        meta["forkedFrom"] = validate_id(source_id, "branch")
+        meta["forkedAtIndex"] = index
+        meta["forkedAtCreatedAt"] = str(record.get("createdAt") or "")
+        meta["createdAt"] = now
+        meta["updatedAt"] = now
+        dump_json(target_paths.meta, meta)
+        text = "".join(json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n" for item in records[: index + 1])
+        write_text(target_paths.history, text)
+        self.write_index()
+
     def rename_branch(self, branch_id: str, title: str) -> None:
         self.require_initialized()
         paths = self.branch_paths(branch_id)
@@ -4700,6 +4741,32 @@ def make_handler(project_state: ProjectState):
                     self.send_json({"error": "delete_failed", "message": str(exc)}, status=409)
                 except SystemExit as exc:
                     self.send_json({"error": "delete_failed"}, status=int(exc.code or 400))
+                return
+            if parsed.path == "/api/history/fork":
+                branch_id = str(body.get("branch") or "")
+                target_id = str(body.get("target") or "")
+                title = str(body.get("title") or "") or None
+                try:
+                    index = int(body.get("index"))
+                except (TypeError, ValueError):
+                    self.send_json({"error": "invalid_history_index", "message": "history index is required"}, status=400)
+                    return
+                expected_created_at = str(body.get("createdAt") or "")
+                expected_role = str(body.get("role") or "")
+                try:
+                    store.fork_branch_at_history(
+                        branch_id,
+                        target_id,
+                        index,
+                        expected_created_at=expected_created_at,
+                        expected_role=expected_role,
+                        title=title,
+                    )
+                    self.send_json(branch_payload(store, target_id))
+                except ValueError as exc:
+                    self.send_json({"error": "fork_failed", "message": str(exc)}, status=409)
+                except SystemExit as exc:
+                    self.send_json({"error": "fork_failed"}, status=int(exc.code or 400))
                 return
             if parsed.path == "/api/research/start":
                 branch_id = str(body.get("branch") or "")

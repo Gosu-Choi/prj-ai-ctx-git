@@ -217,7 +217,8 @@ textarea {
 .tab,
 .composer button,
 .branch-options-button,
-.branch-options-menu button {
+.branch-options-menu button,
+.message-options-menu button {
   border: 1px solid var(--line);
   background: var(--panel);
   color: var(--text);
@@ -408,6 +409,11 @@ textarea {
   gap: 8px;
 }
 
+.message-options {
+  position: relative;
+  display: inline-flex;
+}
+
 .message-options-button {
   width: 26px;
   height: 24px;
@@ -423,6 +429,36 @@ textarea {
 .message-options-button:hover {
   border-color: var(--accent);
   color: var(--accent);
+}
+
+.message-options-menu {
+  display: none;
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 20;
+  min-width: 142px;
+  padding: 5px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 12%);
+}
+
+.message-options.open .message-options-menu {
+  display: grid;
+  gap: 4px;
+}
+
+.message-options-menu button {
+  width: 100%;
+  padding: 7px 8px;
+  border-radius: 5px;
+  text-align: left;
+}
+
+.message-options-menu button.danger {
+  color: #842828;
 }
 
 .message-text {
