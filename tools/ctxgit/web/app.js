@@ -305,9 +305,9 @@ function renderBranches() {
       event.stopPropagation();
       closeBranchMenus();
       const source = button.dataset.branchClone;
-      const target = window.prompt(`Clone ${source} as:`, `${source}-copy`);
-      if (!target) return;
-      await cloneBranch(source, target.trim());
+      const title = window.prompt(`Clone ${source} with title:`, `${branchTitle(source)} copy`);
+      if (!title) return;
+      await cloneBranch(source, title.trim());
     });
   });
   els.branchList.querySelectorAll("[data-branch-rename]").forEach((button) => {
@@ -353,6 +353,35 @@ function closeBranchMenus() {
 
 function closeMessageMenus() {
   document.querySelectorAll(".message-options.open").forEach((item) => item.classList.remove("open"));
+}
+
+function branchTitle(branchId) {
+  const branch = state.branches.find((item) => item.id === branchId);
+  return branch?.title || branchId;
+}
+
+function branchIdFromTitle(title) {
+  const normalized = title
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "_")
+    .replace(/[^a-z0-9._-]+/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^[^a-z0-9]+/, "")
+    .replace(/[^a-z0-9]+$/, "");
+  return (normalized || "branch").slice(0, 80).replace(/[^a-z0-9]+$/, "") || "branch";
+}
+
+function uniqueBranchIdForTitle(title) {
+  const existing = new Set(state.branches.map((branch) => branch.id));
+  const base = branchIdFromTitle(title);
+  if (!existing.has(base)) return base;
+  for (let index = 1; index < 1000; index += 1) {
+    const suffix = `_${index}`;
+    const candidate = `${base.slice(0, 80 - suffix.length).replace(/[^a-z0-9]+$/, "") || "branch"}${suffix}`;
+    if (!existing.has(candidate)) return candidate;
+  }
+  return `${base.slice(0, 66).replace(/[^a-z0-9]+$/, "") || "branch"}_${Date.now().toString(36)}`;
 }
 
 function renderGit(status) {
@@ -1052,10 +1081,11 @@ async function forkHistoryMessage(button) {
   const index = Number.parseInt(button.dataset.historyFork || "", 10);
   if (!Number.isInteger(index)) return;
   const branch = state.activeBranch;
-  const target = window.prompt(`Fork ${branch} through this message as:`, `${branch}-fork-${index + 1}`);
-  if (!target) return;
-  const targetId = target.trim();
-  if (!targetId) return;
+  const title = window.prompt(`Fork ${branch} through this message with title:`, `${branchTitle(branch)} fork ${index + 1}`);
+  if (!title) return;
+  const targetTitle = title.trim();
+  if (!targetTitle) return;
+  const targetId = uniqueBranchIdForTitle(targetTitle);
   button.disabled = true;
   try {
     const payload = await api("/api/history/fork", {
@@ -1063,6 +1093,7 @@ async function forkHistoryMessage(button) {
       body: JSON.stringify({
         branch,
         target: targetId,
+        title: targetTitle,
         index,
         createdAt: button.dataset.historyCreatedAt || "",
         role: button.dataset.historyRole || "",
@@ -1080,12 +1111,14 @@ async function forkHistoryMessage(button) {
   }
 }
 
-async function cloneBranch(source, target) {
-  if (!target) return;
+async function cloneBranch(source, title) {
+  const targetTitle = title.trim();
+  if (!targetTitle) return;
+  const target = uniqueBranchIdForTitle(targetTitle);
   try {
     const payload = await api("/api/branch/clone", {
       method: "POST",
-      body: JSON.stringify({ source, target }),
+      body: JSON.stringify({ source, target, title: targetTitle }),
     });
     state.activeBranch = target;
     await loadBranches();
@@ -1319,7 +1352,7 @@ els.composer.addEventListener("submit", async (event) => {
 els.messageInput.addEventListener("keydown", async (event) => {
   if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
   event.preventDefault();
-  await sendComposerMessage({ mode: "chat" });
+  await sendComposerMessage({ mode: "info-chat" });
 });
 
 els.copyEventLogButton.addEventListener("click", copyEventLog);
