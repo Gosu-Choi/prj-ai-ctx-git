@@ -440,9 +440,7 @@ function renderApprovalRequests(requests, statuses = {}) {
 function scrollChatToBottom() {
   window.requestAnimationFrame(() => {
     window.requestAnimationFrame(() => {
-      els.messageList.scrollTop = els.messageList.scrollHeight;
-      const scroller = document.scrollingElement || document.documentElement;
-      scroller.scrollTo({ top: scroller.scrollHeight, behavior: "auto" });
+      els.chatTab.scrollTo({ top: els.chatTab.scrollHeight, behavior: "auto" });
     });
   });
 }
@@ -474,7 +472,6 @@ function renderEventPanel(job) {
   if (!job || !job.id) return;
   state.currentJob = job;
   els.chatTab.classList.add("event-visible");
-  els.eventPanel.hidden = false;
   els.copyEventLogButton.disabled = false;
   const diagnostics = job.diagnostics || {};
   els.eventStatus.textContent = diagnostics.state || job.status || "";
@@ -505,13 +502,11 @@ function renderEventPanel(job) {
 
 function hideEventPanel() {
   state.currentJob = null;
-  els.chatTab.classList.remove("event-visible");
-  els.eventPanel.hidden = true;
   els.eventStatus.textContent = "";
   els.eventCopyStatus.textContent = "";
   els.copyEventLogButton.disabled = true;
-  els.eventMeta.innerHTML = "";
-  els.eventList.innerHTML = "";
+  els.eventMeta.innerHTML = '<div>작업 이벤트가 여기에 표시됩니다.</div>';
+  els.eventList.innerHTML = '<div class="muted">아직 이벤트가 없습니다.</div>';
 }
 
 function buildEventLogText(job) {

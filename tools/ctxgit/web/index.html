@@ -91,7 +91,7 @@
           </div>
         </header>
 
-        <section id="chatTab" class="tab-panel active">
+        <section id="chatTab" class="tab-panel active event-visible">
           <div class="chat-main">
             <div id="messageList" class="message-list"></div>
             <div id="progressPanel" class="progress-panel" hidden>
@@ -105,17 +105,21 @@
               <button id="historyChatButton" type="button">Info chat</button>
             </form>
           </div>
-          <aside id="eventPanel" class="event-panel" hidden>
+          <aside id="eventPanel" class="event-panel">
             <div class="event-panel-header">
               <span>Events</span>
               <div class="event-header-actions">
                 <span id="eventStatus" class="event-status"></span>
-                <button id="copyEventLogButton" type="button">로그 복사</button>
+                <button id="copyEventLogButton" type="button" disabled>로그 복사</button>
               </div>
             </div>
             <div id="eventCopyStatus" class="event-copy-status"></div>
-            <div id="eventMeta" class="event-meta"></div>
-            <div id="eventList" class="event-list"></div>
+            <div id="eventMeta" class="event-meta">
+              <div>작업 이벤트가 여기에 표시됩니다.</div>
+            </div>
+            <div id="eventList" class="event-list">
+              <div class="muted">아직 이벤트가 없습니다.</div>
+            </div>
           </aside>
         </section>
 
