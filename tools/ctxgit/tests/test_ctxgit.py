@@ -753,7 +753,7 @@ class CtxgitTest(unittest.TestCase):
             self.assertEqual(kwargs["encoding"], "utf-8")
             self.assertEqual(kwargs["errors"], "replace")
 
-    def test_info_chat_uses_search_and_read_only_sandbox(self) -> None:
+    def test_info_chat_uses_search_read_only_sandbox_and_allows_reads(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             store = ctxgit.ContextStore(root)
@@ -788,6 +788,8 @@ class CtxgitTest(unittest.TestCase):
             command, kwargs = seen[0]
             self.assertIn("--search", command)
             self.assertEqual(command[command.index("--sandbox") + 1], "read-only")
+            self.assertIn("You may read additional project files", kwargs["input"])
+            self.assertIn("archive, and branch context files", kwargs["input"])
             self.assertIn("Do not edit files", kwargs["input"])
 
     def test_run_process_with_progress_closes_utf8_stdin(self) -> None:
