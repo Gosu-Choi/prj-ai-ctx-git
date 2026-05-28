@@ -16,7 +16,9 @@ can be diffed, merged, and committed.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import contextlib
+import hashlib
 import html
 import importlib.util
 import http.server
@@ -36,6 +38,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -101,6 +104,7 @@ class ResearchExecutionError(RuntimeError):
 
 
 ProgressCallback = Callable[[str], None]
+MergeBranchSummaryCallback = Callable[[dict[str, Any]], str]
 
 
 def utc_now() -> str:
@@ -405,6 +409,69 @@ def demote_markdown_headings(text: str, levels: int = 1) -> str:
     return "\n".join(lines)
 
 
+def new_history_record_id() -> str:
+    return f"msg_{uuid.uuid4().hex}"
+
+
+def normalize_history_text(text: str) -> str:
+    return "\n".join(line.rstrip() for line in text.replace("\r\n", "\n").replace("\r", "\n").strip().splitlines())
+
+
+def history_record_fingerprint(record: dict[str, Any]) -> str:
+    payload = {
+        "role": str(record.get("role") or "").strip().lower(),
+        "text": normalize_history_text(str(record.get("text") or "")),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def history_record_identity(record: dict[str, Any]) -> str:
+    record_id = str(record.get("id") or "").strip()
+    if record_id:
+        return f"id:{record_id}"
+    return f"fp:{history_record_fingerprint(record)}"
+
+
+def history_records_equivalent(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    if history_record_identity(left) == history_record_identity(right):
+        return True
+    return history_record_fingerprint(left) == history_record_fingerprint(right)
+
+
+def common_history_prefix_length(left: list[dict[str, Any]], right: list[dict[str, Any]]) -> int:
+    count = 0
+    for left_record, right_record in zip(left, right):
+        if not history_records_equivalent(left_record, right_record):
+            break
+        count += 1
+    return count
+
+
+def clone_history_record_for_branch(record: dict[str, Any], branch_id: str) -> dict[str, Any]:
+    cloned = dict(record)
+    cloned.setdefault("schemaVersion", 1)
+    cloned["branch"] = branch_id
+    return cloned
+
+
+def split_markdown_blocks(text: str) -> list[str]:
+    return [block.strip() for block in re.split(r"\n\s*\n+", text.strip()) if block.strip()]
+
+
+def context_block_fingerprint(block: str) -> str:
+    normalized_lines = []
+    for line in block.replace("\r\n", "\n").replace("\r", "\n").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if re.fullmatch(r"#+\s+.+", stripped):
+            stripped = re.sub(r"^#+\s+", "", stripped)
+        normalized_lines.append(re.sub(r"\s+", " ", stripped).lower())
+    normalized = "\n".join(normalized_lines)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
 @dataclass(frozen=True)
 class BranchPaths:
     root: Path
@@ -417,6 +484,12 @@ class BranchPaths:
     sources: Path
     compactions: Path
     archives: Path
+
+
+@dataclass(frozen=True)
+class HistoryMergeResult:
+    records: list[dict[str, Any]]
+    summary: str
 
 
 class ContextStore:
@@ -999,6 +1072,7 @@ class ContextStore:
             die("role must be one of: user, assistant, system, note")
         record = {
             "schemaVersion": 1,
+            "id": new_history_record_id(),
             "branch": branch_id,
             "role": role,
             "text": text,
@@ -1006,6 +1080,8 @@ class ContextStore:
         }
         if extra:
             record.update(extra)
+        if not str(record.get("id") or "").strip():
+            record["id"] = new_history_record_id()
         with paths.history.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
         self.touch_branch(branch_id)
@@ -1284,6 +1360,7 @@ class ContextStore:
         target_id: str,
         title: str | None = None,
         history_limit: int = 12,
+        branch_summarizer: MergeBranchSummaryCallback | None = None,
     ) -> Path:
         self.require_initialized()
         safe_target = validate_id(target_id, "branch")
@@ -1306,13 +1383,18 @@ class ContextStore:
             title=title or f"Merged: {', '.join(safe_branches)}",
             tags=["merge"],
         )
-        summary = self.merge_summary_markdown(safe_branches, history_limit=history_limit)
+        history_result = self.merge_history_pairwise(
+            safe_branches,
+            safe_target,
+            history_limit=history_limit,
+            branch_summarizer=branch_summarizer,
+        )
         archived_sources = [
             self.archive_source_branch(safe_target, source_id) for source_id in safe_branches
         ]
         write_text(
             target_paths.context,
-            self.default_merged_context_markdown(safe_target, safe_branches, summary),
+            self.default_merged_context_markdown(safe_target, safe_branches, history_result.summary),
         )
         meta = load_json(target_paths.meta)
         meta["parents"] = safe_branches
@@ -1320,20 +1402,17 @@ class ContextStore:
             "createdAt": utc_now(),
             "sourceBranches": safe_branches,
             "archivedSources": archived_sources,
+            "historyPolicy": "common-prefix-with-pairwise-divergence-summary",
         }
         dump_json(target_paths.meta, meta)
-        self.append_history(
-            safe_target,
-            "system",
-            summary,
-            extra={
-                "event": "merge",
-                "sources": archived_sources,
-                "summaryKind": "source-history-summary",
-            },
-        )
+        write_text(target_paths.history, self.serialize_history_records(history_result.records))
         self.write_index()
         return target_paths.root
+
+    def serialize_history_records(self, records: list[dict[str, Any]]) -> str:
+        if not records:
+            return ""
+        return "".join(json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n" for item in records)
 
     def archive_source_branch(self, target_id: str, source_id: str) -> dict[str, Any]:
         target_paths = self.branch_paths(target_id)
@@ -1353,42 +1432,247 @@ class ContextStore:
             "historyCount": sum(1 for _ in self.iter_history(source_id)),
         }
 
+    def merge_history_pairwise(
+        self,
+        branch_ids: list[str],
+        target_id: str,
+        history_limit: int = 12,
+        branch_summarizer: MergeBranchSummaryCallback | None = None,
+    ) -> HistoryMergeResult:
+        current_records = self.read_history_file(self.branch_paths(branch_ids[0]).history)
+        current_sources = [branch_ids[0]]
+        step_summaries: list[str] = []
+        for step_index, right_id in enumerate(branch_ids[1:], start=1):
+            right_records = self.read_history_file(self.branch_paths(right_id).history)
+            prefix_count = common_history_prefix_length(current_records, right_records)
+            left_tail = current_records[prefix_count:]
+            right_tail = right_records[prefix_count:]
+            common_prefix = current_records[:prefix_count]
+            left_request = {
+                "branchId": current_sources[0] if len(current_sources) == 1 else "",
+                "sourceIds": current_sources,
+                "side": "left",
+                "stepIndex": step_index,
+                "commonPrefixRecords": common_prefix,
+                "divergentRecords": left_tail,
+                "oppositeSourceIds": [right_id],
+            }
+            right_request = {
+                "branchId": right_id,
+                "sourceIds": [right_id],
+                "side": "right",
+                "stepIndex": step_index,
+                "commonPrefixRecords": common_prefix,
+                "divergentRecords": right_tail,
+                "oppositeSourceIds": current_sources,
+            }
+            left_summary, right_summary = self.merge_side_summaries_parallel(
+                left_request,
+                right_request,
+                branch_summarizer,
+                history_limit=history_limit,
+            )
+            step_summary = self.merge_pair_summary_markdown(
+                step_index,
+                current_sources,
+                right_id,
+                prefix_count,
+                len(left_tail),
+                len(right_tail),
+                left_summary,
+                right_summary,
+                history_limit=history_limit,
+            )
+            step_summaries.append(step_summary)
+            merged_records = [
+                clone_history_record_for_branch(record, target_id)
+                for record in current_records[:prefix_count]
+            ]
+            if left_tail or right_tail:
+                merged_records.append(
+                    {
+                        "schemaVersion": 1,
+                        "id": new_history_record_id(),
+                        "branch": target_id,
+                        "role": "system",
+                        "text": step_summary,
+                        "createdAt": utc_now(),
+                        "event": "merge",
+                        "sources": [*current_sources, right_id],
+                        "summaryKind": "common-prefix-divergence-summary",
+                        "pairwiseStep": step_index,
+                        "commonPrefixCount": prefix_count,
+                        "leftTailCount": len(left_tail),
+                        "rightTailCount": len(right_tail),
+                    }
+                )
+            current_records = merged_records
+            current_sources = [*current_sources, right_id]
+        overall_summary = self.overall_pairwise_merge_summary(branch_ids, step_summaries)
+        return HistoryMergeResult(records=current_records, summary=overall_summary)
+
     def merge_summary_markdown(self, branch_ids: list[str], history_limit: int = 12) -> str:
+        return self.merge_history_pairwise(branch_ids, "merge-preview", history_limit=history_limit).summary
+
+    def merge_side_summary(
+        self,
+        request: dict[str, Any],
+        branch_summarizer: MergeBranchSummaryCallback | None,
+        history_limit: int = 12,
+    ) -> str:
+        if branch_summarizer:
+            summary = str(branch_summarizer(request) or "").strip()
+            if summary:
+                return summary
+        records = request.get("divergentRecords")
+        if not isinstance(records, list):
+            records = []
+        return self.summarize_divergent_history_tail(records, history_limit=history_limit)
+
+    def merge_side_summaries_parallel(
+        self,
+        left_request: dict[str, Any],
+        right_request: dict[str, Any],
+        branch_summarizer: MergeBranchSummaryCallback | None,
+        history_limit: int = 12,
+    ) -> tuple[str, str]:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            left_future = executor.submit(
+                self.merge_side_summary,
+                left_request,
+                branch_summarizer,
+                history_limit,
+            )
+            right_future = executor.submit(
+                self.merge_side_summary,
+                right_request,
+                branch_summarizer,
+                history_limit,
+            )
+            return left_future.result(), right_future.result()
+
+    def branch_display_label(self, branch_id: str) -> str:
+        meta = load_json(self.branch_paths(branch_id).meta)
+        title = str(meta.get("title") or branch_id)
+        return f"{title} (`{branch_id}`)"
+
+    def merge_pair_summary_markdown(
+        self,
+        step_index: int,
+        left_source_ids: list[str],
+        right_id: str,
+        common_prefix_count: int,
+        left_tail_count: int,
+        right_tail_count: int,
+        left_summary: str,
+        right_summary: str,
+        history_limit: int = 12,
+    ) -> str:
+        left_label = ", ".join(self.branch_display_label(branch_id) for branch_id in left_source_ids)
+        right_label = self.branch_display_label(right_id)
         lines = [
-            "# Merge Summary",
+            f"# Pairwise Merge Step {step_index}",
             "",
-            "This branch starts from summarized parent histories. Full parent",
+            "| Field | Value |",
+            "| --- | --- |",
+            f"| Left side | {left_label} |",
+            f"| Right side | {right_label} |",
+            f"| Common chat prefix | {common_prefix_count} messages reused once |",
+            f"| Left divergent messages | {left_tail_count} |",
+            f"| Right divergent messages | {right_tail_count} |",
+            "",
+            f"## 브랜치 요약 ({left_label})",
+            "",
+            left_summary.strip() or "_No divergent messages._",
+            "",
+            f"## 브랜치 요약 ({right_label})",
+            "",
+            right_summary.strip() or "_No divergent messages._",
+            "",
+            "## Merge Starting Point",
+            "",
+            "- Continue from the shared prefix plus this divergence summary.",
+            "- Use archived source histories when exact provenance is needed.",
+        ]
+        return "\n".join(lines).rstrip()
+
+    def overall_pairwise_merge_summary(self, branch_ids: list[str], step_summaries: list[str]) -> str:
+        lines = [
+            "# Pairwise Merge Summary",
+            "",
+            "This branch keeps identical leading chat messages once, then replaces",
+            "branch-specific divergent tails with pairwise summaries. Full source",
             "history snapshots are preserved under this branch's archives.",
             "",
             "## Source Branches",
             "",
+            *[f"- {self.branch_display_label(branch_id)}" for branch_id in branch_ids],
+            "",
         ]
+        for summary in step_summaries:
+            lines.extend([demote_markdown_headings(summary, levels=1), ""])
+        return "\n".join(lines).rstrip()
+
+    def summarize_divergent_history_tail(
+        self,
+        records: list[dict[str, Any]],
+        history_limit: int = 12,
+    ) -> str:
+        if not records:
+            return "_No divergent messages._"
+        role_counts: dict[str, int] = {}
+        for record in records:
+            role = str(record.get("role") or "unknown")
+            role_counts[role] = role_counts.get(role, 0) + 1
+        role_summary = ", ".join(f"{role}: {count}" for role, count in sorted(role_counts.items()))
+        lines = [
+            f"- Messages: {len(records)}",
+            f"- Roles: {role_summary}",
+            "",
+        ]
+        selected = records
+        omitted = 0
+        if len(records) > history_limit:
+            head_count = min(3, history_limit // 2)
+            tail_count = max(1, history_limit - head_count)
+            selected = [*records[:head_count], *records[-tail_count:]]
+            omitted = len(records) - len(selected)
+        if omitted:
+            lines.append(f"_Omitted {omitted} middle divergent messages from this compact summary._")
+            lines.append("")
+        lines.extend(["### Representative Messages", ""])
+        for record in selected:
+            lines.append(f"- {self.format_summary_history_record(record)}")
+        return "\n".join(lines).rstrip()
+
+    def format_summary_history_record(self, record: dict[str, Any]) -> str:
+        created = str(record.get("createdAt") or "")
+        role = str(record.get("role") or "unknown")
+        text = normalize_history_text(str(record.get("text") or ""))
+        text = truncate_middle(text, 900)
+        if created:
+            return f"{created} {role}: {text}"
+        return f"{role}: {text}"
+
+    def deduplicated_source_context_markdown(self, branch_ids: list[str]) -> str:
+        seen: set[str] = set()
+        lines: list[str] = []
         for branch_id in branch_ids:
-            meta = load_json(self.branch_paths(branch_id).meta)
-            title = meta.get("title") or branch_id
-            lines.extend(
-                [
-                    f"### {title} (`{branch_id}`)",
-                    "",
-                    "#### Branch Context",
-                    "",
-                    demote_markdown_headings(self.context_excerpt(branch_id), levels=3),
-                    "",
-                    "#### Recent Conversation",
-                    "",
-                    self.format_recent_history(branch_id, limit=history_limit),
-                    "",
-                ]
-            )
-        lines.extend(
-            [
-                "## Integrated Starting Point",
-                "",
-                "- Consolidate shared findings from the source branches.",
-                "- Preserve unresolved tensions as research questions.",
-                "- Continue new investigation in this merged branch, using archives for provenance.",
-            ]
-        )
+            unique_blocks = []
+            for block in split_markdown_blocks(read_text(self.branch_paths(branch_id).context)):
+                if re.fullmatch(r"#+\s+.+", block.strip()):
+                    continue
+                fingerprint = context_block_fingerprint(block)
+                if fingerprint in seen:
+                    continue
+                seen.add(fingerprint)
+                unique_blocks.append(block)
+            lines.extend([f"### {self.branch_display_label(branch_id)}", ""])
+            if unique_blocks:
+                for block in unique_blocks:
+                    lines.extend([demote_markdown_headings(block, levels=3), ""])
+            else:
+                lines.extend(["_No unique context blocks beyond earlier source branches._", ""])
         return "\n".join(lines).rstrip()
 
     def default_merged_context_markdown(
@@ -1410,11 +1694,15 @@ class ContextStore:
                 "| Field | Value |",
                 "| --- | --- |",
                 f"| Source branches | {', '.join(f'`{branch}`' for branch in source_branches)} |",
-                "| History policy | Parent histories are summarized here and archived as snapshots. |",
+                "| History policy | Shared leading chat messages are reused once; divergent tails are summarized pairwise and archived as snapshots. |",
                 "",
-                "## Merged Source Summary",
+                "## Merged Conversation Summary",
                 "",
-                demote_markdown_headings(summary, levels=1),
+                demote_markdown_headings(summary, levels=2),
+                "",
+                "## Deduplicated Source Context",
+                "",
+                self.deduplicated_source_context_markdown(source_branches),
                 "",
                 "## Research Question",
                 "",
@@ -2869,6 +3157,35 @@ def compaction_context_sections(store: ContextStore, branch_id: str, budget_char
     return "\n\n".join(reversed(sections)).strip() or "(none)"
 
 
+def archive_reference_section(store: ContextStore, branch_id: str) -> str:
+    archives = store.list_archives(branch_id)
+    if not archives:
+        return ""
+    lines = [
+        "This branch has merge archive snapshots. When provenance or source-branch",
+        "conversation detail matters, you may read the archived source context files",
+        "and archived chat histories listed here.",
+        "",
+    ]
+    for archive in archives:
+        archive_id = str(archive.get("id") or "")
+        title = str(archive.get("title") or archive_id)
+        history = str(archive.get("history") or "")
+        context = str(archive.get("context") or "")
+        meta = str(archive.get("meta") or "")
+        history_count = archive.get("historyCount")
+        lines.extend(
+            [
+                f"- {title} (`{archive_id}`)",
+                f"  - archived history: `{history}`"
+                + (f" ({history_count} messages)" if isinstance(history_count, int) else ""),
+                f"  - archived context: `{context}`",
+                f"  - archived metadata: `{meta}`",
+            ]
+        )
+    return "\n".join(lines).strip()
+
+
 def format_history_record(record: dict[str, Any]) -> str:
     role = record.get("role", "unknown")
     created = record.get("createdAt", "")
@@ -2917,6 +3234,7 @@ def build_context_bundle(store: ContextStore, branch_id: str) -> dict[str, str]:
         "branch": branch_context or "(none)",
         "sources": source_context,
         "compactions": compaction_context,
+        "archives": archive_reference_section(store, branch_id),
         "history": "\n".join(history_lines) or "(none)",
     }
 
@@ -2929,47 +3247,59 @@ def build_chat_prompt(
 ) -> str:
     context = build_context_bundle(store, branch_id)
     approved_paths = "\n".join(f"- {path}" for path in approved_external_paths or []) or "(none)"
-    return "\n".join(
+    parts = [
+        "You are the assistant inside ctxgit, a git-managed research conversation system.",
+        "",
+        "Work like an agentic research collaborator: plan when needed, preserve evidence,",
+        "use durable memory, and keep branch state reviewable in files.",
+        "When the user asks for edits, you may modify files inside the opened project",
+        "workspace directly. Do not ask for permission for in-project file edits.",
+        "Do not write, delete, move, or overwrite files outside the opened project",
+        "workspace unless that exact external target is listed as approved below.",
+        "If an outside-workspace write is needed and not approved, do not attempt it.",
+        "Instead, ask for permission by returning approvalRequests with the target path,",
+        "operation, and reason.",
+        "",
+        "Approved external write targets for this turn:",
+        "<approved_external_paths>",
+        approved_paths,
+        "</approved_external_paths>",
+        "",
+        f"Branch: {branch_id}",
+        "",
+        "Project-level instructions and memory:",
+        "<project_context>",
+        context["project"],
+        "</project_context>",
+        "",
+        "Branch report:",
+        "<branch_report>",
+        context["branch"],
+        "</branch_report>",
+        "",
+        "Branch source files and extracted text:",
+        "<sources>",
+        context["sources"],
+        "</sources>",
+        "",
+        "Long-history compactions:",
+        "<compactions>",
+        context["compactions"],
+        "</compactions>",
+        "",
+    ]
+    if context["archives"]:
+        parts.extend(
+            [
+                "Merge archives available for this branch:",
+                "<archives>",
+                context["archives"],
+                "</archives>",
+                "",
+            ]
+        )
+    parts.extend(
         [
-            "You are the assistant inside ctxgit, a git-managed research conversation system.",
-            "",
-            "Work like an agentic research collaborator: plan when needed, preserve evidence,",
-            "use durable memory, and keep branch state reviewable in files.",
-            "When the user asks for edits, you may modify files inside the opened project",
-            "workspace directly. Do not ask for permission for in-project file edits.",
-            "Do not write, delete, move, or overwrite files outside the opened project",
-            "workspace unless that exact external target is listed as approved below.",
-            "If an outside-workspace write is needed and not approved, do not attempt it.",
-            "Instead, ask for permission by returning approvalRequests with the target path,",
-            "operation, and reason.",
-            "",
-            "Approved external write targets for this turn:",
-            "<approved_external_paths>",
-            approved_paths,
-            "</approved_external_paths>",
-            "",
-            f"Branch: {branch_id}",
-            "",
-            "Project-level instructions and memory:",
-            "<project_context>",
-            context["project"],
-            "</project_context>",
-            "",
-            "Branch report:",
-            "<branch_report>",
-            context["branch"],
-            "</branch_report>",
-            "",
-            "Branch source files and extracted text:",
-            "<sources>",
-            context["sources"],
-            "</sources>",
-            "",
-            "Long-history compactions:",
-            "<compactions>",
-            context["compactions"],
-            "</compactions>",
-            "",
             "Relevant branch conversation history selected within the context budget:",
             "<history>",
             context["history"],
@@ -3000,6 +3330,7 @@ def build_chat_prompt(
             "and mention any files you changed directly.",
         ]
     )
+    return "\n".join(parts)
 
 
 def build_history_chat_prompt(store: ContextStore, branch_id: str, user_message: str) -> str:
@@ -3020,34 +3351,47 @@ def build_history_chat_prompt(store: ContextStore, branch_id: str, user_message:
     history_lines = [format_history_record(item) for item in history_records]
     if omitted:
         history_lines.insert(0, f"- [ctxgit omitted {omitted} older raw history records]")
-    return "\n".join(
+    archive_references = archive_reference_section(store, branch_id)
+    parts = [
+        "You are answering in ctxgit info-chat mode.",
+        "",
+        "This is an information-sharing conversation mode, not an agent-editing mode.",
+        "Use only these information sources:",
+        "1. Project memory/instructions supplied below.",
+        "2. Branch context and conversation history supplied below.",
+        "3. Live web search, only when it is useful for the user's question.",
+        "",
+        "You may read additional project files when needed, including source, research,",
+        "artifact, archive, and branch context files inside the opened project.",
+        "Do not edit files. Do not create artifacts. Answer directly and concisely.",
+        "If the history is insufficient, say what is missing instead of guessing.",
+        "Reply in the user's language unless the user asks otherwise.",
+        "",
+        f"Branch: {branch_id}",
+        "",
+        "Project memory and standing instructions:",
+        "<project_context>",
+        project_context or "(none)",
+        "</project_context>",
+        "",
+        "Branch context:",
+        "<branch_context>",
+        branch_context or "(none)",
+        "</branch_context>",
+        "",
+    ]
+    if archive_references:
+        parts.extend(
+            [
+                "Merge archives available for this branch:",
+                "<archives>",
+                archive_references,
+                "</archives>",
+                "",
+            ]
+        )
+    parts.extend(
         [
-            "You are answering in ctxgit info-chat mode.",
-            "",
-            "This is an information-sharing conversation mode, not an agent-editing mode.",
-            "Use only these information sources:",
-            "1. Project memory/instructions supplied below.",
-            "2. Branch context and conversation history supplied below.",
-            "3. Live web search, only when it is useful for the user's question.",
-            "",
-            "You may read additional project files when needed, including source, research,",
-            "artifact, archive, and branch context files inside the opened project.",
-            "Do not edit files. Do not create artifacts. Answer directly and concisely.",
-            "If the history is insufficient, say what is missing instead of guessing.",
-            "Reply in the user's language unless the user asks otherwise.",
-            "",
-            f"Branch: {branch_id}",
-            "",
-            "Project memory and standing instructions:",
-            "<project_context>",
-            project_context or "(none)",
-            "</project_context>",
-            "",
-            "Branch context:",
-            "<branch_context>",
-            branch_context or "(none)",
-            "</branch_context>",
-            "",
             "Branch conversation history:",
             "<history>",
             "\n".join(history_lines) or "(none)",
@@ -3064,6 +3408,7 @@ def build_history_chat_prompt(store: ContextStore, branch_id: str, user_message:
             "- approvalRequests: empty array.",
         ]
     )
+    return "\n".join(parts)
 
 
 def chat_output_schema() -> dict[str, Any]:
@@ -3693,6 +4038,152 @@ def run_history_chat_turn(
     )
     emit_progress(progress, "Refreshing branch view")
     return branch_payload(store, branch_id)
+
+
+def format_merge_prompt_records(records: list[dict[str, Any]]) -> str:
+    if not records:
+        return "(none)"
+    sections = []
+    for index, record in enumerate(records, start=1):
+        record_id = str(record.get("id") or "")
+        created = str(record.get("createdAt") or "")
+        role = str(record.get("role") or "unknown")
+        header_parts = [f"{index}. {role}"]
+        if created:
+            header_parts.append(created)
+        if record_id:
+            header_parts.append(f"id={record_id}")
+        text = normalize_history_text(str(record.get("text") or ""))
+        sections.extend([f"### {' · '.join(header_parts)}", "", text or "(empty)", ""])
+    return "\n".join(sections).rstrip()
+
+
+def merge_branch_file_hints(store: ContextStore, source_ids: list[str]) -> str:
+    lines: list[str] = []
+    for branch_id in source_ids:
+        paths = store.branch_paths(branch_id)
+        lines.extend(
+            [
+                f"## {store.branch_display_label(branch_id)}",
+                f"- Branch context: `{relpath(store.root, paths.context)}`",
+                f"- Raw history: `{relpath(store.root, paths.history)}`",
+            ]
+        )
+        for label, directory in (
+            ("Notes", paths.notes),
+            ("Research", paths.research),
+            ("Artifacts", paths.artifacts),
+            ("Sources", paths.sources),
+            ("Compactions", paths.compactions),
+            ("Archives", paths.archives),
+        ):
+            if not directory.exists():
+                continue
+            files = [path for path in sorted(directory.rglob("*")) if path.is_file()]
+            if not files:
+                continue
+            lines.append(f"- {label}:")
+            for path in files[:40]:
+                lines.append(f"  - `{relpath(store.root, path)}`")
+            if len(files) > 40:
+                lines.append(f"  - ... {len(files) - 40} more files")
+    return "\n".join(lines).strip() or "(none)"
+
+
+def build_merge_branch_summary_prompt(store: ContextStore, request: dict[str, Any]) -> str:
+    source_ids = [str(item) for item in request.get("sourceIds") or []]
+    branch_id = str(request.get("branchId") or (source_ids[0] if source_ids else ""))
+    opposite_source_ids = [str(item) for item in request.get("oppositeSourceIds") or []]
+    common_prefix = request.get("commonPrefixRecords")
+    divergent = request.get("divergentRecords")
+    if not isinstance(common_prefix, list):
+        common_prefix = []
+    if not isinstance(divergent, list):
+        divergent = []
+    branch_label = store.branch_display_label(branch_id) if branch_id else ", ".join(source_ids)
+    opposite_label = ", ".join(store.branch_display_label(item) for item in opposite_source_ids) or "(none)"
+    return "\n".join(
+        [
+            "This is an internal ctxgit merge-summary request. It should behave like an",
+            "info-chat question on the source branch, but the answer will be inserted into",
+            "the new merged branch and must not be recorded on the source branch.",
+            "",
+            "Task:",
+            f"- Summarize the divergent chat tail for: {branch_label}",
+            f"- Use the shared prefix as prior conversation context: {len(common_prefix)} messages.",
+            f"- The opposite merge side is: {opposite_label}. Do not summarize that side here.",
+            "- Read project/branch context files when useful. Prefer the branch context, notes,",
+            "  research, artifacts, sources, and archives listed below.",
+            "- Produce a synthesis, not a transcript. Explain what this branch added, changed,",
+            "  decided, left unresolved, and what evidence/context matters.",
+            "- Maximum length: roughly two A4 pages.",
+            "- Do not include raw JSON, do not include `[... truncated ...]`, and do not say",
+            "  that this is an internal request.",
+            "- Write in the user's dominant language for this branch.",
+            "",
+            "Relevant files you may inspect:",
+            "<file_hints>",
+            merge_branch_file_hints(store, source_ids),
+            "</file_hints>",
+            "",
+            "Shared prefix context:",
+            "<common_prefix>",
+            format_merge_prompt_records(common_prefix),
+            "</common_prefix>",
+            "",
+            "Divergent tail to summarize:",
+            "<divergent_tail>",
+            format_merge_prompt_records(divergent),
+            "</divergent_tail>",
+        ]
+    )
+
+
+def summarize_merge_branch_with_info_chat(
+    root: Path,
+    store: ContextStore,
+    request: dict[str, Any],
+    progress: ProgressCallback | None = None,
+) -> str:
+    records = request.get("divergentRecords")
+    if not isinstance(records, list) or not records:
+        return "공통 prefix 이후 이 브랜치에만 추가된 대화는 없습니다."
+    branch_id = str(request.get("branchId") or "").strip()
+    if not branch_id:
+        return ""
+    emit_progress(progress, f"머지 요약 생성 중: {store.branch_display_label(branch_id)}")
+    prompt = build_merge_branch_summary_prompt(store, request)
+    result = call_codex_history_chat(root, store, branch_id, prompt, progress=progress)
+    return str(result.get("assistant") or "").strip()
+
+
+def run_merge_branches(
+    root: Path,
+    store: ContextStore,
+    branch_ids: list[str],
+    target_id: str,
+    title: str | None = None,
+    history_limit: int = 12,
+    provider: str | None = None,
+    progress: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    selected_provider = provider or str(read_llm_config(root).get("provider") or "codex")
+    if selected_provider != "codex":
+        raise RuntimeError(f"Unsupported merge provider: {selected_provider}")
+    emit_progress(progress, "Preparing merge summaries")
+
+    def branch_summarizer(request: dict[str, Any]) -> str:
+        return summarize_merge_branch_with_info_chat(root, store, request, progress=progress)
+
+    store.merge_branches(
+        branch_ids,
+        target_id,
+        title=title,
+        history_limit=history_limit,
+        branch_summarizer=branch_summarizer,
+    )
+    emit_progress(progress, "Refreshing branch view")
+    return branch_payload(store, target_id)
 
 
 def run_approval_decision(
@@ -4652,7 +5143,7 @@ def make_handler(project_state: ProjectState):
             except SystemExit as exc:
                 self.send_json({"error": "project_not_initialized", "project": project_state.payload()}, status=int(exc.code or 409))
                 return
-            if parsed.path == "/api/merge":
+            if parsed.path in {"/api/merge", "/api/merge/start"}:
                 raw_branches = body.get("branches")
                 if isinstance(raw_branches, list):
                     branch_ids = [str(item) for item in raw_branches if str(item).strip()]
@@ -4660,9 +5151,39 @@ def make_handler(project_state: ProjectState):
                     branch_ids = str(raw_branches or "").split()
                 name = str(body.get("name") or "")
                 title = str(body.get("title") or "") or None
+                provider = str(body.get("provider") or "") or None
+                history_limit = coerce_positive_int(body.get("limit"), 12)
+                if parsed.path == "/api/merge/start":
+                    def work(progress: ProgressCallback) -> dict[str, Any]:
+                        return run_merge_branches(
+                            root,
+                            store,
+                            branch_ids,
+                            name,
+                            title=title,
+                            history_limit=history_limit,
+                            provider=provider,
+                            progress=progress,
+                        )
+
+                    self.send_json(jobs.create("merge", work), status=202)
+                    return
                 try:
-                    store.merge_branches(branch_ids, name, title=title)
-                    self.send_json(branch_payload(store, name))
+                    self.send_json(
+                        run_merge_branches(
+                            root,
+                            store,
+                            branch_ids,
+                            name,
+                            title=title,
+                            history_limit=history_limit,
+                            provider=provider,
+                        )
+                    )
+                except ChatTimeoutError as exc:
+                    self.send_json({"error": "timeout", "message": str(exc)}, status=504)
+                except RuntimeError as exc:
+                    self.send_json({"error": "merge_failed", "message": str(exc)}, status=500)
                 except SystemExit as exc:
                     self.send_json({"error": "merge_failed"}, status=int(exc.code or 400))
                 return
@@ -5112,13 +5633,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "merge":
-        path = store.merge_branches(
+        payload = run_merge_branches(
+            root,
+            store,
             args.branches,
             args.name,
             title=args.title,
             history_limit=args.limit,
         )
-        print(path.relative_to(root))
+        print(payload["paths"]["root"])
         return 0
 
     if args.command == "research":

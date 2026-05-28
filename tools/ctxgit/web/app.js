@@ -813,6 +813,9 @@ async function monitorTrackedJob(jobId) {
       await refreshBranchNavigation().catch(() => {});
       if (state.activeBranch === branch) {
         renderBranch(remembered.payload);
+        if (remembered.mode === "merge") {
+          selectTab("archives");
+        }
         renderGit(await api("/api/git/status"));
         renderProvider(await api("/api/provider/status"));
         hideProgressSoon();
@@ -823,7 +826,7 @@ async function monitorTrackedJob(jobId) {
     if (remembered.status === "failed") {
       renderBranches();
       if (state.activeBranch === branch) {
-        const prefix = remembered.error === "timeout" ? "시간 초과" : remembered.error === "job_not_found" ? "중단됨" : remembered.mode === "research" ? "리서치 실패" : "채팅 실패";
+        const prefix = remembered.error === "timeout" ? "시간 초과" : remembered.error === "job_not_found" ? "중단됨" : remembered.mode === "research" ? "리서치 실패" : remembered.mode === "merge" ? "머지 실패" : "채팅 실패";
         els.messageList.insertAdjacentHTML(
           "beforebegin",
           `<div class="error-banner">${prefix}: ${escapeHtml(remembered.message || "작업 실패")}</div>`,
@@ -1320,21 +1323,21 @@ els.mergeForm.addEventListener("submit", async (event) => {
     return;
   }
   els.mergeButton.disabled = true;
-  els.mergeStatus.textContent = "Merging...";
+  els.mergeStatus.textContent = "Starting merge...";
   els.mergeStatus.className = "settings-status";
   try {
-    const payload = await api("/api/merge", {
-      method: "POST",
-      body: JSON.stringify({ branches, name }),
-    });
     state.activeBranch = name;
-    await loadBranches();
-    renderBranch(payload);
+    markBranchActivity(name);
+    renderBranches();
+    await startTrackedJob(
+      "/api/merge/start",
+      { branches, name },
+      { branch: name, mode: "merge", title: "머지 요약 생성 중" },
+    );
     els.mergeSourcesInput.value = "";
     els.mergeNameInput.value = "";
-    els.mergeStatus.textContent = "Merged.";
+    els.mergeStatus.textContent = "Merge started.";
     els.mergeStatus.classList.add("ok");
-    selectTab("archives");
   } catch (error) {
     els.mergeStatus.textContent = `Merge failed: ${error.message}`;
     els.mergeStatus.classList.add("error");

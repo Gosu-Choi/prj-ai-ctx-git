@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -30,10 +31,11 @@ class CtxgitTest(unittest.TestCase):
             store.create_branch("AItrust", title="AI trust")
             store.create_branch("AIdiscipline", title="AI discipline")
 
-            store.append_history("AItrust", "user", "Can I trust an AI assistant?")
+            record = store.append_history("AItrust", "user", "Can I trust an AI assistant?")
             store.append_history("AIdiscipline", "assistant", "Use explicit rituals.")
             view_path = store.write_merge_view(["AItrust", "AIdiscipline"], "trust-discipline")
 
+            self.assertTrue(record["id"].startswith("msg_"))
             self.assertTrue((root / "contexts/branches/AItrust/context.md").exists())
             history = (root / "contexts/branches/AItrust/history.jsonl").read_text()
             self.assertEqual(json.loads(history)["role"], "user")
@@ -90,10 +92,164 @@ class CtxgitTest(unittest.TestCase):
             self.assertEqual(len(history), 1)
             self.assertEqual(history[0]["role"], "system")
             self.assertEqual(history[0]["event"], "merge")
+            self.assertEqual(history[0]["summaryKind"], "common-prefix-divergence-summary")
+            self.assertIn("Trust question", history[0]["text"])
+            self.assertIn("Discipline answer", history[0]["text"])
             archives = store.list_archives("combined")
             self.assertEqual([item["id"] for item in archives], ["AItrust", "AIdiscipline"])
             archived = store.archive_payload("combined", "AItrust")
             self.assertEqual(archived["history"][0]["text"], "Trust question")
+            context = (merge_root / "context.md").read_text(encoding="utf-8")
+            self.assertIn("Merged Conversation Summary", context)
+            self.assertIn("Deduplicated Source Context", context)
+            chat_prompt = ctxgit.build_chat_prompt(store, "combined", "Use archive if needed.")
+            self.assertIn("Merge archives available for this branch", chat_prompt)
+            self.assertIn("contexts/branches/combined/archives/AItrust/history.jsonl", chat_prompt)
+            self.assertIn("archived chat histories", chat_prompt)
+            info_prompt = ctxgit.build_history_chat_prompt(store, "combined", "Use archive if needed.")
+            self.assertIn("Merge archives available for this branch", info_prompt)
+            self.assertIn("contexts/branches/combined/archives/AIdiscipline/context.md", info_prompt)
+            source_prompt = ctxgit.build_history_chat_prompt(store, "AItrust", "No archives here.")
+            self.assertNotIn("Merge archives available for this branch", source_prompt)
+
+    def test_empty_archive_directory_does_not_add_archive_prompt_section(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("plain")
+            self.assertTrue((root / "contexts/branches/plain/archives").exists())
+
+            prompt = ctxgit.build_history_chat_prompt(store, "plain", "Anything archived?")
+
+            self.assertNotIn("Merge archives available for this branch", prompt)
+            self.assertEqual(store.list_archives("plain"), [])
+
+    def test_merge_keeps_common_prefix_once_and_summarizes_divergence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("source", title="Source")
+            first = store.append_history("source", "user", "a")
+            second = store.append_history("source", "assistant", "b")
+            third = store.append_history("source", "user", "c")
+            store.fork_branch_at_history("source", "forked", 2, title="Forked")
+            store.append_history("source", "assistant", "d")
+            store.append_history("source", "user", "e")
+            store.append_history("source", "assistant", "f")
+            store.append_history("forked", "assistant", "d prime")
+            store.append_history("forked", "user", "e prime")
+            store.append_history("forked", "assistant", "f prime")
+
+            store.merge_branches(["source", "forked"], "merged")
+
+            records = list(store.iter_history("merged"))
+            self.assertEqual([record["text"] for record in records[:3]], ["a", "b", "c"])
+            self.assertEqual([record["id"] for record in records[:3]], [first["id"], second["id"], third["id"]])
+            self.assertEqual(len(records), 4)
+            self.assertEqual(records[-1]["role"], "system")
+            self.assertEqual(records[-1]["commonPrefixCount"], 3)
+            self.assertIn("d", records[-1]["text"])
+            self.assertIn("d prime", records[-1]["text"])
+
+    def test_run_merge_uses_hidden_parallel_info_chats_for_branch_summaries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("source", title="Source")
+            store.append_history("source", "user", "a")
+            store.append_history("source", "assistant", "b")
+            store.append_history("source", "user", "c")
+            store.fork_branch_at_history("source", "forked", 2, title="Forked")
+            store.append_history("source", "assistant", "d")
+            store.append_history("forked", "assistant", "d prime")
+            original = ctxgit.call_codex_history_chat
+            prompts: dict[str, str] = {}
+            active = 0
+            max_active = 0
+            lock = threading.Lock()
+            try:
+                def fake_info_chat(_root, _store, branch_id, user_message, progress=None):
+                    nonlocal active, max_active
+                    with lock:
+                        active += 1
+                        max_active = max(max_active, active)
+                    try:
+                        time.sleep(0.05)
+                        prompts[branch_id] = user_message
+                        return {
+                            "assistant": f"LLM summary for {branch_id}",
+                            "artifacts": [],
+                            "approvalRequests": [],
+                        }
+                    finally:
+                        with lock:
+                            active -= 1
+
+                ctxgit.call_codex_history_chat = fake_info_chat
+                payload = ctxgit.run_merge_branches(root, store, ["source", "forked"], "merged")
+            finally:
+                ctxgit.call_codex_history_chat = original
+
+            self.assertEqual(payload["meta"]["id"], "merged")
+            self.assertGreaterEqual(max_active, 2)
+            self.assertEqual(set(prompts), {"source", "forked"})
+            self.assertIn("Divergent tail to summarize", prompts["source"])
+            self.assertIn("Shared prefix context", prompts["forked"])
+            self.assertEqual(len(list(store.iter_history("source"))), 4)
+            self.assertEqual(len(list(store.iter_history("forked"))), 4)
+            records = list(store.iter_history("merged"))
+            self.assertEqual([record["text"] for record in records[:3]], ["a", "b", "c"])
+            self.assertEqual(records[-1]["role"], "system")
+            self.assertIn("브랜치 요약", records[-1]["text"])
+            self.assertIn("LLM summary for source", records[-1]["text"])
+            self.assertIn("LLM summary for forked", records[-1]["text"])
+
+    def test_merge_deduplicates_context_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("left", title="Left")
+            store.create_branch("right", title="Right")
+            ctxgit.write_text(
+                root / "contexts/branches/left/context.md",
+                "# Left\n\nShared context line.\n\nLeft-only context.\n",
+            )
+            ctxgit.write_text(
+                root / "contexts/branches/right/context.md",
+                "# Right\n\nShared context line.\n\nRight-only context.\n",
+            )
+            store.append_history("left", "user", "left tail")
+            store.append_history("right", "user", "right tail")
+
+            merge_root = store.merge_branches(["left", "right"], "merged")
+
+            context = (merge_root / "context.md").read_text(encoding="utf-8")
+            self.assertEqual(context.count("Shared context line."), 1)
+            self.assertIn("Left-only context.", context)
+            self.assertIn("Right-only context.", context)
+
+    def test_merge_three_branches_uses_pairwise_fold(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            for branch_id in ["rw1", "rw2", "rw3"]:
+                store.create_branch(branch_id)
+                store.append_history(branch_id, "user", "shared")
+            store.append_history("rw1", "assistant", "rw1 tail")
+            store.append_history("rw2", "assistant", "rw2 tail")
+            store.append_history("rw3", "assistant", "rw3 tail")
+
+            store.merge_branches(["rw1", "rw2", "rw3"], "merged")
+
+            records = list(store.iter_history("merged"))
+            self.assertEqual([record["text"] for record in records[:1]], ["shared"])
+            self.assertEqual(len(records), 2)
+            self.assertEqual(records[-1]["pairwiseStep"], 2)
+            self.assertIn("Pairwise Merge Step 2", records[-1]["text"])
+            self.assertIn("rw3 tail", records[-1]["text"])
+            context = (root / "contexts/branches/merged/context.md").read_text(encoding="utf-8")
+            self.assertIn("Pairwise Merge Step 1", context)
+            self.assertIn("Pairwise Merge Step 2", context)
 
     def test_agent_files_are_project_global(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
