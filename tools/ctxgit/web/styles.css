@@ -203,6 +203,7 @@ textarea {
 .nav-list {
   display: grid;
   gap: 5px;
+  min-width: 0;
 }
 
 .branch-row {
@@ -226,7 +227,9 @@ textarea {
 }
 
 .nav-item {
+  min-width: 0;
   width: 100%;
+  overflow: hidden;
   padding: 9px 10px;
   text-align: left;
   border-radius: 6px;
@@ -292,11 +295,19 @@ textarea {
 
 .nav-title {
   display: block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-weight: 650;
 }
 
 .nav-meta {
   display: block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   margin-top: 2px;
   color: var(--muted);
   font-size: 12px;
@@ -631,6 +642,7 @@ textarea {
   gap: 7px;
   min-height: 0;
   overflow: auto;
+  overflow-anchor: none;
   padding: 10px 11px;
 }
 

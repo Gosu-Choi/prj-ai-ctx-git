@@ -287,9 +287,9 @@ function renderBranches() {
           : "";
       return `
         <div class="branch-row ${branch.id === state.activeBranch ? "active" : ""} ${statusClass}">
-          <button class="nav-item branch-main ${branch.id === state.activeBranch ? "active" : ""}" data-branch="${escapeHtml(branch.id)}" type="button">
-            <span class="nav-title">${escapeHtml(branch.title)}</span>
-            <span class="nav-meta">${escapeHtml(branch.id)} · ${branch.historyCount} messages${escapeHtml(jobLabel)}</span>
+          <button class="nav-item branch-main ${branch.id === state.activeBranch ? "active" : ""}" data-branch="${escapeHtml(branch.id)}" type="button" title="${escapeHtml(`${branch.title} (${branch.id})`)}">
+            <span class="nav-title" title="${escapeHtml(branch.title)}">${escapeHtml(branch.title)}</span>
+            <span class="nav-meta" title="${escapeHtml(`${branch.id} · ${branch.historyCount} messages${jobLabel}`)}">${escapeHtml(branch.id)} · ${branch.historyCount} messages${escapeHtml(jobLabel)}</span>
           </button>
           <button class="branch-options-button" data-branch-options="${escapeHtml(branch.id)}" type="button" aria-label="Branch options">...</button>
           <div class="branch-options-menu">
@@ -356,9 +356,9 @@ function renderBranches() {
     state.views
       .map(
         (view) => `
-          <button class="nav-item" data-view="${escapeHtml(view.id)}" type="button">
-            <span class="nav-title">${escapeHtml(view.id)}</span>
-            <span class="nav-meta">${escapeHtml(view.path)}</span>
+          <button class="nav-item" data-view="${escapeHtml(view.id)}" type="button" title="${escapeHtml(`${view.id} (${view.path})`)}">
+            <span class="nav-title" title="${escapeHtml(view.id)}">${escapeHtml(view.id)}</span>
+            <span class="nav-meta" title="${escapeHtml(view.path)}">${escapeHtml(view.path)}</span>
           </button>
         `,
       )
@@ -374,9 +374,9 @@ function renderGlobalizedList() {
     state.globalized
       .map(
         (archive) => `
-          <button class="nav-item ${archive.id === state.activeGlobalized ? "active" : ""}" data-globalized="${escapeHtml(archive.id)}" type="button">
-            <span class="nav-title">${escapeHtml(archive.title || archive.id)}</span>
-            <span class="nav-meta">${escapeHtml(archive.sourceBranch || "")} · ${archive.rangeStart || "?"}-${archive.rangeEnd || "?"} · ${archive.messageCount || 0} messages</span>
+          <button class="nav-item ${archive.id === state.activeGlobalized ? "active" : ""}" data-globalized="${escapeHtml(archive.id)}" type="button" title="${escapeHtml(`${archive.title || archive.id} (${archive.sourceBranch || "archived"})`)}">
+            <span class="nav-title" title="${escapeHtml(archive.title || archive.id)}">${escapeHtml(archive.title || archive.id)}</span>
+            <span class="nav-meta" title="${escapeHtml(`${archive.sourceBranch || ""} · ${archive.rangeStart || "?"}-${archive.rangeEnd || "?"} · ${archive.messageCount || 0} messages`)}">${escapeHtml(archive.sourceBranch || "")} · ${archive.rangeStart || "?"}-${archive.rangeEnd || "?"} · ${archive.messageCount || 0} messages</span>
           </button>
         `,
       )
@@ -589,8 +589,26 @@ function hideProgress() {
   els.progressEvents.innerHTML = "";
 }
 
+function isEventListNearBottom() {
+  const remaining = els.eventList.scrollHeight - els.eventList.scrollTop - els.eventList.clientHeight;
+  return remaining <= 32;
+}
+
+function setEventListScrollTop(value) {
+  els.eventList.scrollTop = value;
+  window.requestAnimationFrame(() => {
+    els.eventList.scrollTop = value;
+    window.requestAnimationFrame(() => {
+      els.eventList.scrollTop = value;
+    });
+  });
+}
+
 function renderEventPanel(job) {
   if (!job || !job.id) return;
+  const isNewJob = state.currentJob?.id !== job.id;
+  const previousScrollTop = els.eventList.scrollTop;
+  const shouldFollowEvents = isNewJob || isEventListNearBottom();
   state.currentJob = job;
   els.chatTab.classList.add("event-visible");
   els.copyEventLogButton.disabled = false;
@@ -618,7 +636,7 @@ function renderEventPanel(job) {
         `,
       )
       .join("") || '<div class="muted">아직 이벤트가 없습니다.</div>';
-  els.eventList.scrollTop = els.eventList.scrollHeight;
+  setEventListScrollTop(shouldFollowEvents ? els.eventList.scrollHeight : previousScrollTop);
 }
 
 function hideEventPanel() {
