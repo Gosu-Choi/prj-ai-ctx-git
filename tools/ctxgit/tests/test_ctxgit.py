@@ -78,6 +78,26 @@ class CtxgitTest(unittest.TestCase):
             self.assertEqual(items[0]["lastUserMessageAt"], "2026-01-03T00:00:00Z")
             self.assertEqual(items[1]["lastMessageAt"], "2026-01-04T00:00:00Z")
 
+    def test_archive_branch_range_writes_branch_and_globalized_copies(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("alpha")
+            store.append_history("alpha", "user", "first")
+            store.append_history("alpha", "assistant", "second")
+            store.append_history("alpha", "user", "third")
+
+            payload = store.archive_branch_range("alpha", 2, 3)
+
+            self.assertEqual(payload["id"], "alpha_globalized")
+            self.assertEqual([record["text"] for record in payload["history"]], ["second", "third"])
+            self.assertTrue((root / "contexts" / "branches" / "alpha" / "archived" / "alpha_globalized" / "history.jsonl").exists())
+            self.assertTrue((root / "contexts" / "globalized" / "alpha_globalized" / "history.jsonl").exists())
+            archives = store.list_globalized_archives()
+            self.assertEqual([item["id"] for item in archives], ["alpha_globalized"])
+            self.assertEqual(archives[0]["rangeStart"], 2)
+            self.assertEqual(archives[0]["rangeEnd"], 3)
+
     def test_delete_history_record_rewrites_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

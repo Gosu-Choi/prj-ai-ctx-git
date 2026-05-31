@@ -1,8 +1,10 @@
 const state = {
   project: null,
   activeBranch: null,
+  activeGlobalized: null,
   branches: [],
   views: [],
+  globalized: [],
   payload: null,
   provider: null,
   currentJob: null,
@@ -23,6 +25,7 @@ const els = {
   projectStatus: document.querySelector("#projectStatus"),
   branchList: document.querySelector("#branchList"),
   viewList: document.querySelector("#viewList"),
+  globalizedList: document.querySelector("#globalizedList"),
   gitSummary: document.querySelector("#gitSummary"),
   providerSummary: document.querySelector("#providerSummary"),
   mergeForm: document.querySelector("#mergeForm"),
@@ -230,8 +233,10 @@ function setProjectStatus(message, kind = "") {
 
 function clearWorkspace(message = "Select or initialize a ctxgit project.") {
   state.activeBranch = null;
+  state.activeGlobalized = null;
   state.branches = [];
   state.views = [];
+  state.globalized = [];
   state.payload = null;
   renderBranches();
   els.activeTitle.textContent = "No project selected";
@@ -290,6 +295,7 @@ function renderBranches() {
           <div class="branch-options-menu">
             <button data-branch-rename="${escapeHtml(branch.id)}" data-branch-title="${escapeHtml(branch.title)}" type="button">Rename branch</button>
             <button data-branch-clone="${escapeHtml(branch.id)}" type="button">Clone branch</button>
+            <button data-branch-archive="${escapeHtml(branch.id)}" type="button">Archive branch</button>
             <button class="danger" data-branch-remove="${escapeHtml(branch.id)}" type="button">Remove branch</button>
           </div>
         </div>
@@ -329,6 +335,13 @@ function renderBranches() {
       await renameBranch(branch, title.trim());
     });
   });
+  els.branchList.querySelectorAll("[data-branch-archive]").forEach((button) => {
+    button.addEventListener("click", async (event) => {
+      event.stopPropagation();
+      closeBranchMenus();
+      await archiveBranch(button.dataset.branchArchive);
+    });
+  });
   els.branchList.querySelectorAll("[data-branch-remove]").forEach((button) => {
     button.addEventListener("click", async (event) => {
       event.stopPropagation();
@@ -352,6 +365,24 @@ function renderBranches() {
       .join("") || '<div class="muted">No views yet</div>';
   els.viewList.querySelectorAll("[data-view]").forEach((button) => {
     button.addEventListener("click", () => loadView(button.dataset.view));
+  });
+  renderGlobalizedList();
+}
+
+function renderGlobalizedList() {
+  els.globalizedList.innerHTML =
+    state.globalized
+      .map(
+        (archive) => `
+          <button class="nav-item ${archive.id === state.activeGlobalized ? "active" : ""}" data-globalized="${escapeHtml(archive.id)}" type="button">
+            <span class="nav-title">${escapeHtml(archive.title || archive.id)}</span>
+            <span class="nav-meta">${escapeHtml(archive.sourceBranch || "")} · ${archive.rangeStart || "?"}-${archive.rangeEnd || "?"} · ${archive.messageCount || 0} messages</span>
+          </button>
+        `,
+      )
+      .join("") || '<div class="muted">No archived chats yet</div>';
+  els.globalizedList.querySelectorAll("[data-globalized]").forEach((button) => {
+    button.addEventListener("click", () => loadGlobalizedArchive(button.dataset.globalized));
   });
 }
 
@@ -720,6 +751,7 @@ async function refreshBranchNavigation() {
   const data = await api("/api/branches");
   state.branches = data.branches || [];
   state.views = data.views || [];
+  state.globalized = data.globalized || [];
   renderBranches();
 }
 
@@ -860,6 +892,7 @@ function renderBranch(payload) {
             <div class="message-header">
               <span class="message-role">${escapeHtml(message.role)}</span>
               <span class="message-meta-actions">
+                <span class="message-number">${index + 1}</span>
                 <span>${escapeHtml(message.createdAt)}</span>
                 <span class="message-options">
                   <button
@@ -987,7 +1020,8 @@ async function loadBranches() {
   const data = await api("/api/branches");
   state.branches = data.branches || [];
   state.views = data.views || [];
-  if (!state.activeBranch && state.branches.length) {
+  state.globalized = data.globalized || [];
+  if (!state.activeBranch && !state.activeGlobalized && state.branches.length) {
     state.activeBranch = state.branches[0].id;
   }
   renderBranches();
@@ -1071,6 +1105,7 @@ async function projectPathForAction() {
 
 async function loadBranch(branch) {
   state.activeBranch = branch;
+  state.activeGlobalized = null;
   acknowledgeBranchJob(branch);
   selectTab("chat");
   renderBranches();
@@ -1229,6 +1264,34 @@ async function removeBranch(branch) {
   }
 }
 
+async function archiveBranch(branch) {
+  if (!branch) return;
+  const range = window.prompt(`Archive some range from ${branch}? Enter start,end message numbers:`, "1,1");
+  if (!range) return;
+  const parts = range
+    .split(/[,\s]+/)
+    .map((item) => Number.parseInt(item.trim(), 10))
+    .filter((item) => Number.isInteger(item));
+  if (parts.length !== 2) {
+    window.alert("Archive range must be two message numbers, like 2,5.");
+    return;
+  }
+  try {
+    const payload = await api("/api/branch/archive", {
+      method: "POST",
+      body: JSON.stringify({ branch, start: parts[0], end: parts[1] }),
+    });
+    state.globalized = payload.globalized || state.globalized;
+    if (state.activeBranch === branch) {
+      renderBranch(payload);
+    }
+    renderBranches();
+    await loadGlobalizedArchive(payload.archive?.id);
+  } catch (error) {
+    window.alert(`Archive failed: ${error.message}`);
+  }
+}
+
 async function loadArchive(archiveId) {
   if (!state.activeBranch) return;
   const payload = await api(
@@ -1261,9 +1324,54 @@ async function loadArchive(archiveId) {
   `;
 }
 
+async function loadGlobalizedArchive(archiveId) {
+  if (!archiveId) return;
+  const payload = await api(`/api/globalized?id=${encodeURIComponent(archiveId)}`);
+  state.activeBranch = null;
+  state.activeGlobalized = archiveId;
+  renderBranches();
+  const meta = payload.meta || {};
+  const range = `${meta.rangeStart || "?"}-${meta.rangeEnd || "?"}`;
+  els.activeTitle.textContent = meta.title || archiveId;
+  els.activeMeta.textContent = `${meta.sourceBranch || "archived"} · messages ${range}`;
+  els.reportView.innerHTML = renderMarkdown(payload.markdown || "");
+  const messages =
+    (payload.history || [])
+      .map(
+        (message, index) => `
+          <article class="message">
+            <div class="message-header">
+              <span class="message-role">${escapeHtml(message.role)}</span>
+              <span class="message-meta-actions">
+                <span class="message-number">${(meta.rangeStart || 1) + index}</span>
+                <span>${escapeHtml(message.createdAt)}</span>
+              </span>
+            </div>
+            <div class="message-text">${renderMessageText(message.text)}</div>
+          </article>
+        `,
+      )
+      .join("") || '<div class="muted">No archived messages.</div>';
+  els.archiveList.innerHTML = `
+    <button class="nav-item active" type="button">
+      <span class="nav-title">${escapeHtml(meta.title || archiveId)}</span>
+      <span class="nav-meta">${escapeHtml(payload.paths?.history || "")}</span>
+    </button>
+  `;
+  els.archiveViewer.innerHTML = `
+    <div class="archive-heading">
+      <h2>${escapeHtml(meta.title || archiveId)}</h2>
+      <div class="active-meta">${escapeHtml(payload.paths?.markdown || "")}</div>
+    </div>
+    <div class="message-list">${messages}</div>
+  `;
+  selectTab("archives");
+}
+
 async function loadView(view) {
   const payload = await api(`/api/view?id=${encodeURIComponent(view)}`);
   state.activeBranch = null;
+  state.activeGlobalized = null;
   renderBranches();
   els.activeTitle.textContent = payload.id;
   els.activeMeta.textContent = payload.path;

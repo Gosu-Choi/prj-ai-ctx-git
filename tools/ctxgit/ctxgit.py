@@ -484,6 +484,7 @@ class BranchPaths:
     sources: Path
     compactions: Path
     archives: Path
+    archived: Path
 
 
 @dataclass(frozen=True)
@@ -498,6 +499,7 @@ class ContextStore:
         self.contexts = self.root / "contexts"
         self.branches = self.contexts / "branches"
         self.views = self.contexts / "views"
+        self.globalized = self.contexts / "globalized"
         self.agents = self.contexts / "agents"
         self.config_dir = self.root / ".ctxgit"
         self.config = self.config_dir / "config.json"
@@ -516,11 +518,13 @@ class ContextStore:
             sources=root / "sources",
             compactions=root / "compactions",
             archives=root / "archives",
+            archived=root / "archived",
         )
 
     def init(self, create_initial_branch: bool = True) -> None:
         self.branches.mkdir(parents=True, exist_ok=True)
         self.views.mkdir(parents=True, exist_ok=True)
+        self.globalized.mkdir(parents=True, exist_ok=True)
         self.config_dir.mkdir(parents=True, exist_ok=True)
         ensure_project_gitignore(self.root)
         if not self.config.exists():
@@ -993,6 +997,98 @@ class ContextStore:
         self.ensure_initial_branch()
         self.write_index()
 
+    def unique_globalized_archive_id(self, branch_id: str) -> str:
+        branch_slug = slugify(branch_id, fallback="branch")
+        suffix = "_globalized"
+        base = f"{branch_slug[: max(1, 80 - len(suffix))]}{suffix}"
+        paths = self.branch_paths(branch_id)
+        for index in range(1, 1000):
+            numbered_suffix = "" if index == 1 else f"_{index}"
+            candidate = f"{base[: 80 - len(numbered_suffix)]}{numbered_suffix}"
+            if not (self.globalized / candidate).exists() and not (paths.archived / candidate).exists():
+                return candidate
+        return f"{base[:66]}_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+
+    def archived_history_markdown(
+        self,
+        archive_id: str,
+        branch_id: str,
+        records: list[dict[str, Any]],
+        start: int,
+        end: int,
+        created_at: str,
+    ) -> str:
+        lines = [
+            f"# {archive_id}",
+            "",
+            "## Archive Metadata",
+            "",
+            "| Field | Value |",
+            "| --- | --- |",
+            f"| Source branch | `{branch_id}` |",
+            f"| Message range | `{start}-{end}` |",
+            f"| Message count | {len(records)} |",
+            f"| Created | `{created_at}` |",
+            "",
+            "## Archived Chat",
+            "",
+        ]
+        for offset, record in enumerate(records, start=start):
+            role = str(record.get("role") or "unknown")
+            timestamp = str(record.get("createdAt") or "")
+            text = str(record.get("text") or "").strip()
+            lines.extend(
+                [
+                    f"### {offset}. {role}",
+                    "",
+                    f"- Created: `{timestamp}`",
+                    "",
+                    text or "_No text._",
+                    "",
+                ]
+            )
+        return "\n".join(lines).rstrip() + "\n"
+
+    def archive_branch_range(self, branch_id: str, start: int, end: int) -> dict[str, Any]:
+        self.require_initialized()
+        safe_branch = validate_id(branch_id, "branch")
+        paths = self.branch_paths(safe_branch)
+        if not paths.root.exists():
+            die(f"branch does not exist: {branch_id}")
+        records = list(self.iter_history(safe_branch))
+        if not records:
+            raise ValueError("branch has no history to archive")
+        low, high = sorted((start, end))
+        if low < 1 or high > len(records):
+            raise ValueError(f"archive range must be between 1 and {len(records)}")
+        selected = records[low - 1 : high]
+        created_at = utc_now()
+        archive_id = self.unique_globalized_archive_id(safe_branch)
+        history_text = "".join(json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n" for item in selected)
+        markdown = self.archived_history_markdown(archive_id, safe_branch, selected, low, high, created_at)
+        branch_archive_root = paths.archived / archive_id
+        globalized_root = self.globalized / archive_id
+        meta = {
+            "schemaVersion": 1,
+            "id": archive_id,
+            "title": archive_id,
+            "sourceBranch": safe_branch,
+            "createdAt": created_at,
+            "rangeStart": low,
+            "rangeEnd": high,
+            "messageCount": len(selected),
+            "branchArchivePath": relpath(self.root, branch_archive_root),
+            "globalizedPath": relpath(self.root, globalized_root),
+            "history": relpath(self.root, globalized_root / "history.jsonl"),
+            "markdown": relpath(self.root, globalized_root / "archive.md"),
+        }
+        for archive_root in (branch_archive_root, globalized_root):
+            write_text(archive_root / "history.jsonl", history_text)
+            write_text(archive_root / "archive.md", markdown)
+            dump_json(archive_root / "globalized.json", meta)
+        self.touch_branch(safe_branch)
+        return self.globalized_payload(archive_id)
+
     def ensure_initial_branch(self) -> bool:
         if self.branch_paths(INITIAL_BRANCH_ID).meta.exists():
             return False
@@ -1019,6 +1115,7 @@ class ContextStore:
         paths.sources.mkdir(parents=True, exist_ok=True)
         paths.compactions.mkdir(parents=True, exist_ok=True)
         paths.archives.mkdir(parents=True, exist_ok=True)
+        paths.archived.mkdir(parents=True, exist_ok=True)
         meta = {
             "schemaVersion": 1,
             "id": validate_id(branch_id, "branch"),
@@ -1879,6 +1976,57 @@ class ContextStore:
                 }
             )
         return archives
+
+    def list_globalized_archives(self) -> list[dict[str, Any]]:
+        archives: list[dict[str, Any]] = []
+        if not self.globalized.exists():
+            return archives
+        for meta_path in sorted(self.globalized.glob("*/globalized.json")):
+            try:
+                meta = load_json(meta_path)
+            except SystemExit:
+                continue
+            archive_id = str(meta.get("id") or meta_path.parent.name)
+            archives.append(
+                {
+                    "id": archive_id,
+                    "title": meta.get("title") or archive_id,
+                    "sourceBranch": meta.get("sourceBranch") or "",
+                    "createdAt": meta.get("createdAt") or "",
+                    "rangeStart": meta.get("rangeStart"),
+                    "rangeEnd": meta.get("rangeEnd"),
+                    "messageCount": meta.get("messageCount", 0),
+                    "history": relpath(self.root, meta_path.parent / "history.jsonl"),
+                    "markdown": relpath(self.root, meta_path.parent / "archive.md"),
+                    "meta": relpath(self.root, meta_path),
+                }
+            )
+        archives.sort(key=lambda item: str(item.get("id") or "").lower())
+        archives.sort(
+            key=lambda item: parse_utc(item.get("createdAt")) or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )
+        return archives
+
+    def globalized_payload(self, archive_id: str) -> dict[str, Any]:
+        safe_archive = validate_id(archive_id, "globalized archive")
+        archive_root = self.globalized / safe_archive
+        if not archive_root.exists():
+            die(f"globalized archive does not exist: {archive_id}")
+        meta_path = archive_root / "globalized.json"
+        history_path = archive_root / "history.jsonl"
+        markdown_path = archive_root / "archive.md"
+        return {
+            "id": safe_archive,
+            "meta": load_json(meta_path),
+            "markdown": read_text(markdown_path),
+            "history": self.read_history_file(history_path),
+            "paths": {
+                "history": relpath(self.root, history_path),
+                "markdown": relpath(self.root, markdown_path),
+                "meta": relpath(self.root, meta_path),
+            },
+        }
 
     def archive_payload(self, branch_id: str, archive_id: str) -> dict[str, Any]:
         paths = self.branch_paths(branch_id)
@@ -5015,7 +5163,13 @@ def make_handler(project_state: ProjectState):
                 self.send_json({"error": "project_not_initialized", "project": project_state.payload()}, status=int(exc.code or 409))
                 return True
             if parsed.path == "/api/branches":
-                self.send_json({"branches": store.list_branches(), "views": store.list_views()})
+                self.send_json(
+                    {
+                        "branches": store.list_branches(),
+                        "views": store.list_views(),
+                        "globalized": store.list_globalized_archives(),
+                    }
+                )
                 return True
             if parsed.path == "/api/branch":
                 branch_id = (query.get("id") or [""])[0]
@@ -5031,6 +5185,13 @@ def make_handler(project_state: ProjectState):
                     self.send_json(store.archive_payload(branch_id, archive_id))
                 except SystemExit as exc:
                     self.send_json({"error": "archive_not_found"}, status=int(exc.code or 404))
+                return True
+            if parsed.path == "/api/globalized":
+                archive_id = (query.get("id") or [""])[0]
+                try:
+                    self.send_json(store.globalized_payload(archive_id))
+                except SystemExit as exc:
+                    self.send_json({"error": "globalized_not_found"}, status=int(exc.code or 404))
                 return True
             if parsed.path == "/api/view":
                 try:
@@ -5227,9 +5388,34 @@ def make_handler(project_state: ProjectState):
                 branch_id = str(body.get("branch") or "")
                 try:
                     store.remove_branch(branch_id)
-                    self.send_json({"branches": store.list_branches(), "views": store.list_views()})
+                    self.send_json(
+                        {
+                            "branches": store.list_branches(),
+                            "views": store.list_views(),
+                            "globalized": store.list_globalized_archives(),
+                        }
+                    )
                 except SystemExit as exc:
                     self.send_json({"error": "remove_failed"}, status=int(exc.code or 400))
+                return
+            if parsed.path == "/api/branch/archive":
+                branch_id = str(body.get("branch") or "")
+                try:
+                    start = int(body.get("start"))
+                    end = int(body.get("end"))
+                except (TypeError, ValueError):
+                    self.send_json({"error": "invalid_archive_range", "message": "archive range is required"}, status=400)
+                    return
+                try:
+                    archive = store.archive_branch_range(branch_id, start, end)
+                    payload = branch_payload(store, branch_id)
+                    payload["archive"] = archive
+                    payload["globalized"] = store.list_globalized_archives()
+                    self.send_json(payload)
+                except ValueError as exc:
+                    self.send_json({"error": "archive_failed", "message": str(exc)}, status=400)
+                except SystemExit as exc:
+                    self.send_json({"error": "archive_failed"}, status=int(exc.code or 400))
                 return
             if parsed.path == "/api/ingest":
                 branch_id = str(body.get("branch") or "")
