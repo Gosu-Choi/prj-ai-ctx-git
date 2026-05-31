@@ -45,6 +45,39 @@ class CtxgitTest(unittest.TestCase):
             self.assertIn("Executive Summary", view)
             self.assertIn("Comparative Findings", view)
 
+    def test_list_branches_orders_by_last_user_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("alpha")
+            store.create_branch("beta")
+            store.create_branch("empty")
+            store.append_history(
+                "alpha",
+                "user",
+                "Older user message",
+                extra={"createdAt": "2026-01-01T00:00:00Z"},
+            )
+            store.append_history(
+                "beta",
+                "user",
+                "Newer user message",
+                extra={"createdAt": "2026-01-03T00:00:00Z"},
+            )
+            store.append_history(
+                "alpha",
+                "assistant",
+                "Assistant reply after the newer user message",
+                extra={"createdAt": "2026-01-04T00:00:00Z"},
+            )
+            store.rename_branch("empty", "Recently touched")
+
+            items = store.list_branches()
+
+            self.assertEqual([item["id"] for item in items], ["beta", "alpha", "empty"])
+            self.assertEqual(items[0]["lastUserMessageAt"], "2026-01-03T00:00:00Z")
+            self.assertEqual(items[1]["lastMessageAt"], "2026-01-04T00:00:00Z")
+
     def test_delete_history_record_rewrites_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

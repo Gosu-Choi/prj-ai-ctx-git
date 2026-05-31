@@ -364,8 +364,10 @@ textarea {
 #chatTab.active {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+  align-items: stretch;
   gap: 14px;
-  overflow: auto;
+  overflow: hidden;
   padding: 18px 22px;
 }
 
@@ -375,10 +377,11 @@ textarea {
 
 .chat-main {
   display: grid;
-  grid-template-rows: auto auto auto;
-  align-content: start;
+  grid-template-rows: minmax(0, 1fr) auto auto;
   gap: 12px;
   min-width: 0;
+  min-height: 0;
+  height: 100%;
 }
 
 .message-list {
@@ -388,8 +391,11 @@ textarea {
   align-items: start;
   grid-auto-rows: max-content;
   max-width: 980px;
-  overflow: visible;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
   padding-bottom: 18px;
+  scrollbar-gutter: stable;
 }
 
 .message {
@@ -498,6 +504,7 @@ textarea {
   border: 1px solid var(--line);
   background: var(--panel);
   border-radius: 6px;
+  box-shadow: 0 12px 28px rgb(0 0 0 / 10%);
 }
 
 .composer textarea {
@@ -544,15 +551,12 @@ textarea {
 }
 
 .event-panel {
-  position: sticky;
-  top: 18px;
-  align-self: start;
+  align-self: stretch;
   display: grid;
   grid-template-rows: auto auto auto minmax(0, 1fr);
   min-width: 0;
-  height: calc(100vh - 118px);
-  max-height: calc(100vh - 118px);
-  min-height: 320px;
+  height: 100%;
+  min-height: 0;
   border-left: 1px solid var(--line);
   background: var(--panel);
   overflow: hidden;

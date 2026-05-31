@@ -386,7 +386,13 @@ function acknowledgeBranchJob(branchId) {
 
 function branchActivityTime(branchId) {
   const job = branchJob(branchId);
-  return state.branchActivityAt[branchId] || jobStartedAt(job);
+  const branch = state.branches.find((item) => item.id === branchId);
+  return (
+    state.branchActivityAt[branchId] ||
+    jobStartedAt(job) ||
+    Date.parse(branch?.lastUserMessageAt || "") ||
+    0
+  );
 }
 
 function orderedBranches() {
@@ -524,7 +530,7 @@ function renderApprovalRequests(requests, statuses = {}) {
 function scrollChatToBottom() {
   window.requestAnimationFrame(() => {
     window.requestAnimationFrame(() => {
-      els.chatTab.scrollTo({ top: els.chatTab.scrollHeight, behavior: "auto" });
+      els.messageList.scrollTo({ top: els.messageList.scrollHeight, behavior: "auto" });
     });
   });
 }

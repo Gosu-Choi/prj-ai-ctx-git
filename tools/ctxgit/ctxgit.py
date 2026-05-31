@@ -1036,18 +1036,8 @@ class ContextStore:
         self.require_initialized()
         items: list[dict[str, Any]] = []
         for meta_path in sorted(self.branches.glob("*/branch.json")):
-            meta = load_json(meta_path)
-            branch_id = str(meta.get("id") or meta_path.parent.name)
-            history_count = sum(1 for _ in self.iter_history(branch_id))
-            items.append(
-                {
-                    "id": branch_id,
-                    "title": meta.get("title") or branch_id,
-                    "parent": meta.get("parent"),
-                    "updatedAt": meta.get("updatedAt"),
-                    "historyCount": history_count,
-                }
-            )
+            items.append(self.branch_list_item(meta_path))
+        self.sort_branch_list(items)
         return items
 
     def list_views(self) -> list[dict[str, str]]:
@@ -1781,21 +1771,48 @@ class ContextStore:
         items: list[dict[str, Any]] = []
         for meta_path in sorted(self.branches.glob("*/branch.json")):
             try:
-                meta = load_json(meta_path)
+                items.append(self.branch_list_item(meta_path))
             except SystemExit:
                 continue
-            branch_id = str(meta.get("id") or meta_path.parent.name)
-            history_count = sum(1 for _ in self.iter_history(branch_id))
-            items.append(
-                {
-                    "id": branch_id,
-                    "title": meta.get("title") or branch_id,
-                    "parent": meta.get("parent"),
-                    "updatedAt": meta.get("updatedAt"),
-                    "historyCount": history_count,
-                }
-            )
+        self.sort_branch_list(items)
         return items
+
+    def branch_list_item(self, meta_path: Path) -> dict[str, Any]:
+        meta = load_json(meta_path)
+        branch_id = str(meta.get("id") or meta_path.parent.name)
+        history = list(self.iter_history(branch_id))
+        last_message_at = ""
+        last_user_message_at = ""
+        for record in history:
+            created_at = str(record.get("createdAt") or "")
+            if not created_at:
+                continue
+            last_message_at = created_at
+            if str(record.get("role") or "").lower() == "user":
+                last_user_message_at = created_at
+        return {
+            "id": branch_id,
+            "title": meta.get("title") or branch_id,
+            "parent": meta.get("parent"),
+            "createdAt": meta.get("createdAt"),
+            "updatedAt": meta.get("updatedAt"),
+            "lastMessageAt": last_message_at,
+            "lastUserMessageAt": last_user_message_at,
+            "historyCount": len(history),
+        }
+
+    @staticmethod
+    def sort_branch_list(items: list[dict[str, Any]]) -> None:
+        def parsed_time(value: Any) -> datetime:
+            return parse_utc(value) or datetime.min.replace(tzinfo=timezone.utc)
+
+        items.sort(key=lambda item: str(item.get("id") or "").lower())
+        items.sort(
+            key=lambda item: parsed_time(item.get("updatedAt") or item.get("createdAt")),
+            reverse=True,
+        )
+        items.sort(key=lambda item: parsed_time(item.get("lastUserMessageAt")), reverse=True)
+        items.sort(key=lambda item: bool(item.get("lastUserMessageAt")), reverse=True)
 
     def iter_history(self, branch_id: str) -> Iterable[dict[str, Any]]:
         return self.read_history_file(self.branch_paths(branch_id).history)
