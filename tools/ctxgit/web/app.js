@@ -1301,9 +1301,10 @@ async function archiveBranch(branch) {
     });
     state.globalized = payload.globalized || state.globalized;
     if (state.activeBranch === branch) {
-      renderBranch(payload);
+      state.activeBranch = null;
+      state.payload = null;
     }
-    renderBranches();
+    await refreshBranchNavigation();
     await loadGlobalizedArchive(payload.archive?.id);
   } catch (error) {
     window.alert(`Archive failed: ${error.message}`);

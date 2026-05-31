@@ -1086,6 +1086,12 @@ class ContextStore:
             write_text(archive_root / "history.jsonl", history_text)
             write_text(archive_root / "archive.md", markdown)
             dump_json(archive_root / "globalized.json", meta)
+        branch_meta = load_json(paths.meta)
+        branch_meta["archivedAt"] = created_at
+        branch_meta["archivedAs"] = archive_id
+        branch_meta["archivedRangeStart"] = low
+        branch_meta["archivedRangeEnd"] = high
+        dump_json(paths.meta, branch_meta)
         self.touch_branch(safe_branch)
         return self.globalized_payload(archive_id)
 
@@ -1133,6 +1139,8 @@ class ContextStore:
         self.require_initialized()
         items: list[dict[str, Any]] = []
         for meta_path in sorted(self.branches.glob("*/branch.json")):
+            if self.branch_is_archived(meta_path):
+                continue
             items.append(self.branch_list_item(meta_path))
         self.sort_branch_list(items)
         return items
@@ -1868,11 +1876,20 @@ class ContextStore:
         items: list[dict[str, Any]] = []
         for meta_path in sorted(self.branches.glob("*/branch.json")):
             try:
+                if self.branch_is_archived(meta_path):
+                    continue
                 items.append(self.branch_list_item(meta_path))
             except SystemExit:
                 continue
         self.sort_branch_list(items)
         return items
+
+    def branch_is_archived(self, meta_path: Path) -> bool:
+        meta = load_json(meta_path)
+        if meta.get("archivedAt"):
+            return True
+        branch_id = str(meta.get("id") or meta_path.parent.name)
+        return any(self.branch_paths(branch_id).archived.glob("*/globalized.json"))
 
     def branch_list_item(self, meta_path: Path) -> dict[str, Any]:
         meta = load_json(meta_path)

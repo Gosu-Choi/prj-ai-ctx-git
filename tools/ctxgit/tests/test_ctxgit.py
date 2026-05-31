@@ -97,6 +97,13 @@ class CtxgitTest(unittest.TestCase):
             self.assertEqual([item["id"] for item in archives], ["alpha_globalized"])
             self.assertEqual(archives[0]["rangeStart"], 2)
             self.assertEqual(archives[0]["rangeEnd"], 3)
+            self.assertEqual(store.list_branches(), [])
+            branch_meta = ctxgit.load_json(root / "contexts" / "branches" / "alpha" / "branch.json")
+            self.assertEqual(branch_meta["archivedAs"], "alpha_globalized")
+            branch_meta.pop("archivedAt")
+            branch_meta.pop("archivedAs")
+            ctxgit.dump_json(root / "contexts" / "branches" / "alpha" / "branch.json", branch_meta)
+            self.assertEqual(store.list_branches(), [])
 
     def test_delete_history_record_rewrites_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
