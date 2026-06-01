@@ -35,6 +35,7 @@ import shutil
 import socketserver
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import textwrap
@@ -1244,6 +1245,58 @@ class ContextStore:
         dump_json(target_paths.meta, meta)
         self.write_index()
 
+    @staticmethod
+    def completed_turn_id_for_history_index(records: list[dict[str, Any]], index: int) -> str:
+        future_turn_ids = {
+            str(record.get("turnId") or "").strip()
+            for record in records[index + 1 :]
+            if str(record.get("turnId") or "").strip()
+        }
+        for record in reversed(records[: index + 1]):
+            turn_id = str(record.get("turnId") or "").strip()
+            if turn_id and turn_id not in future_turn_ids:
+                return turn_id
+        return ""
+
+    def restore_branch_snapshot_from_internal_commit(self, source_id: str, target_id: str, commit: str) -> bool:
+        if not commit:
+            return False
+        source_paths = self.branch_paths(source_id)
+        target_paths = self.branch_paths(target_id)
+        source_rel = relpath(self.root, source_paths.root)
+        completed = subprocess.run(
+            ["git", f"--git-dir={internal_git_dir(self.root)}", "archive", "--format=tar", commit, source_rel],
+            cwd=self.root,
+            text=False,
+            capture_output=True,
+        )
+        if completed.returncode != 0 or not completed.stdout:
+            return False
+        with tempfile.TemporaryDirectory(prefix="ctxgit-fork-") as tmp:
+            tmp_path = Path(tmp).resolve()
+            with tarfile.open(fileobj=io.BytesIO(completed.stdout), mode="r:") as archive:
+                for member in archive:
+                    target = (tmp_path / member.name).resolve()
+                    if not path_is_within(tmp_path, target):
+                        raise ValueError("internal git archive contains an unsafe path")
+                    if member.isdir():
+                        target.mkdir(parents=True, exist_ok=True)
+                    elif member.isfile():
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        extracted = archive.extractfile(member)
+                        if extracted is None:
+                            continue
+                        target.write_bytes(extracted.read())
+                        try:
+                            os.chmod(target, member.mode & 0o777)
+                        except OSError:
+                            pass
+            extracted_source = tmp_path / source_rel
+            if not extracted_source.exists():
+                return False
+            shutil.copytree(extracted_source, target_paths.root)
+            return True
+
     def fork_branch_at_history(
         self,
         source_id: str,
@@ -1269,7 +1322,11 @@ class ContextStore:
         if expected_role and str(record.get("role") or "") != expected_role:
             raise ValueError("history record changed before fork; refresh and try again")
         target_paths.root.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(source_paths.root, target_paths.root)
+        snapshot_turn_id = self.completed_turn_id_for_history_index(records, index)
+        snapshot_commit = internal_git_rev_parse(self.root, ctxgit_turn_ref(snapshot_turn_id)) if snapshot_turn_id else ""
+        restored_from_snapshot = self.restore_branch_snapshot_from_internal_commit(source_id, target_id, snapshot_commit)
+        if not restored_from_snapshot:
+            shutil.copytree(source_paths.root, target_paths.root)
         now = utc_now()
         meta = load_json(target_paths.meta)
         source_title = str(meta.get("title") or source_id)
@@ -1278,6 +1335,9 @@ class ContextStore:
         meta["forkedFrom"] = validate_id(source_id, "branch")
         meta["forkedAtIndex"] = index
         meta["forkedAtCreatedAt"] = str(record.get("createdAt") or "")
+        meta["forkedFromTurnId"] = snapshot_turn_id
+        meta["forkedFromCommit"] = snapshot_commit
+        meta["forkedSnapshot"] = "internal-git" if restored_from_snapshot else "current-files"
         meta["createdAt"] = now
         meta["updatedAt"] = now
         dump_json(target_paths.meta, meta)
