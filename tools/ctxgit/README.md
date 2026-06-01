@@ -104,6 +104,12 @@ ctxgit snapshot -m "ctxgit: update AI trust contexts"
 ctxgit serve
 ```
 
+For local-only use on your own machine, run without the login gate:
+
+```bash
+ctxgit serve --no-auth
+```
+
 The web interface uses local accounts by default. The first signup creates the
 admin account, then signup closes unless `CTXGIT_ALLOW_SIGNUP=1` is set. User
 records are stored outside project snapshots in `.ctxgit/auth.json`; sessions
@@ -115,6 +121,10 @@ notes, and Git status in one place. The `Project` panel can open another
 initialized project or initialize a new directory, so one long-running UI can
 move between project workspaces without storing their contexts in this tool
 repo.
+
+Folder uploads are chunked from the browser. ctxgit sends each file in small
+pieces and records one upload turn after the selected files finish, which keeps
+large folder uploads below reverse-proxy and Cloudflare request-size limits.
 
 `Send` calls the configured LLM provider. The default is the local `codex` CLI
 using OpenAI Codex / ChatGPT OAuth. ctxgit uses `--sandbox workspace-write` by

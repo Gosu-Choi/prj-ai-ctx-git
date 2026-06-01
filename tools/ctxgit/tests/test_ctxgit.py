@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.request
 import unittest
 from pathlib import Path
 
@@ -207,6 +208,65 @@ class CtxgitTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 ctxgit.project_files_payload(root, "../")
 
+    def test_project_file_chunk_upload_appends_and_finishes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ctxgit.ContextStore(root).init()
+
+            first = ctxgit.upload_project_file_chunk(
+                root,
+                "uploads",
+                "notes/large.txt",
+                base64.b64encode(b"hello ").decode("ascii"),
+                0,
+                12,
+            )
+            second = ctxgit.upload_project_file_chunk(
+                root,
+                "uploads",
+                "notes/large.txt",
+                base64.b64encode(b"server").decode("ascii"),
+                6,
+                12,
+                last_chunk=True,
+            )
+
+            self.assertFalse(first["complete"])
+            self.assertTrue(second["complete"])
+            self.assertEqual((root / "uploads" / "notes" / "large.txt").read_text(encoding="utf-8"), "hello server")
+
+    def test_project_file_chunk_upload_rejects_existing_file_without_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ctxgit.ContextStore(root).init()
+            target = root / "uploads" / "same.txt"
+            target.parent.mkdir(parents=True)
+            target.write_text("old", encoding="utf-8")
+
+            with self.assertRaises(FileExistsError):
+                ctxgit.upload_project_file_chunk(
+                    root,
+                    "uploads",
+                    "same.txt",
+                    base64.b64encode(b"new").decode("ascii"),
+                    0,
+                    3,
+                    last_chunk=True,
+                )
+            result = ctxgit.upload_project_file_chunk(
+                root,
+                "uploads",
+                "same.txt",
+                base64.b64encode(b"new").decode("ascii"),
+                0,
+                3,
+                overwrite=True,
+                last_chunk=True,
+            )
+
+            self.assertTrue(result["complete"])
+            self.assertEqual(target.read_text(encoding="utf-8"), "new")
+
     def test_auth_store_first_signup_login_and_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -245,6 +305,32 @@ class CtxgitTest(unittest.TestCase):
             finally:
                 if previous is not None:
                     os.environ["CTXGIT_ALLOW_SIGNUP"] = previous
+
+    def test_no_auth_handler_allows_project_api(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ctxgit.ContextStore(root).init()
+            project_state = ctxgit.ProjectState(root)
+            handler = ctxgit.make_handler(project_state, auth_required=False)
+
+            with ctxgit.ReusableThreadingHTTPServer(("127.0.0.1", 0), handler) as server:
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                base_url = f"http://127.0.0.1:{server.server_port}"
+                try:
+                    with urllib.request.urlopen(f"{base_url}/api/auth/status", timeout=5) as response:
+                        auth = json.loads(response.read().decode("utf-8"))
+                    with urllib.request.urlopen(f"{base_url}/api/project", timeout=5) as response:
+                        project_status = response.status
+                        project = json.loads(response.read().decode("utf-8"))
+                finally:
+                    server.shutdown()
+                    thread.join(timeout=5)
+
+            self.assertFalse(auth["enabled"])
+            self.assertTrue(auth["authenticated"])
+            self.assertEqual(project_status, 200)
+            self.assertEqual(project["path"], str(root.resolve()))
 
     def test_internal_git_commits_turn_to_branch_ref(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

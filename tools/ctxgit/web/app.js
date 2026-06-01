@@ -21,6 +21,8 @@ const state = {
   startingBranches: {},
 };
 
+const UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024;
+
 const els = {
   authGate: document.querySelector("#authGate"),
   authModeLabel: document.querySelector("#authModeLabel"),
@@ -174,6 +176,13 @@ function showAuthMode(mode) {
 
 function renderAuth(auth) {
   state.auth = auth || { authenticated: false, registrationOpen: false };
+  if (state.auth.enabled === false) {
+    els.authGate.hidden = true;
+    els.logoutButton.hidden = true;
+    els.authSummary.innerHTML = '<div class="muted">Auth disabled for local access.</div>';
+    setAuthStatus("");
+    return;
+  }
   const authenticated = state.auth.authenticated === true;
   els.authGate.hidden = authenticated;
   els.logoutButton.hidden = !authenticated;
@@ -181,7 +190,7 @@ function renderAuth(auth) {
     const user = state.auth.user || {};
     els.authSummary.innerHTML = `
       <div>Signed in: <strong>${escapeHtml(user.username || "")}</strong></div>
-      <div class="muted">${escapeHtml(user.role || "user")} · ${escapeHtml(user.provider || "local")}</div>
+      <div class="muted">${escapeHtml(user.role || "user")} - ${escapeHtml(user.provider || "local")}</div>
     `;
     setAuthStatus("");
     return;
@@ -554,52 +563,119 @@ async function previewProjectFile(path) {
   }
 }
 
-function fileToUploadPayload(file) {
+function readBlobAsBase64(blob) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.addEventListener("load", () => {
       const result = String(reader.result || "");
       const encoded = result.includes(",") ? result.split(",", 2)[1] : "";
-      resolve({
-        path: file.webkitRelativePath || file.name,
-        name: file.name,
-        contentBase64: encoded,
-      });
+      resolve(encoded);
     });
     reader.addEventListener("error", () => reject(reader.error || new Error("file read failed")));
-    reader.readAsDataURL(file);
+    reader.readAsDataURL(blob);
   });
+}
+
+async function uploadFileInChunks(file, { directory, overwrite, index, total }) {
+  const path = file.webkitRelativePath || file.name;
+  const chunkCount = Math.max(1, Math.ceil(file.size / UPLOAD_CHUNK_BYTES));
+  let lastPayload = null;
+  if (file.size === 0) {
+    setFileStatus(`Uploading ${index}/${total}: ${path}`);
+    lastPayload = await api("/api/project/file/upload-chunk", {
+      method: "POST",
+      body: JSON.stringify({
+        directory,
+        path,
+        contentBase64: "",
+        offset: 0,
+        totalSize: 0,
+        overwrite,
+        lastChunk: true,
+      }),
+    });
+    return lastPayload;
+  }
+  for (let offset = 0, chunkIndex = 1; offset < file.size; offset += UPLOAD_CHUNK_BYTES, chunkIndex += 1) {
+    const blob = file.slice(offset, Math.min(file.size, offset + UPLOAD_CHUNK_BYTES));
+    setFileStatus(`Uploading ${index}/${total}: ${path} (${chunkIndex}/${chunkCount}, ${formatBytes(offset)} of ${formatBytes(file.size)})`);
+    const contentBase64 = await readBlobAsBase64(blob);
+    lastPayload = await api("/api/project/file/upload-chunk", {
+      method: "POST",
+      body: JSON.stringify({
+        directory,
+        path,
+        contentBase64,
+        offset,
+        totalSize: file.size,
+        overwrite: overwrite && offset === 0,
+        lastChunk: offset + blob.size >= file.size,
+      }),
+    });
+  }
+  return lastPayload;
+}
+
+async function finishChunkedUpload(directory, uploadedPaths) {
+  const payload = await api("/api/project/file/upload-finish", {
+    method: "POST",
+    body: JSON.stringify({ directory, files: uploadedPaths }),
+  });
+  renderProjectFiles(payload.files);
+  renderGit(await api("/api/git/status"));
+  return payload;
 }
 
 async function uploadFiles(fileList) {
   const files = Array.from(fileList || []);
   if (!files.length) return;
-  setFileStatus("Uploading...");
+  const directory = state.fileBrowser.path || "";
+  const uploadedPaths = [];
+  let overwriteAll = false;
   try {
-    const payloads = await Promise.all(files.map(fileToUploadPayload));
-    const body = { directory: state.fileBrowser.path || "", files: payloads };
-    try {
-      const payload = await api("/api/project/file/upload", {
-        method: "POST",
-        body: JSON.stringify(body),
-      });
-      renderProjectFiles(payload.files);
-      setFileStatus(`Uploaded ${payload.uploaded?.length || 0} file(s).`, "ok");
-    } catch (error) {
-      if (!(error instanceof ApiError) || error.payload?.error !== "file_exists") throw error;
-      if (!window.confirm(`${error.message}\n\nOverwrite existing file(s)?`)) {
-        setFileStatus("Upload canceled.");
-        return;
+    for (let index = 0; index < files.length; index += 1) {
+      const file = files[index];
+      try {
+        const result = await uploadFileInChunks(file, {
+          directory,
+          overwrite: overwriteAll,
+          index: index + 1,
+          total: files.length,
+        });
+        const uploadedPath = result?.entry?.path || file.webkitRelativePath || file.name;
+        uploadedPaths.push(uploadedPath);
+      } catch (error) {
+        if (!(error instanceof ApiError) || error.payload?.error !== "file_exists") throw error;
+        if (!window.confirm(`${error.message}\n\nOverwrite existing file(s) for the rest of this upload?`)) {
+          if (uploadedPaths.length) {
+            await finishChunkedUpload(directory, uploadedPaths);
+            setFileStatus(`Upload canceled after ${uploadedPaths.length} file(s).`, "ok");
+          } else {
+            setFileStatus("Upload canceled.");
+          }
+          return;
+        }
+        overwriteAll = true;
+        const result = await uploadFileInChunks(file, {
+          directory,
+          overwrite: true,
+          index: index + 1,
+          total: files.length,
+        });
+        const uploadedPath = result?.entry?.path || file.webkitRelativePath || file.name;
+        uploadedPaths.push(uploadedPath);
       }
-      const payload = await api("/api/project/file/upload", {
-        method: "POST",
-        body: JSON.stringify({ ...body, overwrite: true }),
-      });
-      renderProjectFiles(payload.files);
-      setFileStatus(`Uploaded ${payload.uploaded?.length || 0} file(s).`, "ok");
     }
-    renderGit(await api("/api/git/status"));
+    const payload = await finishChunkedUpload(directory, uploadedPaths);
+    setFileStatus(`Uploaded ${payload.uploaded?.length || uploadedPaths.length} file(s).`, "ok");
   } catch (error) {
+    if (uploadedPaths.length) {
+      try {
+        await finishChunkedUpload(directory, uploadedPaths);
+      } catch {
+        // Keep the original upload error visible.
+      }
+    }
     setFileStatus(`Upload failed: ${error.message}`, "error");
   } finally {
     els.fileUploadInput.value = "";

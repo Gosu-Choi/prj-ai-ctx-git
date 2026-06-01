@@ -89,6 +89,8 @@ PROJECT_SYNC_SKIP_DIRS = {".git", "__pycache__", ".mypy_cache", ".pytest_cache",
 PROJECT_SYNC_SKIP_FILES = {".env", ".DS_Store"}
 PROJECT_SYNC_SKIP_PATHS = {(".ctxgit", ".env"), (".ctxgit", "auth.json")}
 MAX_PROJECT_UPLOAD_BYTES = 100 * 1024 * 1024
+MAX_PROJECT_UPLOAD_CHUNK_BYTES = 6 * 1024 * 1024
+MAX_PROJECT_FILE_UPLOAD_BYTES = 1024 * 1024 * 1024
 MAX_PROJECT_TEXT_PREVIEW_BYTES = 512 * 1024
 AUTH_COOKIE_NAME = "ctxgit_session"
 AUTH_SESSION_SECONDS = 7 * 24 * 60 * 60
@@ -5590,6 +5592,80 @@ def upload_project_files(
     return uploaded
 
 
+def upload_partial_path(target: Path) -> Path:
+    return target.with_name(f".{target.name}.ctxgit-upload")
+
+
+def upload_project_file_chunk(
+    root: Path,
+    directory_value: str,
+    path_value: str,
+    content_base64: str,
+    offset: int,
+    total_size: int,
+    *,
+    overwrite: bool = False,
+    last_chunk: bool = False,
+) -> dict[str, Any]:
+    root = root.resolve()
+    if offset < 0:
+        raise ValueError("chunk offset must not be negative")
+    if total_size < 0 or total_size > MAX_PROJECT_FILE_UPLOAD_BYTES:
+        raise ValueError("file is too large")
+    directory = resolve_project_path(root, directory_value or "", allow_empty=True)
+    rel = safe_upload_relative_path(path_value)
+    try:
+        data = base64.b64decode(content_base64.encode("ascii"), validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise ValueError(f"invalid base64 for {rel.as_posix()}") from exc
+    if len(data) > MAX_PROJECT_UPLOAD_CHUNK_BYTES:
+        raise ValueError("upload chunk is too large")
+    if offset + len(data) > total_size:
+        raise ValueError("chunk exceeds declared file size")
+    target = (directory / rel).resolve(strict=False)
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("upload path must stay inside the project") from exc
+    partial = upload_partial_path(target)
+    if offset == 0:
+        if target.exists() and not overwrite:
+            raise FileExistsError(rel.as_posix())
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with partial.open("wb") as handle:
+            handle.write(data)
+    else:
+        if not partial.exists():
+            raise ValueError("upload chunk is missing its first chunk")
+        current_size = partial.stat().st_size
+        if current_size != offset:
+            raise ValueError(f"chunk offset mismatch for {rel.as_posix()}: expected {current_size}, got {offset}")
+        with partial.open("ab") as handle:
+            handle.write(data)
+    next_offset = offset + len(data)
+    complete = last_chunk or next_offset == total_size
+    if complete:
+        if partial.stat().st_size != total_size:
+            raise ValueError("final upload size does not match declared file size")
+        os.replace(partial, target)
+        return {
+            "complete": True,
+            "nextOffset": next_offset,
+            "entry": project_file_entry(root, target),
+        }
+    return {
+        "complete": False,
+        "nextOffset": next_offset,
+        "entry": {
+            "name": target.name,
+            "path": relpath(root, target),
+            "isDirectory": False,
+            "size": next_offset,
+            "modifiedAt": project_file_modified_at(partial),
+        },
+    }
+
+
 def project_registry_id(path: Path, used: set[str]) -> str:
     base = slugify(path.name or "project", fallback="project").lower()
     base = re.sub(r"[^a-z0-9._-]+", "-", base).strip("-._") or "project"
@@ -6336,6 +6412,7 @@ def make_handler(
     worker_token: str = "",
     prefer_worker: bool = False,
     auth_root: Path | None = None,
+    auth_required: bool = True,
 ):
     registry = project_registry or ServerProjectRegistry(project_state.root())
     jobs = JobStore(project_state, prefer_worker=prefer_worker)
@@ -6392,6 +6469,8 @@ def make_handler(
             return hmac.compare_digest(supplied, worker_token)
 
         def auth_api_exempt(self, path: str) -> bool:
+            if not auth_required:
+                return True
             return path.startswith("/api/auth/") or path in {
                 "/api/worker/claim",
                 "/api/worker/job/event",
@@ -6440,9 +6519,19 @@ def make_handler(
             return morsel.value if morsel else ""
 
         def current_user(self) -> dict[str, Any] | None:
+            if not auth_required:
+                return {
+                    "id": "local:no-auth",
+                    "username": "local",
+                    "role": "admin",
+                    "provider": "disabled",
+                    "createdAt": "",
+                }
             return auth_store.session_user(self.auth_token())
 
         def require_authenticated(self, *, json_response: bool = True) -> bool:
+            if not auth_required:
+                return True
             if self.current_user():
                 return True
             if json_response:
@@ -6460,11 +6549,33 @@ def make_handler(
 
         def handle_auth_get(self, parsed: urllib.parse.ParseResult) -> bool:
             if parsed.path == "/api/auth/status":
-                self.send_json(auth_store.status(self.current_user()))
+                if not auth_required:
+                    self.send_json(
+                        {
+                            "enabled": False,
+                            "authenticated": True,
+                            "user": self.current_user(),
+                            "registrationOpen": False,
+                            "userCount": 0,
+                        }
+                    )
+                else:
+                    self.send_json(auth_store.status(self.current_user()))
                 return True
             return False
 
         def handle_auth_post(self, parsed: urllib.parse.ParseResult, body: dict[str, Any]) -> bool:
+            if not auth_required and parsed.path.startswith("/api/auth/"):
+                self.send_json(
+                    {
+                        "enabled": False,
+                        "authenticated": True,
+                        "user": self.current_user(),
+                        "registrationOpen": False,
+                        "userCount": 0,
+                    }
+                )
+                return True
             if parsed.path == "/api/auth/register":
                 username = str(body.get("username") or "")
                 password = str(body.get("password") or "")
@@ -6862,6 +6973,62 @@ def make_handler(
                     self.send_json({"error": "file_exists", "message": f"File already exists: {exc}"}, status=409)
                 except ValueError as exc:
                     self.send_json({"error": "upload_failed", "message": str(exc)}, status=400)
+                return
+            if parsed.path == "/api/project/file/upload-chunk":
+                directory = str(body.get("directory") or "")
+                path_value = str(body.get("path") or "")
+                content_base64 = str(body.get("contentBase64") or "")
+                overwrite = body.get("overwrite") is True
+                last_chunk = body.get("lastChunk") is True
+                try:
+                    offset = int(body.get("offset") or 0)
+                    total_size = int(body.get("totalSize") or 0)
+                except (TypeError, ValueError):
+                    self.send_json({"error": "invalid_chunk", "message": "offset and totalSize are required"}, status=400)
+                    return
+                try:
+                    self.send_json(
+                        upload_project_file_chunk(
+                            root,
+                            directory,
+                            path_value,
+                            content_base64,
+                            offset,
+                            total_size,
+                            overwrite=overwrite,
+                            last_chunk=last_chunk,
+                        )
+                    )
+                except FileExistsError as exc:
+                    self.send_json({"error": "file_exists", "message": f"File already exists: {exc}"}, status=409)
+                except ValueError as exc:
+                    self.send_json({"error": "upload_failed", "message": str(exc)}, status=400)
+                return
+            if parsed.path == "/api/project/file/upload-finish":
+                directory = str(body.get("directory") or "")
+                uploaded_paths = body.get("files") if isinstance(body.get("files"), list) else []
+                uploaded_paths = [str(item) for item in uploaded_paths if str(item).strip()]
+                try:
+                    turn_commit = internal_git_commit_turn(
+                        store,
+                        kind="file-upload",
+                        actor="user",
+                        summary=f"Upload {len(uploaded_paths)} file(s)",
+                        metadata={
+                            "directory": directory,
+                            "chunked": True,
+                            "files": uploaded_paths,
+                        },
+                    )
+                    self.send_json(
+                        {
+                            "uploaded": uploaded_paths,
+                            "turnCommit": turn_commit,
+                            "files": project_files_payload(root, directory),
+                        }
+                    )
+                except ValueError as exc:
+                    self.send_json({"error": "upload_finish_failed", "message": str(exc)}, status=400)
                 return
             if parsed.path in {"/api/merge", "/api/merge/start"}:
                 raw_branches = body.get("branches")
@@ -7547,6 +7714,7 @@ def run_server(
     projects_root: Path | None = None,
     worker_token: str = "",
     prefer_worker: bool = False,
+    auth_required: bool = True,
 ) -> None:
     project_state = ProjectState(root)
     project_registry = ServerProjectRegistry(root, projects_root)
@@ -7556,6 +7724,7 @@ def run_server(
         worker_token=worker_token,
         prefer_worker=prefer_worker,
         auth_root=projects_root or root,
+        auth_required=auth_required,
     )
     with ReusableThreadingHTTPServer((host, port), handler) as server:
         url = f"http://{host}:{server.server_port}"
@@ -7565,6 +7734,8 @@ def run_server(
             print(f"server projects root: {projects_root}", flush=True)
         if prefer_worker:
             print("codex execution: local worker", flush=True)
+        if not auth_required:
+            print("authentication: disabled", flush=True)
         print("Press Ctrl-C to stop.", flush=True)
         try:
             server.serve_forever()
@@ -7662,6 +7833,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--projects-root", help="Directory containing server-hosted ctxgit projects")
     serve.add_argument("--worker-token", default="", help="Token local workers must send")
     serve.add_argument("--codex-worker", action="store_true", help="Queue Codex-backed jobs for a local worker")
+    serve.add_argument("--no-auth", action="store_true", help="Disable web login gate; use only for local/private access")
 
     worker = sub.add_parser("worker", help="Run a local Codex worker for a ctxgit server")
     worker.add_argument("--server", required=True, help="ctxgit server URL, for example http://127.0.0.1:8765")
@@ -7876,6 +8048,7 @@ def main(argv: list[str] | None = None) -> int:
             projects_root=Path(args.projects_root).expanduser().resolve() if args.projects_root else None,
             worker_token=args.worker_token,
             prefer_worker=args.codex_worker,
+            auth_required=not args.no_auth,
         )
         return 0
 

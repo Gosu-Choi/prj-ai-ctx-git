@@ -180,6 +180,12 @@ Run the local viewer:
 ctxgit serve
 ```
 
+For local-only use on your own machine, skip signup/login:
+
+```bash
+ctxgit serve --no-auth
+```
+
 The web interface requires login. On a fresh server, the first signup creates
 the admin account; after that, signup is closed by default. Set
 `CTXGIT_ALLOW_SIGNUP=1` only if you intentionally want additional open
@@ -193,6 +199,10 @@ timelines backed by `contexts/branches/<branch>/history.jsonl`, the branch
 report from `context.md`, and Git status/log/diff for those files. Appending a
 message in the UI writes to the selected project's `history.jsonl`, so each
 project keeps its own version-managed conversation history.
+
+The file browser uploads folders by sending files in small chunks rather than
+posting one huge base64 payload. This avoids common reverse-proxy and
+Cloudflare `413 Payload Too Large` failures for large folders.
 
 The primary `Send` button calls the configured LLM provider. The default
 provider is OpenAI Codex through the local `codex` CLI, using its existing
