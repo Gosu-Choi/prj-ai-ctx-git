@@ -74,7 +74,7 @@ APPROVAL_STATUSES = {"approved", "denied"}
 PROJECT_ENV_ALLOWED_KEYS = {"BRAVE_API_KEY"}
 REPO_ENV_FILES = (".env",)
 PROJECT_ENV_FILES = (".ctxgit/.env", ".env")
-PROJECT_ENV_GITIGNORE_LINES = (".ctxgit/.env", ".ctxgit/.env.*", "!.ctxgit/.env.example")
+PROJECT_ENV_GITIGNORE_LINES = (".ctxgit/.env", ".ctxgit/.env.*", "!.ctxgit/.env.example", ".ctxgit/git/")
 PROJECT_SYNC_SKIP_DIRS = {".git", "__pycache__", ".mypy_cache", ".pytest_cache", "node_modules", ".venv", "venv"}
 PROJECT_SYNC_SKIP_FILES = {".env", ".DS_Store"}
 PROJECT_SYNC_SKIP_PATHS = {(".ctxgit", ".env")}
@@ -103,6 +103,8 @@ INGEST_EXTENSIONS = {".md", ".txt", ".json", ".jsonl", ".pdf"}
 ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _PROJECT_ENV_LOCK = threading.RLock()
 _PROJECT_ENV_ORIGINAL: dict[str, str | None] = {}
+_INTERNAL_GIT_LOCKS: dict[str, threading.RLock] = {}
+_INTERNAL_GIT_LOCKS_GUARD = threading.RLock()
 
 
 class ChatTimeoutError(RuntimeError):
@@ -119,6 +121,10 @@ MergeBranchSummaryCallback = Callable[[dict[str, Any]], str]
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def new_turn_id() -> str:
+    return "turn_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
 
 
 def parse_utc(value: Any) -> datetime | None:
@@ -302,6 +308,294 @@ def run_git(root: Path, args: list[str]) -> str:
     if completed.returncode != 0:
         return completed.stderr.strip()
     return completed.stdout.strip()
+
+
+def internal_git_dir(root: Path) -> Path:
+    return root.resolve() / ".ctxgit" / "git"
+
+
+def internal_git_lock(root: Path) -> threading.RLock:
+    key = str(root.resolve())
+    with _INTERNAL_GIT_LOCKS_GUARD:
+        lock = _INTERNAL_GIT_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _INTERNAL_GIT_LOCKS[key] = lock
+        return lock
+
+
+def internal_git_excludes() -> str:
+    return "\n".join(
+        [
+            ".git/",
+            ".git/**",
+            ".ctxgit/git/",
+            ".ctxgit/git/**",
+            ".ctxgit/.env",
+            ".ctxgit/.env.*",
+            ".env",
+            ".DS_Store",
+        ]
+    ) + "\n"
+
+
+def run_internal_git(root: Path, args: list[str], check: bool = False) -> subprocess.CompletedProcess[str]:
+    git_dir = internal_git_dir(root)
+    return subprocess.run(
+        ["git", f"--git-dir={git_dir}", f"--work-tree={root.resolve()}", *args],
+        cwd=root,
+        check=check,
+        text=True,
+        capture_output=True,
+    )
+
+
+def ensure_internal_git(root: Path) -> Path:
+    root = root.resolve()
+    with internal_git_lock(root):
+        git_dir = internal_git_dir(root)
+        if not (git_dir / "HEAD").exists():
+            git_dir.parent.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["git", "init", "--bare", str(git_dir)], cwd=root, check=True, text=True, capture_output=True)
+        info = git_dir / "info"
+        info.mkdir(parents=True, exist_ok=True)
+        exclude_path = info / "exclude"
+        existing = read_text(exclude_path)
+        expected = internal_git_excludes()
+        if expected.strip() not in existing:
+            prefix = existing.rstrip() + "\n" if existing.strip() else ""
+            write_text(exclude_path, prefix + expected)
+        run_internal_git(root, ["config", "user.name", "ctxgit"], check=False)
+        run_internal_git(root, ["config", "user.email", "ctxgit@local"], check=False)
+        return git_dir
+
+
+def safe_git_ref_component(value: str, fallback: str = "item") -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip()).strip(".-/")
+    cleaned = cleaned.replace("..", ".")
+    return cleaned[:120] or fallback
+
+
+def ctxgit_branch_ref(branch_id: str) -> str:
+    return f"refs/ctxgit/branches/{safe_git_ref_component(branch_id, 'branch')}"
+
+
+def ctxgit_action_ref() -> str:
+    return "refs/ctxgit/actions"
+
+
+def ctxgit_turn_ref(turn_id: str) -> str:
+    return f"refs/ctxgit/turns/{safe_git_ref_component(turn_id, 'turn')}"
+
+
+def internal_git_rev_parse(root: Path, ref: str) -> str:
+    completed = run_internal_git(root, ["rev-parse", "--verify", f"{ref}^{{commit}}"])
+    return completed.stdout.strip() if completed.returncode == 0 else ""
+
+
+def internal_git_existing_refs(root: Path, refs: Iterable[str]) -> list[str]:
+    commits: list[str] = []
+    seen: set[str] = set()
+    for ref in refs:
+        commit = internal_git_rev_parse(root, ref)
+        if commit and commit not in seen:
+            commits.append(commit)
+            seen.add(commit)
+    return commits
+
+
+def internal_git_status_lines(root: Path) -> list[str]:
+    ensure_internal_git(root)
+    completed = run_internal_git(root, ["status", "--porcelain=v1", "--untracked-files=all"])
+    return [line for line in completed.stdout.splitlines() if line.strip()]
+
+
+def internal_git_log(root: Path, ref: str = "--all", max_count: int = 20) -> str:
+    ensure_internal_git(root)
+    args = ["log", "--graph", "--parents", "--oneline", "--decorate", f"--max-count={max_count}"]
+    if ref:
+        args.append(ref)
+    completed = run_internal_git(root, args)
+    return completed.stdout.strip() if completed.returncode == 0 else ""
+
+
+def internal_git_ref_summary(root: Path) -> list[dict[str, str]]:
+    ensure_internal_git(root)
+    completed = run_internal_git(
+        root,
+        ["for-each-ref", "--format=%(refname)%00%(objectname:short)%00%(committerdate:iso8601)%00%(subject)", "refs/ctxgit"],
+    )
+    refs = []
+    if completed.returncode != 0:
+        return refs
+    for line in completed.stdout.splitlines():
+        parts = line.split("\0")
+        if len(parts) != 4:
+            continue
+        refs.append(
+            {
+                "ref": parts[0],
+                "short": parts[1],
+                "date": parts[2],
+                "subject": parts[3],
+            }
+        )
+    refs.sort(key=lambda item: item.get("date", ""), reverse=True)
+    return refs
+
+
+def internal_git_parent_refs_for_branch(store: "ContextStore", branch_id: str, ref: str) -> list[str]:
+    if internal_git_rev_parse(store.root, ref):
+        return [ref]
+    paths = store.branch_paths(branch_id)
+    if not paths.meta.exists():
+        return []
+    meta = load_json(paths.meta)
+    candidates: list[str] = []
+    parent = str(meta.get("parent") or "").strip()
+    if parent:
+        candidates.append(ctxgit_branch_ref(parent))
+    for key in ("forkedFrom", "clonedFrom"):
+        value = str(meta.get(key) or "").strip()
+        if value:
+            candidates.append(ctxgit_branch_ref(value))
+    parents = meta.get("parents")
+    if isinstance(parents, list):
+        candidates.extend(ctxgit_branch_ref(str(item)) for item in parents if str(item).strip())
+    merge = meta.get("merge") if isinstance(meta.get("merge"), dict) else {}
+    source_branches = merge.get("sourceBranches")
+    if isinstance(source_branches, list):
+        candidates.extend(ctxgit_branch_ref(str(item)) for item in source_branches if str(item).strip())
+    return candidates
+
+
+def write_turn_record(
+    store: "ContextStore",
+    turn_id: str,
+    *,
+    kind: str,
+    actor: str,
+    summary: str,
+    branch_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> Path:
+    branch_dir = safe_git_ref_component(branch_id, "global") if branch_id else "global"
+    path = store.contexts / "turns" / branch_dir / f"{turn_id}.json"
+    dump_json(
+        path,
+        {
+            "schemaVersion": 1,
+            "id": turn_id,
+            "kind": kind,
+            "actor": actor,
+            "summary": summary,
+            "branch": branch_id or "",
+            "createdAt": utc_now(),
+            "metadata": metadata or {},
+        },
+    )
+    return path
+
+
+def internal_git_commit_turn(
+    store: "ContextStore",
+    *,
+    kind: str,
+    actor: str,
+    summary: str,
+    branch_id: str | None = None,
+    turn_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    root = store.root
+    store.require_initialized()
+    turn_id = turn_id or new_turn_id()
+    with internal_git_lock(root):
+        ensure_internal_git(root)
+        write_turn_record(
+            store,
+            turn_id,
+            kind=kind,
+            actor=actor,
+            summary=summary,
+            branch_id=branch_id,
+            metadata=metadata,
+        )
+        run_internal_git(root, ["add", "-A", "--", "."], check=True)
+        status_lines = internal_git_status_lines(root)
+        if not status_lines:
+            return {"turnId": turn_id, "commit": "", "ref": "", "changed": []}
+        tree = run_internal_git(root, ["write-tree"], check=True).stdout.strip()
+        if branch_id:
+            ref = ctxgit_branch_ref(branch_id)
+            parent_refs = internal_git_parent_refs_for_branch(store, branch_id, ref)
+        else:
+            ref = ctxgit_action_ref()
+            parent_refs = [ref] if internal_git_rev_parse(root, ref) else []
+        parents = internal_git_existing_refs(root, parent_refs)
+        message_lines = [
+            f"ctxgit: {kind} {turn_id}",
+            "",
+            f"turn: {turn_id}",
+            f"kind: {kind}",
+            f"actor: {actor}",
+        ]
+        if branch_id:
+            message_lines.append(f"branch: {branch_id}")
+        message_lines.append(f"summary: {summary}")
+        commit_args = ["commit-tree", tree]
+        for parent in parents:
+            commit_args.extend(["-p", parent])
+        commit_args.extend(["-m", "\n".join(message_lines)])
+        env = os.environ.copy()
+        env.update(
+            {
+                "GIT_AUTHOR_NAME": "ctxgit",
+                "GIT_AUTHOR_EMAIL": "ctxgit@local",
+                "GIT_COMMITTER_NAME": "ctxgit",
+                "GIT_COMMITTER_EMAIL": "ctxgit@local",
+            }
+        )
+        completed = subprocess.run(
+            ["git", f"--git-dir={internal_git_dir(root)}", f"--work-tree={root.resolve()}", *commit_args],
+            cwd=root,
+            check=True,
+            text=True,
+            capture_output=True,
+            env=env,
+        )
+        commit = completed.stdout.strip()
+        run_internal_git(root, ["update-ref", ref, commit], check=True)
+        run_internal_git(root, ["update-ref", ctxgit_turn_ref(turn_id), commit], check=True)
+        run_internal_git(root, ["update-ref", "HEAD", commit], check=True)
+        return {"turnId": turn_id, "commit": commit, "ref": ref, "changed": status_lines}
+
+
+def ensure_internal_git_baseline(store: "ContextStore") -> dict[str, Any] | None:
+    with internal_git_lock(store.root):
+        ensure_internal_git(store.root)
+        if internal_git_rev_parse(store.root, "refs/ctxgit/baseline"):
+            return None
+        turn = internal_git_commit_turn(
+            store,
+            kind="baseline",
+            actor="system",
+            summary="Initial ctxgit internal snapshot",
+            metadata={"reason": "bootstrap internal ctxgit git repository"},
+        )
+        commit = str(turn.get("commit") or "")
+        if commit:
+            run_internal_git(store.root, ["update-ref", "refs/ctxgit/baseline", commit], check=True)
+            for meta_path in sorted(store.branches.glob("*/branch.json")):
+                try:
+                    meta = load_json(meta_path)
+                    branch_id = str(meta.get("id") or meta_path.parent.name)
+                    branch_ref = ctxgit_branch_ref(branch_id)
+                    if not internal_git_rev_parse(store.root, branch_ref):
+                        run_internal_git(store.root, ["update-ref", branch_ref, commit], check=True)
+                except SystemExit:
+                    continue
+        return turn
 
 
 def relpath(root: Path, path: Path) -> str:
@@ -552,7 +846,9 @@ class ContextStore:
         self.branches.mkdir(parents=True, exist_ok=True)
         self.views.mkdir(parents=True, exist_ok=True)
         self.globalized.mkdir(parents=True, exist_ok=True)
+        (self.contexts / "turns").mkdir(parents=True, exist_ok=True)
         self.config_dir.mkdir(parents=True, exist_ok=True)
+        ensure_internal_git(self.root)
         ensure_project_gitignore(self.root)
         if not self.config.exists():
             dump_json(
@@ -4166,12 +4462,13 @@ def run_chat_turn(
     progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     selected_provider = provider or str(read_llm_config(root).get("provider") or "codex")
+    turn_id = new_turn_id()
     emit_progress(progress, "Preparing branch context")
     store.auto_ingest_branch_sources(branch_id)
     store.maybe_compact_history(branch_id)
     if record_user:
         emit_progress(progress, "Recording user message")
-        store.append_history(branch_id, "user", user_message)
+        store.append_history(branch_id, "user", user_message, extra={"turnId": turn_id})
     if selected_provider != "codex":
         raise RuntimeError(f"Unsupported chat provider: {selected_provider}")
     result = call_codex_chat(
@@ -4209,12 +4506,29 @@ def run_chat_turn(
         assistant,
         extra={
             "provider": selected_provider,
+            "turnId": turn_id,
             "artifacts": artifact_refs,
             "approvalRequests": approval_requests,
         },
     )
+    turn_commit = internal_git_commit_turn(
+        store,
+        kind="chat",
+        actor="user+agent",
+        summary=f"Chat turn on {branch_id}",
+        branch_id=branch_id,
+        turn_id=turn_id,
+        metadata={
+            "provider": selected_provider,
+            "recordUser": record_user,
+            "artifactCount": len(artifact_refs),
+            "approvalRequestCount": len(approval_requests),
+        },
+    )
     emit_progress(progress, "Refreshing branch view")
-    return branch_payload(store, branch_id)
+    payload = branch_payload(store, branch_id)
+    payload["turnCommit"] = turn_commit
+    return payload
 
 
 def run_history_chat_turn(
@@ -4226,11 +4540,12 @@ def run_history_chat_turn(
     progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     selected_provider = provider or str(read_llm_config(root).get("provider") or "codex")
+    turn_id = new_turn_id()
     emit_progress(progress, "Preparing branch context")
     if selected_provider != "codex":
         raise RuntimeError(f"Unsupported chat provider: {selected_provider}")
     emit_progress(progress, "Recording user message")
-    store.append_history(branch_id, "user", user_message)
+    store.append_history(branch_id, "user", user_message, extra={"turnId": turn_id, "mode": "info-chat"})
     result = call_codex_history_chat(root, store, branch_id, user_message, progress=progress)
     assistant = str(result.get("assistant") or "").strip() or "(No assistant message returned.)"
     emit_progress(progress, "Saving assistant output")
@@ -4241,12 +4556,24 @@ def run_history_chat_turn(
         extra={
             "provider": selected_provider,
             "mode": "info-chat",
+            "turnId": turn_id,
             "artifacts": [],
             "approvalRequests": [],
         },
     )
+    turn_commit = internal_git_commit_turn(
+        store,
+        kind="info-chat",
+        actor="user+agent",
+        summary=f"Info chat turn on {branch_id}",
+        branch_id=branch_id,
+        turn_id=turn_id,
+        metadata={"provider": selected_provider},
+    )
     emit_progress(progress, "Refreshing branch view")
-    return branch_payload(store, branch_id)
+    payload = branch_payload(store, branch_id)
+    payload["turnCommit"] = turn_commit
+    return payload
 
 
 def format_merge_prompt_records(records: list[dict[str, Any]]) -> str:
@@ -4391,8 +4718,23 @@ def run_merge_branches(
         history_limit=history_limit,
         branch_summarizer=branch_summarizer,
     )
+    turn_commit = internal_git_commit_turn(
+        store,
+        kind="merge",
+        actor="user+agent",
+        summary=f"Merge {', '.join(branch_ids)} into {target_id}",
+        branch_id=target_id,
+        metadata={
+            "sourceBranches": branch_ids,
+            "target": target_id,
+            "provider": selected_provider,
+            "historyLimit": history_limit,
+        },
+    )
     emit_progress(progress, "Refreshing branch view")
-    return branch_payload(store, target_id)
+    payload = branch_payload(store, target_id)
+    payload["turnCommit"] = turn_commit
+    return payload
 
 
 def run_approval_decision(
@@ -4429,7 +4771,17 @@ def run_approval_decision(
         },
     )
     if status == "denied":
-        return branch_payload(store, branch_id)
+        turn_commit = internal_git_commit_turn(
+            store,
+            kind="approval-decision",
+            actor="user",
+            summary=f"Deny external write request on {branch_id}",
+            branch_id=branch_id,
+            metadata={"approvalId": approval_id, "status": status, "path": path, "operation": operation},
+        )
+        payload = branch_payload(store, branch_id)
+        payload["turnCommit"] = turn_commit
+        return payload
 
     user_message = str(request.get("userMessage") or "").strip()
     if not user_message:
@@ -4637,6 +4989,7 @@ def run_research_turn(
     title: str | None = None,
     progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
+    turn_id = new_turn_id()
     emit_progress(progress, "Preparing research context")
     load_project_env(root)
     store.require_initialized()
@@ -4663,7 +5016,7 @@ def run_research_turn(
         branch_id,
         "user",
         query,
-        extra={"mode": "research", "provider": selected_provider},
+        extra={"mode": "research", "provider": selected_provider, "turnId": turn_id},
     )
     if selected_provider == "hybrid":
         emit_progress(progress, "Searching source providers")
@@ -4733,10 +5086,25 @@ def run_research_turn(
         branch_id,
         "assistant",
         f"Research note created: {artifact_ref['path']}",
-        extra={"mode": "research", "provider": selected_provider, "artifacts": [artifact_ref]},
+        extra={"mode": "research", "provider": selected_provider, "turnId": turn_id, "artifacts": [artifact_ref]},
+    )
+    turn_commit = internal_git_commit_turn(
+        store,
+        kind="research",
+        actor="user+agent",
+        summary=f"Research turn on {branch_id}",
+        branch_id=branch_id,
+        turn_id=turn_id,
+        metadata={
+            "provider": selected_provider,
+            "title": note_title,
+            "artifact": artifact_ref,
+        },
     )
     emit_progress(progress, "Refreshing branch view")
-    return branch_payload(store, branch_id)
+    payload = branch_payload(store, branch_id)
+    payload["turnCommit"] = turn_commit
+    return payload
 
 
 def run_snapshot(root: Path, message: str, include_tools: bool = False) -> None:
@@ -4789,7 +5157,25 @@ def branch_payload(store: ContextStore, branch_id: str) -> dict[str, Any]:
             "historyDiff": run_git(store.root, ["diff", "--", history_path]),
             "contextDiff": run_git(store.root, ["diff", "--", context_path]),
             "status": run_git(store.root, ["status", "--short", "--", history_path, context_path]),
+            "internal": {
+                "ref": ctxgit_branch_ref(branch_id),
+                "head": internal_git_rev_parse(store.root, ctxgit_branch_ref(branch_id)),
+                "log": internal_git_log(store.root, ctxgit_branch_ref(branch_id), max_count=12),
+            },
         },
+    }
+
+
+def internal_git_status_payload(root: Path) -> dict[str, Any]:
+    ensure_internal_git(root)
+    status_lines = internal_git_status_lines(root)
+    return {
+        "initialized": True,
+        "gitDir": str(internal_git_dir(root)),
+        "dirtyCount": len(status_lines),
+        "status": "\n".join(status_lines),
+        "log": internal_git_log(root, "--all", max_count=12),
+        "refs": internal_git_ref_summary(root)[:80],
     }
 
 
@@ -4805,6 +5191,7 @@ def git_status_payload(root: Path) -> dict[str, Any]:
         "unstagedCount": unstaged_count,
         "untrackedCount": untracked_count,
         "log": run_git(root, ["log", "--oneline", "--decorate", "--max-count=8"]),
+        "internal": internal_git_status_payload(root),
     }
 
 
@@ -5048,6 +5435,8 @@ def should_skip_project_sync_path(rel: Path) -> bool:
     parts = rel.parts
     if not parts:
         return False
+    if len(parts) >= 2 and parts[0] == ".ctxgit" and parts[1] == "git":
+        return True
     if len(parts) >= 2 and parts[0] == "contexts" and parts[1] == "jobs":
         return True
     if any(part in PROJECT_SYNC_SKIP_DIRS for part in parts):
@@ -5197,6 +5586,7 @@ class ProjectState:
         store = ContextStore(root)
         if require_initialized:
             store.require_initialized()
+            ensure_internal_git_baseline(store)
             load_project_env(root)
         return root, store
 
@@ -5823,7 +6213,22 @@ def make_handler(
                                 return
                             root_path = Path(str(job.get("projectPath") or project_state.root())).expanduser().resolve()
                             changed = apply_project_snapshot_zip(root_path, base64.b64decode(encoded_zip.encode("ascii")))
-                            result_payload = {**result_payload, "syncedFiles": changed}
+                            request_payload = job.get("request") if isinstance(job.get("request"), dict) else {}
+                            branch_id = str(request_payload.get("branch") or request_payload.get("name") or "")
+                            turn_commit = internal_git_commit_turn(
+                                ContextStore(root_path),
+                                kind=f"worker-{job.get('kind') or 'job'}",
+                                actor=f"worker:{worker_id}",
+                                summary=f"Worker completed {job.get('kind') or 'job'}",
+                                branch_id=branch_id or None,
+                                metadata={
+                                    "jobId": job_id,
+                                    "workerId": worker_id,
+                                    "syncedFiles": changed,
+                                    "request": request_payload,
+                                },
+                            )
+                            result_payload = {**result_payload, "syncedFiles": changed, "serverTurnCommit": turn_commit}
                         except Exception as exc:
                             self.send_json({"error": "sync_failed", "message": str(exc)}, status=500)
                             return
@@ -5874,7 +6279,20 @@ def make_handler(
                 path_value = str(body.get("path") or "")
                 try:
                     entry = create_project_directory(root, path_value)
-                    self.send_json({"entry": entry, "files": project_files_payload(root, str(Path(path_value).parent if Path(path_value).parent != Path(".") else ""))})
+                    turn_commit = internal_git_commit_turn(
+                        store,
+                        kind="file-directory-create",
+                        actor="user",
+                        summary=f"Create directory {entry['path']}",
+                        metadata={"path": entry["path"]},
+                    )
+                    self.send_json(
+                        {
+                            "entry": entry,
+                            "turnCommit": turn_commit,
+                            "files": project_files_payload(root, str(Path(path_value).parent if Path(path_value).parent != Path(".") else "")),
+                        }
+                    )
                 except ValueError as exc:
                     self.send_json({"error": "directory_create_failed", "message": str(exc)}, status=400)
                 return
@@ -5884,7 +6302,18 @@ def make_handler(
                 overwrite = body.get("overwrite") is True
                 try:
                     uploaded = upload_project_files(root, directory, files, overwrite=overwrite)
-                    self.send_json({"uploaded": uploaded, "files": project_files_payload(root, directory)})
+                    turn_commit = internal_git_commit_turn(
+                        store,
+                        kind="file-upload",
+                        actor="user",
+                        summary=f"Upload {len(uploaded)} file(s)",
+                        metadata={
+                            "directory": directory,
+                            "overwrite": overwrite,
+                            "files": [item["path"] for item in uploaded],
+                        },
+                    )
+                    self.send_json({"uploaded": uploaded, "turnCommit": turn_commit, "files": project_files_payload(root, directory)})
                 except FileExistsError as exc:
                     self.send_json({"error": "file_exists", "message": f"File already exists: {exc}"}, status=409)
                 except ValueError as exc:
@@ -5960,7 +6389,16 @@ def make_handler(
                 title = str(body.get("title") or "") or None
                 try:
                     store.clone_branch(source_id, target_id, title=title)
-                    self.send_json(branch_payload(store, target_id))
+                    payload = branch_payload(store, target_id)
+                    payload["turnCommit"] = internal_git_commit_turn(
+                        store,
+                        kind="branch-clone",
+                        actor="user",
+                        summary=f"Clone {source_id} to {target_id}",
+                        branch_id=target_id,
+                        metadata={"source": source_id, "target": target_id, "title": title},
+                    )
+                    self.send_json(payload)
                 except SystemExit as exc:
                     self.send_json({"error": "clone_failed"}, status=int(exc.code or 400))
                 return
@@ -5969,7 +6407,16 @@ def make_handler(
                 title = str(body.get("title") or "")
                 try:
                     store.rename_branch(branch_id, title)
-                    self.send_json(branch_payload(store, branch_id))
+                    payload = branch_payload(store, branch_id)
+                    payload["turnCommit"] = internal_git_commit_turn(
+                        store,
+                        kind="branch-rename",
+                        actor="user",
+                        summary=f"Rename branch {branch_id}",
+                        branch_id=branch_id,
+                        metadata={"branch": branch_id, "title": title},
+                    )
+                    self.send_json(payload)
                 except SystemExit as exc:
                     self.send_json({"error": "rename_failed"}, status=int(exc.code or 400))
                 return
@@ -5977,11 +6424,20 @@ def make_handler(
                 branch_id = str(body.get("branch") or "")
                 try:
                     store.remove_branch(branch_id)
+                    turn_commit = internal_git_commit_turn(
+                        store,
+                        kind="branch-remove",
+                        actor="user",
+                        summary=f"Remove branch {branch_id}",
+                        branch_id=branch_id,
+                        metadata={"branch": branch_id},
+                    )
                     self.send_json(
                         {
                             "branches": store.list_branches(),
                             "views": store.list_views(),
                             "globalized": store.list_globalized_archives(),
+                            "turnCommit": turn_commit,
                         }
                     )
                 except SystemExit as exc:
@@ -6000,6 +6456,14 @@ def make_handler(
                     payload = branch_payload(store, branch_id)
                     payload["archive"] = archive
                     payload["globalized"] = store.list_globalized_archives()
+                    payload["turnCommit"] = internal_git_commit_turn(
+                        store,
+                        kind="branch-archive",
+                        actor="user",
+                        summary=f"Archive {branch_id} messages {start}-{end}",
+                        branch_id=branch_id,
+                        metadata={"branch": branch_id, "start": start, "end": end, "archive": archive.get("meta", {})},
+                    )
                     self.send_json(payload)
                 except ValueError as exc:
                     self.send_json({"error": "archive_failed", "message": str(exc)}, status=400)
@@ -6011,7 +6475,16 @@ def make_handler(
                 file_path = str(body.get("file") or "")
                 try:
                     store.ingest_source(branch_id, file_path)
-                    self.send_json(branch_payload(store, branch_id))
+                    payload = branch_payload(store, branch_id)
+                    payload["turnCommit"] = internal_git_commit_turn(
+                        store,
+                        kind="source-ingest",
+                        actor="user",
+                        summary=f"Ingest source into {branch_id}",
+                        branch_id=branch_id,
+                        metadata={"branch": branch_id, "file": file_path},
+                    )
+                    self.send_json(payload)
                 except SystemExit as exc:
                     self.send_json({"error": "ingest_failed"}, status=int(exc.code or 400))
                 return
@@ -6023,8 +6496,20 @@ def make_handler(
                     self.send_json({"error": "message_required"}, status=400)
                     return
                 try:
-                    store.append_history(branch_id, role, text)
-                    self.send_json(branch_payload(store, branch_id))
+                    turn_id = new_turn_id()
+                    store.append_history(branch_id, role, text, extra={"turnId": turn_id, "mode": "manual-append"})
+                    turn_commit = internal_git_commit_turn(
+                        store,
+                        kind="manual-append",
+                        actor="user",
+                        summary=f"Append {role} message to {branch_id}",
+                        branch_id=branch_id,
+                        turn_id=turn_id,
+                        metadata={"branch": branch_id, "role": role},
+                    )
+                    payload = branch_payload(store, branch_id)
+                    payload["turnCommit"] = turn_commit
+                    self.send_json(payload)
                 except SystemExit as exc:
                     self.send_json({"error": "append_failed"}, status=int(exc.code or 400))
                 return
@@ -6050,6 +6535,19 @@ def make_handler(
                         "role": removed.get("role"),
                         "createdAt": removed.get("createdAt"),
                     }
+                    payload["turnCommit"] = internal_git_commit_turn(
+                        store,
+                        kind="history-delete",
+                        actor="user",
+                        summary=f"Delete message {index + 1} from {branch_id}",
+                        branch_id=branch_id,
+                        metadata={
+                            "branch": branch_id,
+                            "index": index,
+                            "removedRole": removed.get("role"),
+                            "removedCreatedAt": removed.get("createdAt"),
+                        },
+                    )
                     self.send_json(payload)
                 except ValueError as exc:
                     self.send_json({"error": "delete_failed", "message": str(exc)}, status=409)
@@ -6076,7 +6574,16 @@ def make_handler(
                         expected_role=expected_role,
                         title=title,
                     )
-                    self.send_json(branch_payload(store, target_id))
+                    payload = branch_payload(store, target_id)
+                    payload["turnCommit"] = internal_git_commit_turn(
+                        store,
+                        kind="history-fork",
+                        actor="user",
+                        summary=f"Fork {branch_id} to {target_id} at message {index + 1}",
+                        branch_id=target_id,
+                        metadata={"source": branch_id, "target": target_id, "index": index, "title": title},
+                    )
+                    self.send_json(payload)
                 except ValueError as exc:
                     self.send_json({"error": "fork_failed", "message": str(exc)}, status=409)
                 except SystemExit as exc:
@@ -6645,11 +7152,21 @@ def main(argv: list[str] | None = None) -> int:
     root = resolve_serve_root(args.root) if args.command == "serve" else resolve_workspace_root(args.root)
     store = ContextStore(root)
     load_project_env(root)
+    if args.command != "init" and is_ctxgit_project(root):
+        ensure_internal_git_baseline(store)
 
     if args.command == "init":
         if not args.no_git and not is_git_project(root):
             subprocess.run(["git", "init"], cwd=root, check=True, text=True, capture_output=True)
         store.init()
+        internal_git_commit_turn(
+            store,
+            kind="init",
+            actor="user",
+            summary="Initialize ctxgit workspace",
+            branch_id=INITIAL_BRANCH_ID if store.branch_paths(INITIAL_BRANCH_ID).root.exists() else None,
+            metadata={"importWorkspace": bool(args.import_workspace)},
+        )
         print(f"Initialized ctxgit workspace at {store.contexts}")
         if args.import_workspace:
             summary_path = store.import_workspace_context(args.import_workspace, force=args.force_import)
@@ -6661,6 +7178,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "branch":
         store.create_branch(args.id, title=args.title, parent=args.parent, tags=args.tag)
+        internal_git_commit_turn(
+            store,
+            kind="branch-create",
+            actor="user",
+            summary=f"Create branch {args.id}",
+            branch_id=args.id,
+            metadata={"title": args.title, "parent": args.parent, "tags": args.tag},
+        )
         print(f"Created branch {args.id}")
         return 0
 
@@ -6678,7 +7203,17 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "append":
         text = read_stdin_or_value(args.message, "message")
-        record = store.append_history(args.branch, args.role, text)
+        turn_id = new_turn_id()
+        record = store.append_history(args.branch, args.role, text, extra={"turnId": turn_id, "mode": "manual-append"})
+        internal_git_commit_turn(
+            store,
+            kind="manual-append",
+            actor="user",
+            summary=f"Append {record['role']} message to {args.branch}",
+            branch_id=args.branch,
+            turn_id=turn_id,
+            metadata={"role": args.role},
+        )
         print(f"Appended {record['role']} message to {args.branch}")
         return 0
 
@@ -6697,11 +7232,27 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "note":
         body = read_stdin_or_value(args.body, "note body")
         path = store.add_note(args.branch, args.title, body)
+        internal_git_commit_turn(
+            store,
+            kind="note",
+            actor="user",
+            summary=f"Add note to {args.branch}",
+            branch_id=args.branch,
+            metadata={"title": args.title, "path": relpath(root, path)},
+        )
         print(path.relative_to(root))
         return 0
 
     if args.command == "ingest":
         meta = store.ingest_source(args.branch, args.file)
+        internal_git_commit_turn(
+            store,
+            kind="source-ingest",
+            actor="user",
+            summary=f"Ingest source into {args.branch}",
+            branch_id=args.branch,
+            metadata={"file": args.file, "result": meta},
+        )
         print(json.dumps(meta, indent=2, ensure_ascii=False, sort_keys=True))
         return 0
 
@@ -6709,6 +7260,13 @@ def main(argv: list[str] | None = None) -> int:
         store.require_initialized()
         summary_path = store.import_workspace_context(args.path, force=args.force)
         if summary_path:
+            internal_git_commit_turn(
+                store,
+                kind="workspace-import",
+                actor="user",
+                summary="Import workspace context",
+                metadata={"source": args.path, "summary": relpath(root, summary_path)},
+            )
             print(summary_path.relative_to(root))
         else:
             print("Workspace import already exists; pass --force to rebuild it.")
@@ -6720,6 +7278,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "merge-view":
         path = store.write_merge_view(args.branches, args.name, limit=args.limit)
+        internal_git_commit_turn(
+            store,
+            kind="merge-view",
+            actor="user",
+            summary=f"Create merge view {args.name}",
+            metadata={"branches": args.branches, "name": args.name, "path": relpath(root, path)},
+        )
         print(path.relative_to(root))
         return 0
 

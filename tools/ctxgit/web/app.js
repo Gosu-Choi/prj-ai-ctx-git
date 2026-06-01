@@ -77,6 +77,7 @@ const els = {
   trackedFiles: document.querySelector("#trackedFiles"),
   historyLog: document.querySelector("#historyLog"),
   currentDiff: document.querySelector("#currentDiff"),
+  internalGitLog: document.querySelector("#internalGitLog"),
   researchList: document.querySelector("#researchList"),
   composer: document.querySelector("#composer"),
   messageInput: document.querySelector("#messageInput"),
@@ -125,6 +126,11 @@ async function api(path, options = {}) {
 
 function sleep(ms) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function isNetworkFetchError(error) {
+  const message = String(error?.message || "");
+  return error instanceof TypeError || /Failed to fetch|NetworkError|Load failed/i.test(message);
 }
 
 function formatEventTime(value) {
@@ -272,6 +278,7 @@ function clearWorkspace(message = "Select or initialize a ctxgit project.") {
   els.trackedFiles.innerHTML = "";
   els.historyLog.textContent = "";
   els.currentDiff.textContent = "";
+  els.internalGitLog.textContent = "";
   els.researchList.innerHTML = "";
   els.gitSummary.innerHTML = "";
   els.providerSummary.innerHTML = "";
@@ -683,10 +690,20 @@ function uniqueBranchIdForTitle(title) {
 }
 
 function renderGit(status) {
+  const internal = status.internal || {};
   els.gitSummary.innerHTML = `
     <div>Branch: <strong>${escapeHtml(status.branch || "(none)")}</strong></div>
     <div>Staged: ${status.stagedCount} · Unstaged: ${status.unstagedCount} · Untracked: ${status.untrackedCount}</div>
+    <div class="muted">ctxgit Git: ${escapeHtml(String(internal.dirtyCount || 0))} pending · ${escapeHtml(internal.gitDir || "")}</div>
   `;
+  if (els.internalGitLog) {
+    const refs = (internal.refs || [])
+      .slice(0, 20)
+      .map((item) => `${item.short || ""} ${item.ref || ""} ${item.subject || ""}`.trim())
+      .join("\n");
+    els.internalGitLog.textContent =
+      [internal.log || "No internal ctxgit commits yet.", refs ? `\nRefs:\n${refs}` : ""].filter(Boolean).join("\n");
+  }
 }
 
 function renderProvider(status) {
@@ -1037,13 +1054,51 @@ async function monitorTrackedJob(jobId) {
   if (!tracked) return;
   const branch = tracked.branch;
   let waitMs = 500;
+  let fetchFailures = 0;
   while (true) {
     await sleep(waitMs);
     let job;
     try {
       job = await api(`/api/job?id=${encodeURIComponent(jobId)}`);
+      fetchFailures = 0;
     } catch (error) {
-      if (error instanceof ApiError && error.payload?.error === "job_not_found") {
+      if (isNetworkFetchError(error)) {
+        fetchFailures += 1;
+        const now = new Date().toISOString();
+        const previous = state.jobs[jobId] || tracked;
+        const message =
+          fetchFailures === 1
+            ? "서버 연결이 잠시 끊겨 작업 상태를 다시 확인 중입니다."
+            : `서버 연결 재시도 중 (${fetchFailures})`;
+        const events =
+          fetchFailures === 1 || fetchFailures % 5 === 0
+            ? [...(previous.events || []), { message, createdAt: now }]
+            : previous.events || [];
+        const reconnecting = rememberJob(
+          {
+            ...previous,
+            status: "running",
+            error: "monitor_reconnecting",
+            message,
+            updatedAt: now,
+            events,
+            diagnostics: {
+              ...(previous.diagnostics || {}),
+              state: "monitor_reconnecting",
+              detail: message,
+              lastEvent: message,
+            },
+          },
+          { branch, mode: tracked.mode },
+        );
+        if (state.activeBranch === branch) {
+          updateProgress(reconnecting);
+          renderEventPanel(reconnecting);
+          updateComposerState();
+        }
+        waitMs = Math.min(2500, waitMs + 300);
+        continue;
+      } else if (error instanceof ApiError && error.payload?.error === "job_not_found") {
         const message =
           "ctxgit 서버가 이 작업을 더 이상 갖고 있지 않습니다. 서버가 재시작되었거나 브라우저가 다른 ctxgit 서버를 조회 중일 수 있습니다.";
         const now = new Date().toISOString();
@@ -1191,11 +1246,17 @@ function renderBranch(payload) {
     <dt>context</dt><dd>${escapeHtml(payload.paths.context)}</dd>
     <dt>history</dt><dd>${escapeHtml(payload.paths.history)}</dd>
     <dt>meta</dt><dd>${escapeHtml(payload.paths.meta)}</dd>
+    <dt>ctxgit ref</dt><dd>${escapeHtml(payload.git?.internal?.ref || "")}</dd>
+    <dt>ctxgit head</dt><dd>${escapeHtml(payload.git?.internal?.head || "")}</dd>
   `;
-  els.historyLog.textContent = payload.git.historyLog || "No commits for this history file yet.";
+  els.historyLog.textContent =
+    payload.git?.internal?.log || payload.git.historyLog || "No internal ctxgit commits for this branch yet.";
   els.currentDiff.textContent =
     [payload.git.status, payload.git.historyDiff, payload.git.contextDiff].filter(Boolean).join("\n\n") ||
     "No uncommitted branch file diff.";
+  if (els.internalGitLog) {
+    els.internalGitLog.textContent = payload.git?.internal?.log || "No internal ctxgit commits for this branch yet.";
+  }
   els.researchList.innerHTML =
     [
       ...(payload.sources || []).map((source) => ({

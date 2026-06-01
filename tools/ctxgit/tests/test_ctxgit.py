@@ -25,6 +25,11 @@ SPEC.loader.exec_module(ctxgit)
 
 
 class CtxgitTest(unittest.TestCase):
+    def test_new_turn_id_uses_timestamp_code(self) -> None:
+        turn_id = ctxgit.new_turn_id()
+
+        self.assertRegex(turn_id, r"^turn_\d{8}T\d{6}\d{6}Z$")
+
     def test_branch_append_and_merge_view(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -199,6 +204,69 @@ class CtxgitTest(unittest.TestCase):
                 )
             with self.assertRaises(ValueError):
                 ctxgit.project_files_payload(root, "../")
+
+    def test_internal_git_commits_turn_to_branch_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.init()
+            store.append_history("initial", "user", "hello")
+            self.assertIn(".ctxgit/git/", (root / ".gitignore").read_text())
+
+            turn = ctxgit.internal_git_commit_turn(
+                store,
+                kind="chat",
+                actor="user+agent",
+                summary="test turn",
+                branch_id="initial",
+            )
+
+            self.assertTrue(turn["commit"])
+            self.assertEqual(ctxgit.internal_git_rev_parse(root, "refs/ctxgit/branches/initial"), turn["commit"])
+            status = ctxgit.internal_git_status_payload(root)
+            self.assertEqual(status["dirtyCount"], 0)
+            self.assertIn("refs/ctxgit/branches/initial", [item["ref"] for item in status["refs"]])
+
+    def test_internal_git_merge_commit_uses_source_branch_parents(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("alpha")
+            store.create_branch("beta")
+            store.append_history("alpha", "user", "alpha")
+            alpha_turn = ctxgit.internal_git_commit_turn(
+                store,
+                kind="chat",
+                actor="user",
+                summary="alpha",
+                branch_id="alpha",
+            )
+            store.append_history("beta", "user", "beta")
+            beta_turn = ctxgit.internal_git_commit_turn(
+                store,
+                kind="chat",
+                actor="user",
+                summary="beta",
+                branch_id="beta",
+            )
+
+            store.merge_branches(["alpha", "beta"], "merged")
+            merge_turn = ctxgit.internal_git_commit_turn(
+                store,
+                kind="merge",
+                actor="user+agent",
+                summary="merge alpha beta",
+                branch_id="merged",
+            )
+
+            parents = ctxgit.run_internal_git(
+                root,
+                ["rev-list", "--parents", "-n", "1", merge_turn["commit"]],
+                check=True,
+            ).stdout.strip().split()
+            self.assertEqual(parents[0], merge_turn["commit"])
+            self.assertIn(alpha_turn["commit"], parents[1:])
+            self.assertIn(beta_turn["commit"], parents[1:])
 
     def test_delete_history_record_rewrites_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
