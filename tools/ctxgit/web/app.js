@@ -7,6 +7,9 @@ const state = {
   globalized: [],
   payload: null,
   provider: null,
+  serverProjects: [],
+  worker: null,
+  fileBrowser: { path: "", parent: "", entries: [] },
   currentJob: null,
   jobs: {},
   branchJobs: {},
@@ -23,11 +26,16 @@ const els = {
   initProjectButton: document.querySelector("#initProjectButton"),
   browseProjectButton: document.querySelector("#browseProjectButton"),
   projectStatus: document.querySelector("#projectStatus"),
+  serverProjectPanel: document.querySelector("#serverProjectPanel"),
+  serverProjectSelect: document.querySelector("#serverProjectSelect"),
+  openServerProjectButton: document.querySelector("#openServerProjectButton"),
+  serverProjectStatus: document.querySelector("#serverProjectStatus"),
   branchList: document.querySelector("#branchList"),
   viewList: document.querySelector("#viewList"),
   globalizedList: document.querySelector("#globalizedList"),
   gitSummary: document.querySelector("#gitSummary"),
   providerSummary: document.querySelector("#providerSummary"),
+  workerSummary: document.querySelector("#workerSummary"),
   mergeForm: document.querySelector("#mergeForm"),
   mergeSourcesInput: document.querySelector("#mergeSourcesInput"),
   mergeNameInput: document.querySelector("#mergeNameInput"),
@@ -53,6 +61,17 @@ const els = {
   eventMeta: document.querySelector("#eventMeta"),
   eventList: document.querySelector("#eventList"),
   reportView: document.querySelector("#reportView"),
+  filePathForm: document.querySelector("#filePathForm"),
+  fileUpButton: document.querySelector("#fileUpButton"),
+  fileRefreshButton: document.querySelector("#fileRefreshButton"),
+  filePathInput: document.querySelector("#filePathInput"),
+  fileGoButton: document.querySelector("#fileGoButton"),
+  newFolderButton: document.querySelector("#newFolderButton"),
+  fileUploadInput: document.querySelector("#fileUploadInput"),
+  folderUploadInput: document.querySelector("#folderUploadInput"),
+  fileStatus: document.querySelector("#fileStatus"),
+  fileList: document.querySelector("#fileList"),
+  filePreview: document.querySelector("#filePreview"),
   archiveList: document.querySelector("#archiveList"),
   archiveViewer: document.querySelector("#archiveViewer"),
   trackedFiles: document.querySelector("#trackedFiles"),
@@ -238,11 +257,16 @@ function clearWorkspace(message = "Select or initialize a ctxgit project.") {
   state.views = [];
   state.globalized = [];
   state.payload = null;
+  state.fileBrowser = { path: "", parent: "", entries: [] };
   renderBranches();
   els.activeTitle.textContent = "No project selected";
   els.activeMeta.textContent = message;
   els.messageList.innerHTML = `<div class="muted">${escapeHtml(message)}</div>`;
   els.reportView.innerHTML = "";
+  els.filePathInput.value = "";
+  els.fileList.innerHTML = "";
+  els.filePreview.textContent = "";
+  els.fileStatus.textContent = "";
   els.archiveList.innerHTML = "";
   els.archiveViewer.innerHTML = '<div class="muted">No archived source branch selected.</div>';
   els.trackedFiles.innerHTML = "";
@@ -267,6 +291,192 @@ function renderProject(project) {
     <div class="muted">${escapeHtml(path)}</div>
     <div class="muted">ctxgit: ${initialized ? "ready" : "not initialized"} · git: ${gitInitialized ? "ready" : "not initialized"}</div>
   `;
+}
+
+function setServerProjectStatus(message, kind = "") {
+  els.serverProjectStatus.textContent = message;
+  els.serverProjectStatus.className = `settings-status ${kind}`.trim();
+}
+
+function renderServerProjects(payload) {
+  const projects = payload?.projects || [];
+  state.serverProjects = projects;
+  const enabled = payload?.enabled === true || projects.length > 1;
+  els.serverProjectPanel.hidden = !enabled;
+  if (!enabled) return;
+  els.serverProjectSelect.innerHTML = projects
+    .map((project) => {
+      const label = `${project.name || project.id}${project.initialized ? "" : " (not initialized)"}`;
+      return `<option value="${escapeHtml(project.id)}" ${project.active ? "selected" : ""}>${escapeHtml(label)}</option>`;
+    })
+    .join("");
+  setServerProjectStatus(
+    payload.projectsRoot ? `Server root: ${payload.projectsRoot}` : "Current project only",
+    "",
+  );
+}
+
+function renderWorker(status) {
+  state.worker = status;
+  if (!status || status.enabled === false) {
+    els.workerSummary.innerHTML = '<div class="muted">Worker API unavailable.</div>';
+    return;
+  }
+  const mode = status.preferWorker ? "local worker" : "server process";
+  els.workerSummary.innerHTML = `
+    <div>Codex runs on: <strong>${escapeHtml(mode)}</strong></div>
+    <div class="muted">Active: ${status.activeWorkers || 0} · Queued: ${status.queued || 0} · Claimed: ${status.claimed || 0}</div>
+  `;
+}
+
+function formatBytes(value) {
+  const bytes = Number(value || 0);
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  let amount = bytes;
+  let unitIndex = 0;
+  while (amount >= 1024 && unitIndex < units.length - 1) {
+    amount /= 1024;
+    unitIndex += 1;
+  }
+  return `${amount >= 10 || unitIndex === 0 ? Math.round(amount) : amount.toFixed(1)} ${units[unitIndex]}`;
+}
+
+function setFileStatus(message, kind = "") {
+  els.fileStatus.textContent = message;
+  els.fileStatus.className = `settings-status ${kind}`.trim();
+}
+
+function renderProjectFiles(payload) {
+  state.fileBrowser = {
+    path: payload?.path || "",
+    parent: payload?.parent || "",
+    entries: payload?.entries || [],
+  };
+  els.filePathInput.value = state.fileBrowser.path;
+  els.fileUpButton.disabled = !state.fileBrowser.path;
+  els.fileList.innerHTML =
+    state.fileBrowser.entries
+      .map((entry) => {
+        const kind = entry.isDirectory ? "folder" : "file";
+        const meta = entry.isDirectory ? "folder" : `${formatBytes(entry.size)} · ${entry.modifiedAt || ""}`;
+        return `
+          <button class="file-row" data-file-path="${escapeHtml(entry.path)}" data-file-kind="${kind}" type="button" title="${escapeHtml(entry.path)}">
+            <span class="file-icon">${entry.isDirectory ? "▸" : "·"}</span>
+            <span class="file-name">${escapeHtml(entry.name)}</span>
+            <span class="file-meta">${escapeHtml(meta)}</span>
+          </button>
+        `;
+      })
+      .join("") || '<div class="muted">No files</div>';
+  els.fileList.querySelectorAll("[data-file-path]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const path = button.dataset.filePath || "";
+      if (button.dataset.fileKind === "folder") {
+        loadProjectFiles(path);
+      } else {
+        previewProjectFile(path);
+      }
+    });
+  });
+}
+
+async function loadProjectFiles(path = state.fileBrowser.path || "") {
+  if (!state.project?.initialized) return;
+  setFileStatus("Loading...");
+  try {
+    const payload = await api(`/api/project/files?path=${encodeURIComponent(path)}`);
+    renderProjectFiles(payload);
+    setFileStatus(payload.path || "Project root", "ok");
+  } catch (error) {
+    setFileStatus(`Load failed: ${error.message}`, "error");
+  }
+}
+
+async function previewProjectFile(path) {
+  setFileStatus("Opening...");
+  try {
+    const payload = await api(`/api/project/file/text?path=${encodeURIComponent(path)}`);
+    if (payload.binary) {
+      els.filePreview.textContent = `${payload.path}\n\n${formatBytes(payload.size)} binary file`;
+    } else {
+      els.filePreview.textContent = `${payload.path}${payload.truncated ? " (truncated)" : ""}\n\n${payload.text || ""}`;
+    }
+    setFileStatus(payload.path, "ok");
+  } catch (error) {
+    setFileStatus(`Open failed: ${error.message}`, "error");
+  }
+}
+
+function fileToUploadPayload(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.addEventListener("load", () => {
+      const result = String(reader.result || "");
+      const encoded = result.includes(",") ? result.split(",", 2)[1] : "";
+      resolve({
+        path: file.webkitRelativePath || file.name,
+        name: file.name,
+        contentBase64: encoded,
+      });
+    });
+    reader.addEventListener("error", () => reject(reader.error || new Error("file read failed")));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function uploadFiles(fileList) {
+  const files = Array.from(fileList || []);
+  if (!files.length) return;
+  setFileStatus("Uploading...");
+  try {
+    const payloads = await Promise.all(files.map(fileToUploadPayload));
+    const body = { directory: state.fileBrowser.path || "", files: payloads };
+    try {
+      const payload = await api("/api/project/file/upload", {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+      renderProjectFiles(payload.files);
+      setFileStatus(`Uploaded ${payload.uploaded?.length || 0} file(s).`, "ok");
+    } catch (error) {
+      if (!(error instanceof ApiError) || error.payload?.error !== "file_exists") throw error;
+      if (!window.confirm(`${error.message}\n\nOverwrite existing file(s)?`)) {
+        setFileStatus("Upload canceled.");
+        return;
+      }
+      const payload = await api("/api/project/file/upload", {
+        method: "POST",
+        body: JSON.stringify({ ...body, overwrite: true }),
+      });
+      renderProjectFiles(payload.files);
+      setFileStatus(`Uploaded ${payload.uploaded?.length || 0} file(s).`, "ok");
+    }
+    renderGit(await api("/api/git/status"));
+  } catch (error) {
+    setFileStatus(`Upload failed: ${error.message}`, "error");
+  } finally {
+    els.fileUploadInput.value = "";
+    els.folderUploadInput.value = "";
+  }
+}
+
+async function createFolderFromPrompt() {
+  const base = state.fileBrowser.path ? `${state.fileBrowser.path}/` : "";
+  const name = window.prompt("New folder path:", base);
+  if (!name) return;
+  setFileStatus("Creating folder...");
+  try {
+    const payload = await api("/api/project/directory/create", {
+      method: "POST",
+      body: JSON.stringify({ path: name.trim() }),
+    });
+    renderProjectFiles(payload.files);
+    setFileStatus(`Created ${payload.entry?.path || name}.`, "ok");
+    renderGit(await api("/api/git/status"));
+  } catch (error) {
+    setFileStatus(`Create failed: ${error.message}`, "error");
+  }
 }
 
 function renderBranches() {
@@ -786,6 +996,7 @@ async function startTrackedJob(endpoint, body, { branch, mode, title }) {
   }
   updateComposerState();
   refreshBranchNavigation().catch(() => {});
+  loadWorkerStatus().catch(() => {});
   monitorTrackedJob(remembered.id).catch((error) => handleMonitorError(remembered, error));
   return remembered;
 }
@@ -877,6 +1088,7 @@ async function monitorTrackedJob(jobId) {
         hideProgressSoon();
       }
       updateComposerState();
+      loadWorkerStatus().catch(() => {});
       return;
     }
     if (remembered.status === "failed") {
@@ -890,6 +1102,7 @@ async function monitorTrackedJob(jobId) {
         hideProgress();
       }
       updateComposerState();
+      loadWorkerStatus().catch(() => {});
       return;
     }
     waitMs = Math.min(1200, waitMs + 100);
@@ -1052,13 +1265,33 @@ async function loadBranches() {
   }
 }
 
+async function loadServerProjects() {
+  try {
+    renderServerProjects(await api("/api/server/projects"));
+  } catch (error) {
+    els.serverProjectPanel.hidden = true;
+  }
+}
+
+async function loadWorkerStatus() {
+  try {
+    renderWorker(await api("/api/worker/status"));
+  } catch (error) {
+    renderWorker(null);
+  }
+}
+
 async function loadProject() {
+  await loadServerProjects();
+  await loadWorkerStatus();
   const project = await api("/api/project");
   renderProject(project);
   if (project.initialized) {
     await loadBranches();
+    await loadProjectFiles(state.fileBrowser.path || "");
     renderGit(await api("/api/git/status"));
     renderProvider(await api("/api/provider/status"));
+    await loadWorkerStatus();
   } else {
     clearWorkspace("This directory is not initialized for ctxgit yet.");
   }
@@ -1077,7 +1310,9 @@ async function openProject(path, { init }) {
     });
     renderProject(project);
     state.activeBranch = null;
+    state.fileBrowser = { path: "", parent: "", entries: [] };
     await loadBranches();
+    await loadProjectFiles("");
     renderGit(await api("/api/git/status"));
     renderProvider(await api("/api/provider/status"));
     setProjectStatus(init ? "Initialized and opened." : "Opened.", "ok");
@@ -1091,6 +1326,35 @@ async function openProject(path, { init }) {
     els.openProjectButton.disabled = false;
     els.initProjectButton.disabled = false;
     els.browseProjectButton.disabled = false;
+  }
+}
+
+async function openServerProject() {
+  const id = els.serverProjectSelect.value;
+  if (!id) return;
+  els.openServerProjectButton.disabled = true;
+  setServerProjectStatus("Opening server project...");
+  try {
+    const project = await api("/api/server/project/open", {
+      method: "POST",
+      body: JSON.stringify({ id }),
+    });
+    renderProject(project);
+    state.activeBranch = null;
+    state.activeGlobalized = null;
+    state.fileBrowser = { path: "", parent: "", entries: [] };
+    await loadServerProjects();
+    await loadBranches();
+    await loadProjectFiles("");
+    renderGit(await api("/api/git/status"));
+    renderProvider(await api("/api/provider/status"));
+    await loadWorkerStatus();
+    setServerProjectStatus("Opened.", "ok");
+  } catch (error) {
+    clearWorkspace(error.message);
+    setServerProjectStatus(`Open failed: ${error.message}`, "error");
+  } finally {
+    els.openServerProjectButton.disabled = false;
   }
 }
 
@@ -1407,6 +1671,7 @@ function selectTab(tab) {
   button.classList.add("active");
   panel.classList.add("active");
   if (tab === "chat") scrollChatToBottom();
+  if (tab === "files") loadProjectFiles().catch(() => {});
 }
 
 document.querySelectorAll(".tab").forEach((button) => {
@@ -1441,6 +1706,31 @@ els.browseProjectButton.addEventListener("click", async () => {
   } else {
     setProjectStatus("Directory selected. Use Init/Open to initialize it.", "");
   }
+});
+
+els.openServerProjectButton.addEventListener("click", openServerProject);
+
+els.filePathForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  await loadProjectFiles(els.filePathInput.value.trim());
+});
+
+els.fileUpButton.addEventListener("click", async () => {
+  await loadProjectFiles(state.fileBrowser.parent || "");
+});
+
+els.fileRefreshButton.addEventListener("click", async () => {
+  await loadProjectFiles();
+});
+
+els.newFolderButton.addEventListener("click", createFolderFromPrompt);
+
+els.fileUploadInput.addEventListener("change", async () => {
+  await uploadFiles(els.fileUploadInput.files);
+});
+
+els.folderUploadInput.addEventListener("change", async () => {
+  await uploadFiles(els.folderUploadInput.files);
 });
 
 els.mergeForm.addEventListener("submit", async (event) => {
@@ -1507,18 +1797,20 @@ async function sendComposerMessage({ mode }) {
       return;
     }
     if (isChat) {
+      const provider = state.worker?.preferWorker ? "codex-worker" : "codex";
       await startTrackedJob(
         "/api/chat/start",
-        { branch, text, provider: "codex" },
+        { branch, text, provider },
         { branch, mode: "chat", title: "채팅 턴 시작 중" },
       );
       els.messageInput.value = "";
       return;
     }
     if (isInfoChat) {
+      const provider = state.worker?.preferWorker ? "codex-worker" : "codex";
       await startTrackedJob(
         "/api/info-chat/start",
-        { branch, text, provider: "codex" },
+        { branch, text, provider },
         { branch, mode: "info-chat", title: "정보 챗 시작 중" },
       );
       els.messageInput.value = "";

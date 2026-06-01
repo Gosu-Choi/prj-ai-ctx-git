@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import base64
 import contextlib
 import io
 import json
@@ -104,6 +105,100 @@ class CtxgitTest(unittest.TestCase):
             branch_meta.pop("archivedAs")
             ctxgit.dump_json(root / "contexts" / "branches" / "alpha" / "branch.json", branch_meta)
             self.assertEqual(store.list_branches(), [])
+
+    def test_server_project_registry_lists_and_resolves_server_projects(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            projects_root = Path(tmp) / "server-projects"
+            alpha = projects_root / "Alpha Project"
+            beta = projects_root / "beta"
+            ctxgit.ContextStore(alpha).init()
+            ctxgit.ContextStore(beta).init()
+            registry = ctxgit.ServerProjectRegistry(alpha, projects_root)
+
+            payload = registry.payload(alpha)
+
+            self.assertTrue(payload["enabled"])
+            ids = [project["id"] for project in payload["projects"]]
+            self.assertIn("alpha-project", ids)
+            self.assertIn("beta", ids)
+            self.assertEqual(registry.resolve("beta", alpha), beta.resolve())
+
+    def test_worker_job_queue_claim_and_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ctxgit.ContextStore(root).init()
+            project_state = ctxgit.ProjectState(root)
+            jobs = ctxgit.JobStore(project_state, prefer_worker=True)
+
+            queued = jobs.create_worker("chat", {"kind": "chat", "branch": "initial", "text": "hello"}, root=root)
+            claimed = jobs.claim_worker_job("local", ["chat"])
+
+            self.assertEqual(claimed["job"]["id"], queued["id"])
+            self.assertEqual(jobs.snapshot(queued["id"])["diagnostics"]["state"], "worker-claimed")
+            completed = jobs.complete_worker_job(queued["id"], "local", payload={"ok": True})
+            self.assertEqual(completed["status"], "done")
+            self.assertEqual(completed["payload"], {"ok": True})
+
+    def test_project_snapshot_round_trip_skips_secrets_and_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source"
+            target = Path(tmp) / "target"
+            ctxgit.ContextStore(source).init()
+            (source / ".env").write_text("SECRET=1\n", encoding="utf-8")
+            (source / ".ctxgit" / ".env").write_text("SECRET=2\n", encoding="utf-8")
+            write_job = source / "contexts" / "jobs" / "running.json"
+            write_job.parent.mkdir(parents=True, exist_ok=True)
+            write_job.write_text("{}", encoding="utf-8")
+            (source / "notes.md").write_text("sync me\n", encoding="utf-8")
+
+            changed = ctxgit.apply_project_snapshot_zip(target, ctxgit.make_project_snapshot_zip(source))
+
+            self.assertIn("notes.md", changed)
+            self.assertTrue((target / "contexts" / "branches" / "initial" / "branch.json").exists())
+            self.assertFalse((target / ".env").exists())
+            self.assertFalse((target / ".ctxgit" / ".env").exists())
+            self.assertFalse((target / "contexts" / "jobs" / "running.json").exists())
+
+    def test_project_file_browser_uploads_and_previews_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ctxgit.ContextStore(root).init()
+
+            uploaded = ctxgit.upload_project_files(
+                root,
+                "uploads",
+                [
+                    {
+                        "path": "notes/hello.txt",
+                        "contentBase64": base64.b64encode(b"hello server").decode("ascii"),
+                    }
+                ],
+            )
+
+            self.assertEqual(uploaded[0]["path"], "uploads/notes/hello.txt")
+            listing = ctxgit.project_files_payload(root, "uploads")
+            self.assertEqual(listing["entries"][0]["name"], "notes")
+            preview = ctxgit.project_file_text_payload(root, "uploads/notes/hello.txt")
+            self.assertEqual(preview["text"], "hello server")
+
+    def test_project_file_upload_rejects_escape_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ctxgit.ContextStore(root).init()
+
+            with self.assertRaises(ValueError):
+                ctxgit.upload_project_files(
+                    root,
+                    "",
+                    [
+                        {
+                            "path": "../outside.txt",
+                            "contentBase64": base64.b64encode(b"nope").decode("ascii"),
+                        }
+                    ],
+                )
+            with self.assertRaises(ValueError):
+                ctxgit.project_files_payload(root, "../")
 
     def test_delete_history_record_rewrites_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

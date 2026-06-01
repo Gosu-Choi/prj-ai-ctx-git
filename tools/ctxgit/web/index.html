@@ -26,6 +26,11 @@
             </div>
             <div id="projectStatus" class="settings-status"></div>
           </form>
+          <div id="serverProjectPanel" class="server-project-panel" hidden>
+            <select id="serverProjectSelect"></select>
+            <button id="openServerProjectButton" type="button">Open server project</button>
+            <div id="serverProjectStatus" class="settings-status"></div>
+          </div>
         </section>
 
         <section class="sidebar-section">
@@ -77,6 +82,11 @@
         </section>
 
         <section class="sidebar-section">
+          <div class="section-title">Worker</div>
+          <div id="workerSummary" class="git-summary"></div>
+        </section>
+
+        <section class="sidebar-section">
           <div class="section-title">Archived</div>
           <div id="globalizedList" class="nav-list"></div>
         </section>
@@ -91,6 +101,7 @@
           <div class="tabs" role="tablist">
             <button class="tab active" data-tab="chat" type="button">Chat</button>
             <button class="tab" data-tab="report" type="button">Report</button>
+            <button class="tab" data-tab="files" type="button">Files</button>
             <button class="tab" data-tab="archives" type="button">Archives</button>
             <button class="tab" data-tab="version" type="button">Version</button>
           </div>
@@ -130,6 +141,31 @@
 
         <section id="reportTab" class="tab-panel">
           <article id="reportView" class="markdown"></article>
+        </section>
+
+        <section id="filesTab" class="tab-panel">
+          <div class="file-browser">
+            <form id="filePathForm" class="file-toolbar">
+              <button id="fileUpButton" type="button">Up</button>
+              <button id="fileRefreshButton" type="button">Refresh</button>
+              <input id="filePathInput" type="text" placeholder="project path" />
+              <button id="fileGoButton" type="submit">Go</button>
+              <button id="newFolderButton" type="button">New folder</button>
+              <label class="file-upload-button">
+                <input id="fileUploadInput" type="file" multiple />
+                <span>Upload files</span>
+              </label>
+              <label class="file-upload-button">
+                <input id="folderUploadInput" type="file" webkitdirectory multiple />
+                <span>Upload folder</span>
+              </label>
+            </form>
+            <div id="fileStatus" class="settings-status"></div>
+            <div class="file-browser-grid">
+              <div id="fileList" class="file-list"></div>
+              <pre id="filePreview" class="code-block file-preview"></pre>
+            </div>
+          </div>
         </section>
 
         <section id="archivesTab" class="tab-panel">

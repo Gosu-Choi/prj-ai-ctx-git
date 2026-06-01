@@ -83,7 +83,14 @@ textarea {
   margin-top: 10px;
 }
 
+.server-project-panel {
+  display: grid;
+  gap: 7px;
+  margin-top: 10px;
+}
+
 .project-form input,
+.server-project-panel select,
 .merge-form input {
   min-width: 0;
   width: 100%;
@@ -116,6 +123,16 @@ textarea {
 
 .project-buttons button {
   padding: 7px 6px;
+}
+
+.server-project-panel button {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+  padding: 7px 8px;
 }
 
 .merge-form button {
@@ -217,14 +234,17 @@ textarea {
 .wide-button,
 .tab,
 .composer button,
-.branch-options-button,
-.branch-options-menu button,
-.message-options-menu button {
-  border: 1px solid var(--line);
-  background: var(--panel);
-  color: var(--text);
-  cursor: pointer;
-}
+	.branch-options-button,
+	.branch-options-menu button,
+	.message-options-menu button,
+	.file-toolbar button,
+	.file-upload-button,
+	.file-row {
+	  border: 1px solid var(--line);
+	  background: var(--panel);
+	  color: var(--text);
+	  cursor: pointer;
+	}
 
 .nav-item {
   min-width: 0;
@@ -759,6 +779,117 @@ textarea {
   vertical-align: top;
 }
 
+.file-browser {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  gap: 10px;
+  height: 100%;
+  min-height: 0;
+}
+
+.file-toolbar {
+  display: grid;
+  grid-template-columns: 70px 88px minmax(180px, 1fr) 58px 104px 112px 120px;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+}
+
+.file-toolbar input[type="text"] {
+  min-width: 0;
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  padding: 8px;
+}
+
+.file-toolbar button,
+.file-upload-button {
+  min-width: 0;
+  min-height: 36px;
+  border-radius: 6px;
+  padding: 8px 10px;
+  text-align: center;
+}
+
+.file-upload-button {
+  display: inline-grid;
+  place-items: center;
+  overflow: hidden;
+}
+
+.file-upload-button input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.file-browser-grid {
+  display: grid;
+  grid-template-columns: minmax(280px, 420px) minmax(0, 1fr);
+  gap: 14px;
+  min-height: 0;
+}
+
+.file-list {
+  display: grid;
+  align-content: start;
+  gap: 5px;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.file-row {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  border-radius: 6px;
+  padding: 9px 10px;
+  text-align: left;
+}
+
+.file-row:hover {
+  border-color: var(--accent);
+}
+
+.file-icon {
+  grid-row: span 2;
+  color: var(--accent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-weight: 700;
+}
+
+.file-name,
+.file-meta {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-name {
+  font-weight: 650;
+}
+
+.file-meta {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.file-preview {
+  min-height: 0;
+  height: 100%;
+  overflow: auto;
+}
+
 .version-grid {
   display: grid;
   grid-template-columns: minmax(260px, 420px) minmax(0, 1fr);
@@ -860,6 +991,8 @@ textarea {
 
   .topbar,
   .archive-layout,
+  .file-browser-grid,
+  .file-toolbar,
   #chatTab.active,
   .composer,
   .version-grid {

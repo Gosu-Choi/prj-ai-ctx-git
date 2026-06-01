@@ -16,10 +16,14 @@ can be diffed, merged, and committed.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import concurrent.futures
 import contextlib
 import hashlib
+import hmac
 import html
+import io
 import importlib.util
 import http.server
 import json
@@ -40,6 +44,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -70,6 +75,11 @@ PROJECT_ENV_ALLOWED_KEYS = {"BRAVE_API_KEY"}
 REPO_ENV_FILES = (".env",)
 PROJECT_ENV_FILES = (".ctxgit/.env", ".env")
 PROJECT_ENV_GITIGNORE_LINES = (".ctxgit/.env", ".ctxgit/.env.*", "!.ctxgit/.env.example")
+PROJECT_SYNC_SKIP_DIRS = {".git", "__pycache__", ".mypy_cache", ".pytest_cache", "node_modules", ".venv", "venv"}
+PROJECT_SYNC_SKIP_FILES = {".env", ".DS_Store"}
+PROJECT_SYNC_SKIP_PATHS = {(".ctxgit", ".env")}
+MAX_PROJECT_UPLOAD_BYTES = 100 * 1024 * 1024
+MAX_PROJECT_TEXT_PREVIEW_BYTES = 512 * 1024
 PROJECT_CONTEXT_FILES = (
     ("Project Agent Instructions", "AGENTS.md"),
     ("User Preferences", "USER.md"),
@@ -318,6 +328,23 @@ def resolve_project_file(root: Path, value: str) -> Path:
         raise ValueError("file path is outside the active project") from exc
     if not resolved_target.exists() or not resolved_target.is_file():
         raise FileNotFoundError(value)
+    return resolved_target
+
+
+def resolve_project_path(root: Path, value: str | Path, allow_empty: bool = False) -> Path:
+    text = str(value or "").strip()
+    if not text:
+        if allow_empty:
+            return root.resolve()
+        raise ValueError("project path is required")
+    raw_path = Path(text)
+    target = raw_path if raw_path.is_absolute() else root / raw_path
+    resolved_root = root.resolve()
+    resolved_target = target.resolve(strict=False)
+    try:
+        resolved_target.relative_to(resolved_root)
+    except ValueError as exc:
+        raise ValueError("path must stay inside the project") from exc
     return resolved_target
 
 
@@ -4825,6 +4852,246 @@ def browse_directories(path_value: str | None) -> dict[str, Any]:
     }
 
 
+def project_file_modified_at(path: Path) -> str:
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    except OSError:
+        return ""
+
+
+def project_file_entry(root: Path, path: Path) -> dict[str, Any]:
+    is_directory = path.is_dir()
+    size = 0
+    if not is_directory:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+    return {
+        "name": path.name,
+        "path": relpath(root, path),
+        "isDirectory": is_directory,
+        "size": size,
+        "modifiedAt": project_file_modified_at(path),
+    }
+
+
+def project_files_payload(root: Path, path_value: str | None) -> dict[str, Any]:
+    root = root.resolve()
+    target = resolve_project_path(root, path_value or "", allow_empty=True)
+    if not target.exists():
+        raise FileNotFoundError(path_value or "")
+    if not target.is_dir():
+        raise ValueError("path is not a directory")
+    try:
+        children = sorted(target.iterdir(), key=lambda item: (not item.is_dir(), item.name.lower()))
+    except PermissionError as exc:
+        raise ValueError(f"permission denied: {safe_relpath(root, target)}") from exc
+    current = "" if target == root else relpath(root, target)
+    parent = ""
+    if target != root and path_is_within(root, target.parent):
+        parent = "" if target.parent == root else relpath(root, target.parent)
+    return {
+        "path": current,
+        "parent": parent,
+        "entries": [project_file_entry(root, child) for child in children],
+    }
+
+
+def project_file_text_payload(root: Path, path_value: str) -> dict[str, Any]:
+    target = resolve_project_file(root, path_value)
+    size = target.stat().st_size
+    data = target.read_bytes()[: MAX_PROJECT_TEXT_PREVIEW_BYTES + 1]
+    truncated = len(data) > MAX_PROJECT_TEXT_PREVIEW_BYTES
+    data = data[:MAX_PROJECT_TEXT_PREVIEW_BYTES]
+    binary = b"\0" in data
+    if binary:
+        text = ""
+    else:
+        text = data.decode("utf-8", errors="replace")
+    return {
+        "path": relpath(root, target),
+        "name": target.name,
+        "size": size,
+        "text": text,
+        "binary": binary,
+        "truncated": truncated,
+    }
+
+
+def safe_upload_relative_path(value: str) -> Path:
+    normalized = value.replace("\\", "/").strip().lstrip("/")
+    rel = Path(normalized)
+    if not normalized or rel.is_absolute() or ".." in rel.parts or any(not part for part in rel.parts):
+        raise ValueError(f"invalid upload path: {value}")
+    return rel
+
+
+def create_project_directory(root: Path, path_value: str) -> dict[str, Any]:
+    target = resolve_project_path(root, path_value, allow_empty=False)
+    target.mkdir(parents=True, exist_ok=True)
+    return project_file_entry(root, target)
+
+
+def upload_project_files(
+    root: Path,
+    directory_value: str,
+    files: list[dict[str, Any]],
+    *,
+    overwrite: bool = False,
+) -> list[dict[str, Any]]:
+    if not isinstance(files, list) or not files:
+        raise ValueError("files are required")
+    directory = resolve_project_path(root, directory_value or "", allow_empty=True)
+    directory.mkdir(parents=True, exist_ok=True)
+    uploaded = []
+    total_size = 0
+    for item in files:
+        if not isinstance(item, dict):
+            raise ValueError("invalid file payload")
+        rel = safe_upload_relative_path(str(item.get("path") or item.get("name") or ""))
+        encoded = str(item.get("contentBase64") or "")
+        try:
+            data = base64.b64decode(encoded.encode("ascii"), validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise ValueError(f"invalid base64 for {rel.as_posix()}") from exc
+        total_size += len(data)
+        if total_size > MAX_PROJECT_UPLOAD_BYTES:
+            raise ValueError("upload is too large")
+        target = (directory / rel).resolve(strict=False)
+        try:
+            target.relative_to(root.resolve())
+        except ValueError as exc:
+            raise ValueError("upload path must stay inside the project") from exc
+        if target.exists() and not overwrite:
+            raise FileExistsError(rel.as_posix())
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        uploaded.append(project_file_entry(root, target))
+    return uploaded
+
+
+def project_registry_id(path: Path, used: set[str]) -> str:
+    base = slugify(path.name or "project", fallback="project").lower()
+    base = re.sub(r"[^a-z0-9._-]+", "-", base).strip("-._") or "project"
+    if not re.match(r"^[a-z0-9]", base):
+        base = f"project-{base}"
+    base = base[:72].strip("-._") or "project"
+    candidate = base
+    index = 2
+    while candidate in used:
+        suffix = f"-{index}"
+        candidate = f"{base[:80 - len(suffix)].strip('-._') or 'project'}{suffix}"
+        index += 1
+    used.add(candidate)
+    return candidate
+
+
+class ServerProjectRegistry:
+    def __init__(self, initial_root: Path, projects_root: Path | None = None) -> None:
+        self.initial_root = initial_root.resolve()
+        self.projects_root = projects_root.expanduser().resolve() if projects_root else None
+        if self.projects_root:
+            self.projects_root.mkdir(parents=True, exist_ok=True)
+
+    def payload(self, active_root: Path) -> dict[str, Any]:
+        return {
+            "enabled": self.projects_root is not None,
+            "projectsRoot": str(self.projects_root) if self.projects_root else "",
+            "activeProject": project_payload(active_root),
+            "projects": self.list_projects(active_root),
+        }
+
+    def list_projects(self, active_root: Path | None = None) -> list[dict[str, Any]]:
+        active_root = (active_root or self.initial_root).resolve()
+        candidates: list[Path] = []
+        if self.projects_root:
+            for child in sorted(self.projects_root.iterdir(), key=lambda item: item.name.lower()):
+                if child.is_dir() and not child.name.startswith("."):
+                    candidates.append(child.resolve())
+        else:
+            candidates.append(active_root)
+        if active_root not in candidates:
+            candidates.insert(0, active_root)
+        used: set[str] = set()
+        projects = []
+        for path in candidates:
+            payload = project_payload(path)
+            payload["id"] = project_registry_id(path, used)
+            payload["active"] = path == active_root
+            payload["source"] = "server" if self.projects_root and path != active_root else "active"
+            projects.append(payload)
+        return projects
+
+    def resolve(self, project_id: str, active_root: Path | None = None) -> Path:
+        clean_id = project_id.strip()
+        if not clean_id:
+            raise ValueError("project id is required")
+        if not SAFE_ID_RE.match(clean_id):
+            raise ValueError(f"invalid project id: {project_id}")
+        for project in self.list_projects(active_root):
+            if project.get("id") == clean_id:
+                path = Path(str(project.get("path") or "")).resolve()
+                if not path.exists() or not path.is_dir():
+                    raise ValueError(f"project directory does not exist: {path}")
+                if self.projects_root:
+                    try:
+                        path.relative_to(self.projects_root)
+                    except ValueError:
+                        if path != (active_root or self.initial_root).resolve():
+                            raise ValueError("project is outside the server projects root")
+                return path
+        raise ValueError(f"server project not found: {project_id}")
+
+
+def should_skip_project_sync_path(rel: Path) -> bool:
+    parts = rel.parts
+    if not parts:
+        return False
+    if len(parts) >= 2 and parts[0] == "contexts" and parts[1] == "jobs":
+        return True
+    if any(part in PROJECT_SYNC_SKIP_DIRS for part in parts):
+        return True
+    if parts[-1] in PROJECT_SYNC_SKIP_FILES:
+        return True
+    return tuple(parts) in PROJECT_SYNC_SKIP_PATHS
+
+
+def make_project_snapshot_zip(root: Path) -> bytes:
+    root = root.resolve()
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in sorted(root.rglob("*")):
+            rel = path.relative_to(root)
+            if should_skip_project_sync_path(rel):
+                if path.is_dir():
+                    continue
+                continue
+            if path.is_dir():
+                continue
+            archive.write(path, rel.as_posix())
+    return buffer.getvalue()
+
+
+def apply_project_snapshot_zip(root: Path, data: bytes) -> list[str]:
+    root = root.resolve()
+    changed: list[str] = []
+    with zipfile.ZipFile(io.BytesIO(data), "r") as archive:
+        for info in archive.infolist():
+            rel = Path(info.filename)
+            if info.is_dir() or rel.is_absolute() or ".." in rel.parts or should_skip_project_sync_path(rel):
+                continue
+            target = (root / rel).resolve()
+            try:
+                target.relative_to(root)
+            except ValueError:
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(archive.read(info))
+            changed.append(rel.as_posix())
+    return changed
+
+
 def dialog_initial_directory(path_value: str | None) -> Path:
     if path_value and path_value.strip():
         candidate = Path(path_value).expanduser()
@@ -4962,19 +5229,28 @@ class ReusableThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPS
 
 
 class JobStore:
-    def __init__(self, project_state: ProjectState) -> None:
+    def __init__(self, project_state: ProjectState, prefer_worker: bool = False) -> None:
         self._project_state = project_state
+        self.prefer_worker = prefer_worker
         self._lock = threading.RLock()
         self._jobs: dict[str, dict[str, Any]] = {}
+        self._workers: dict[str, dict[str, Any]] = {}
 
-    def create(self, kind: str, work: Callable[[ProgressCallback], dict[str, Any]]) -> dict[str, Any]:
+    def new_job_id(self) -> str:
         job_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        with self._lock:
+            while job_id in self._jobs:
+                job_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        return job_id
+
+    def base_job(self, job_id: str, kind: str, root: Path | None = None) -> dict[str, Any]:
         created_at = utc_now()
-        job_path = self.job_path(job_id)
+        project_root = (root or self._project_state.root()).resolve()
         job = {
             "id": job_id,
             "kind": kind,
             "status": "running",
+            "projectPath": str(project_root),
             "createdAt": created_at,
             "updatedAt": created_at,
             "events": [{"message": "대기 중", "createdAt": created_at}],
@@ -4984,8 +5260,14 @@ class JobStore:
                 "state": "queued",
                 "detail": "Job is queued.",
             },
-            "_path": job_path,
+            "_path": self.job_path(job_id, project_root),
+            "_project_root": project_root,
         }
+        return job
+
+    def create(self, kind: str, work: Callable[[ProgressCallback], dict[str, Any]]) -> dict[str, Any]:
+        job_id = self.new_job_id()
+        job = self.base_job(job_id, kind)
         with self._lock:
             self._jobs[job_id] = job
             self.persist_locked(job)
@@ -5011,6 +5293,118 @@ class JobStore:
                 self.fail(job_id, "failed", str(exc))
 
         threading.Thread(target=target, daemon=True).start()
+        return self.snapshot(job_id)
+
+    def create_worker(self, kind: str, request: dict[str, Any], root: Path | None = None) -> dict[str, Any]:
+        job_id = self.new_job_id()
+        job = self.base_job(job_id, kind, root=root)
+        job["runner"] = "worker"
+        job["workerStatus"] = "queued"
+        job["request"] = request
+        job["branch"] = request.get("branch", "")
+        job["mode"] = request.get("mode") or kind
+        job["events"] = [{"message": "로컬 worker 대기 중", "createdAt": job["createdAt"]}]
+        job["diagnostics"] = {
+            "elapsedSeconds": 0,
+            "idleSeconds": 0,
+            "state": "worker-queued",
+            "detail": "Waiting for a local ctxgit worker.",
+        }
+        with self._lock:
+            self._jobs[job_id] = job
+            self.persist_locked(job)
+        return self.snapshot(job_id)
+
+    def worker_status(self) -> dict[str, Any]:
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            workers = []
+            for worker_id, meta in self._workers.items():
+                last_seen = parse_utc(meta.get("lastSeenAt")) or now
+                workers.append(
+                    {
+                        **meta,
+                        "active": (now - last_seen).total_seconds() <= 30,
+                    }
+                )
+            worker_jobs = [job for job in self._jobs.values() if job.get("runner") == "worker" and job.get("status") == "running"]
+            return {
+                "enabled": True,
+                "preferWorker": self.prefer_worker,
+                "activeWorkers": len([worker for worker in workers if worker.get("active")]),
+                "workers": workers,
+                "queued": len([job for job in worker_jobs if job.get("workerStatus") == "queued"]),
+                "claimed": len([job for job in worker_jobs if job.get("workerStatus") == "claimed"]),
+            }
+
+    def claim_worker_job(self, worker_id: str, capabilities: Iterable[str] = ()) -> dict[str, Any]:
+        worker_id = worker_id.strip() or f"worker-{uuid.uuid4().hex[:8]}"
+        now = utc_now()
+        capability_set = {str(item) for item in capabilities if str(item).strip()}
+        with self._lock:
+            self._workers[worker_id] = {
+                "id": worker_id,
+                "lastSeenAt": now,
+                "capabilities": sorted(capability_set),
+            }
+            candidates = [
+                job
+                for job in self._jobs.values()
+                if job.get("runner") == "worker"
+                and job.get("status") == "running"
+                and job.get("workerStatus") == "queued"
+                and (not capability_set or str(job.get("kind") or "") in capability_set)
+            ]
+            candidates.sort(key=lambda job: str(job.get("createdAt") or ""))
+            if not candidates:
+                return {"job": None, "worker": self._workers[worker_id]}
+            job = candidates[0]
+            job["workerStatus"] = "claimed"
+            job["workerId"] = worker_id
+            job["workerClaimedAt"] = now
+            job["updatedAt"] = now
+            job.setdefault("events", []).append({"message": f"로컬 worker {worker_id}가 작업을 가져감", "createdAt": now})
+            self.persist_locked(job)
+            return {"job": self.public_job(job), "worker": self._workers[worker_id]}
+
+    def add_worker_event(self, job_id: str, worker_id: str, message: str) -> dict[str, Any]:
+        with self._lock:
+            job = self._jobs.get(job_id) or self.load_locked(job_id)
+            if not job or job.get("runner") != "worker":
+                return {"error": "job_not_found", "message": f"job not found: {job_id}"}
+            if job.get("workerId") and job.get("workerId") != worker_id:
+                return {"error": "worker_mismatch", "message": "job is claimed by another worker"}
+        self.add_event(job_id, message)
+        return self.snapshot(job_id)
+
+    def complete_worker_job(
+        self,
+        job_id: str,
+        worker_id: str,
+        *,
+        payload: dict[str, Any] | None = None,
+        error: str = "",
+        message: str = "",
+    ) -> dict[str, Any]:
+        with self._lock:
+            job = self._jobs.get(job_id) or self.load_locked(job_id)
+            if not job or job.get("runner") != "worker":
+                return {"error": "job_not_found", "message": f"job not found: {job_id}"}
+            if job.get("workerId") and job.get("workerId") != worker_id:
+                return {"error": "worker_mismatch", "message": "job is claimed by another worker"}
+            now = utc_now()
+            if error:
+                job["status"] = "failed"
+                job["error"] = error
+                job["message"] = message or error
+                job.setdefault("events", []).append({"message": f"실패: {job['message']}", "createdAt": now})
+            else:
+                job["status"] = "done"
+                job["payload"] = payload or {}
+                job.setdefault("events", []).append({"message": "완료됨", "createdAt": now})
+            job["workerStatus"] = "finished"
+            job["updatedAt"] = now
+            self.persist_locked(job)
         return self.snapshot(job_id)
 
     def add_event(self, job_id: str, message: str) -> None:
@@ -5047,8 +5441,9 @@ class JobStore:
         self.add_diagnostics(snapshot)
         return snapshot
 
-    def job_path(self, job_id: str) -> Path:
-        return self._project_state.root() / "contexts" / "jobs" / f"{job_id}.json"
+    def job_path(self, job_id: str, root: Path | None = None) -> Path:
+        project_root = root or self._project_state.root()
+        return project_root / "contexts" / "jobs" / f"{job_id}.json"
 
     def public_job(self, job: dict[str, Any]) -> dict[str, Any]:
         return {key: value for key, value in job.items() if not key.startswith("_")}
@@ -5072,6 +5467,8 @@ class JobStore:
         if not isinstance(job, dict):
             return None
         job["_path"] = path
+        if job.get("projectPath"):
+            job["_project_root"] = Path(str(job["projectPath"])).expanduser().resolve()
         if job.get("status") == "running":
             job["status"] = "failed"
             job["error"] = "server_restarted"
@@ -5099,7 +5496,16 @@ class JobStore:
         state = status
         detail = ""
         if status == "running":
-            if idle_seconds >= 60:
+            if job.get("runner") == "worker":
+                worker_status = str(job.get("workerStatus") or "queued")
+                state = f"worker-{worker_status}"
+                if worker_status == "queued":
+                    detail = "로컬 ctxgit worker가 작업을 가져가기를 기다리는 중입니다."
+                elif worker_status == "claimed":
+                    detail = f"로컬 worker {job.get('workerId') or ''}에서 실행 중입니다.".strip()
+                else:
+                    detail = "로컬 worker 작업이 진행 중입니다."
+            elif idle_seconds >= 60:
                 state = "running-idle"
                 detail = (
                     f"아직 실행 중이지만 {idle_seconds}초 동안 새 이벤트가 없습니다. "
@@ -5124,8 +5530,15 @@ class JobStore:
         }
 
 
-def make_handler(project_state: ProjectState):
-    jobs = JobStore(project_state)
+def make_handler(
+    project_state: ProjectState,
+    project_registry: ServerProjectRegistry | None = None,
+    worker_token: str = "",
+    prefer_worker: bool = False,
+):
+    registry = project_registry or ServerProjectRegistry(project_state.root())
+    jobs = JobStore(project_state, prefer_worker=prefer_worker)
+    worker_token = worker_token or os.environ.get("CTXGIT_WORKER_TOKEN", "")
 
     class CtxgitHandler(http.server.BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: Any) -> None:
@@ -5135,6 +5548,14 @@ def make_handler(project_state: ProjectState):
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def send_bytes(self, data: bytes, content_type: str = "application/octet-stream", status: int = 200) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
@@ -5158,10 +5579,39 @@ def make_handler(project_state: ProjectState):
             except json.JSONDecodeError:
                 return {}
 
+        def worker_authorized(self, body: dict[str, Any] | None = None) -> bool:
+            if not worker_token:
+                return True
+            supplied = self.headers.get("X-Ctxgit-Worker-Token", "")
+            if not supplied and body:
+                supplied = str(body.get("token") or "")
+            return hmac.compare_digest(supplied, worker_token)
+
         def handle_api_get(self, parsed: urllib.parse.ParseResult) -> bool:
             query = urllib.parse.parse_qs(parsed.query)
             if parsed.path == "/api/project":
                 self.send_json(project_state.payload())
+                return True
+            if parsed.path == "/api/server/projects":
+                self.send_json(registry.payload(project_state.root()))
+                return True
+            if parsed.path == "/api/worker/status":
+                self.send_json(jobs.worker_status())
+                return True
+            if parsed.path == "/api/worker/snapshot":
+                if not self.worker_authorized():
+                    self.send_json({"error": "unauthorized", "message": "worker token is invalid"}, status=401)
+                    return True
+                job_id = (query.get("id") or [""])[0]
+                job = jobs.snapshot(job_id)
+                if job.get("error"):
+                    self.send_json(job, status=404)
+                    return True
+                root_path = Path(str(job.get("projectPath") or project_state.root())).expanduser().resolve()
+                try:
+                    self.send_bytes(make_project_snapshot_zip(root_path), content_type="application/zip")
+                except Exception as exc:
+                    self.send_json({"error": "snapshot_failed", "message": str(exc)}, status=500)
                 return True
             if parsed.path == "/api/project/browse":
                 try:
@@ -5227,6 +5677,22 @@ def make_handler(project_state: ProjectState):
                 return True
             if parsed.path == "/api/provider/status":
                 self.send_json(codex_login_status(root))
+                return True
+            if parsed.path == "/api/project/files":
+                try:
+                    self.send_json(project_files_payload(root, (query.get("path") or [""])[0]))
+                except FileNotFoundError:
+                    self.send_json({"error": "path_not_found", "message": "Directory not found."}, status=404)
+                except ValueError as exc:
+                    self.send_json({"error": "file_browse_failed", "message": str(exc)}, status=400)
+                return True
+            if parsed.path == "/api/project/file/text":
+                try:
+                    self.send_json(project_file_text_payload(root, (query.get("path") or [""])[0]))
+                except FileNotFoundError:
+                    self.send_json({"error": "file_not_found", "message": "File not found."}, status=404)
+                except ValueError as exc:
+                    self.send_json({"error": "file_read_failed", "message": str(exc)}, status=400)
                 return True
             return False
 
@@ -5305,6 +5771,72 @@ def make_handler(project_state: ProjectState):
         def do_POST(self) -> None:
             parsed = urllib.parse.urlparse(self.path)
             body = self.read_json_body()
+            if parsed.path == "/api/server/project/open":
+                project_id = str(body.get("id") or "")
+                init = body.get("init") is True
+                try:
+                    root = registry.resolve(project_id, project_state.root())
+                    self.send_json(project_state.open(str(root), init=init, init_git=body.get("gitInit") is True))
+                except SystemExit as exc:
+                    self.send_json({"error": "project_not_initialized", "message": "Project is not initialized for ctxgit."}, status=int(exc.code or 409))
+                except ValueError as exc:
+                    self.send_json({"error": "server_project_open_failed", "message": str(exc)}, status=400)
+                return
+            if parsed.path == "/api/worker/claim":
+                if not self.worker_authorized(body):
+                    self.send_json({"error": "unauthorized", "message": "worker token is invalid"}, status=401)
+                    return
+                worker_id = str(body.get("workerId") or "")
+                capabilities = body.get("capabilities") if isinstance(body.get("capabilities"), list) else []
+                self.send_json(jobs.claim_worker_job(worker_id, capabilities))
+                return
+            if parsed.path == "/api/worker/job/event":
+                if not self.worker_authorized(body):
+                    self.send_json({"error": "unauthorized", "message": "worker token is invalid"}, status=401)
+                    return
+                job_id = str(body.get("jobId") or "")
+                worker_id = str(body.get("workerId") or "")
+                message = str(body.get("message") or "").strip()
+                if not message:
+                    self.send_json({"error": "message_required"}, status=400)
+                    return
+                payload = jobs.add_worker_event(job_id, worker_id, message)
+                status = 404 if payload.get("error") == "job_not_found" else 409 if payload.get("error") else 200
+                self.send_json(payload, status=status)
+                return
+            if parsed.path == "/api/worker/job/complete":
+                if not self.worker_authorized(body):
+                    self.send_json({"error": "unauthorized", "message": "worker token is invalid"}, status=401)
+                    return
+                job_id = str(body.get("jobId") or "")
+                worker_id = str(body.get("workerId") or "")
+                error = str(body.get("error") or "")
+                message = str(body.get("message") or "")
+                result_payload = body.get("payload") if isinstance(body.get("payload"), dict) else {}
+                if not error:
+                    encoded_zip = str(body.get("projectZipBase64") or "")
+                    if encoded_zip:
+                        try:
+                            job = jobs.snapshot(job_id)
+                            if job.get("error"):
+                                self.send_json(job, status=404)
+                                return
+                            root_path = Path(str(job.get("projectPath") or project_state.root())).expanduser().resolve()
+                            changed = apply_project_snapshot_zip(root_path, base64.b64decode(encoded_zip.encode("ascii")))
+                            result_payload = {**result_payload, "syncedFiles": changed}
+                        except Exception as exc:
+                            self.send_json({"error": "sync_failed", "message": str(exc)}, status=500)
+                            return
+                payload = jobs.complete_worker_job(
+                    job_id,
+                    worker_id,
+                    payload=result_payload,
+                    error=error,
+                    message=message,
+                )
+                status = 404 if payload.get("error") == "job_not_found" else 409 if payload.get("error") else 200
+                self.send_json(payload, status=status)
+                return
             if parsed.path == "/api/project/choose-directory":
                 path_value = str(body.get("path") or "")
                 try:
@@ -5338,6 +5870,26 @@ def make_handler(project_state: ProjectState):
             except SystemExit as exc:
                 self.send_json({"error": "project_not_initialized", "project": project_state.payload()}, status=int(exc.code or 409))
                 return
+            if parsed.path == "/api/project/directory/create":
+                path_value = str(body.get("path") or "")
+                try:
+                    entry = create_project_directory(root, path_value)
+                    self.send_json({"entry": entry, "files": project_files_payload(root, str(Path(path_value).parent if Path(path_value).parent != Path(".") else ""))})
+                except ValueError as exc:
+                    self.send_json({"error": "directory_create_failed", "message": str(exc)}, status=400)
+                return
+            if parsed.path == "/api/project/file/upload":
+                files = body.get("files") if isinstance(body.get("files"), list) else []
+                directory = str(body.get("directory") or "")
+                overwrite = body.get("overwrite") is True
+                try:
+                    uploaded = upload_project_files(root, directory, files, overwrite=overwrite)
+                    self.send_json({"uploaded": uploaded, "files": project_files_payload(root, directory)})
+                except FileExistsError as exc:
+                    self.send_json({"error": "file_exists", "message": f"File already exists: {exc}"}, status=409)
+                except ValueError as exc:
+                    self.send_json({"error": "upload_failed", "message": str(exc)}, status=400)
+                return
             if parsed.path in {"/api/merge", "/api/merge/start"}:
                 raw_branches = body.get("branches")
                 if isinstance(raw_branches, list):
@@ -5349,6 +5901,26 @@ def make_handler(project_state: ProjectState):
                 provider = str(body.get("provider") or "") or None
                 history_limit = coerce_positive_int(body.get("limit"), 12)
                 if parsed.path == "/api/merge/start":
+                    if jobs.prefer_worker or provider == "codex-worker":
+                        self.send_json(
+                            jobs.create_worker(
+                                "merge",
+                                {
+                                    "kind": "merge",
+                                    "mode": "merge",
+                                    "branches": branch_ids,
+                                    "branch": name,
+                                    "name": name,
+                                    "title": title,
+                                    "historyLimit": history_limit,
+                                    "provider": provider,
+                                },
+                                root=root,
+                            ),
+                            status=202,
+                        )
+                        return
+
                     def work(progress: ProgressCallback) -> dict[str, Any]:
                         return run_merge_branches(
                             root,
@@ -5519,6 +6091,24 @@ def make_handler(project_state: ProjectState):
                 if not text:
                     self.send_json({"error": "message_required"}, status=400)
                     return
+                if jobs.prefer_worker or provider == "codex-worker":
+                    self.send_json(
+                        jobs.create_worker(
+                            "research",
+                            {
+                                "kind": "research",
+                                "mode": "research",
+                                "branch": branch_id,
+                                "text": text,
+                                "provider": provider,
+                                "title": title,
+                                "timeout": timeout,
+                            },
+                            root=root,
+                        ),
+                        status=202,
+                    )
+                    return
 
                 def work(progress: ProgressCallback) -> dict[str, Any]:
                     args = default_research_args(provider, title=title, timeout=timeout)
@@ -5565,6 +6155,22 @@ def make_handler(project_state: ProjectState):
                 if not text:
                     self.send_json({"error": "message_required"}, status=400)
                     return
+                if jobs.prefer_worker or provider == "codex-worker":
+                    self.send_json(
+                        jobs.create_worker(
+                            "chat",
+                            {
+                                "kind": "chat",
+                                "mode": "chat",
+                                "branch": branch_id,
+                                "text": text,
+                                "provider": provider,
+                            },
+                            root=root,
+                        ),
+                        status=202,
+                    )
+                    return
 
                 def work(progress: ProgressCallback) -> dict[str, Any]:
                     return run_chat_turn(root, store, branch_id, text, provider=provider, progress=progress)
@@ -5577,6 +6183,22 @@ def make_handler(project_state: ProjectState):
                 provider = str(body.get("provider") or "") or None
                 if not text:
                     self.send_json({"error": "message_required"}, status=400)
+                    return
+                if jobs.prefer_worker or provider == "codex-worker":
+                    self.send_json(
+                        jobs.create_worker(
+                            "info-chat",
+                            {
+                                "kind": "info-chat",
+                                "mode": "info-chat",
+                                "branch": branch_id,
+                                "text": text,
+                                "provider": provider,
+                            },
+                            root=root,
+                        ),
+                        status=202,
+                    )
                     return
 
                 def work(progress: ProgressCallback) -> dict[str, Any]:
@@ -5659,13 +6281,238 @@ def make_handler(project_state: ProjectState):
     return CtxgitHandler
 
 
-def run_server(root: Path, host: str, port: int) -> None:
+def server_api_url(server: str, path: str) -> str:
+    return server.rstrip("/") + "/" + path.lstrip("/")
+
+
+def worker_json_request(
+    server: str,
+    path: str,
+    token: str,
+    payload: dict[str, Any],
+    timeout: int = 60,
+) -> dict[str, Any]:
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        server_api_url(server, path),
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "X-Ctxgit-Worker-Token": token,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            text = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(detail or str(exc)) from exc
+    return json.loads(text) if text else {}
+
+
+def worker_bytes_request(server: str, path: str, token: str, timeout: int = 120) -> bytes:
+    request = urllib.request.Request(
+        server_api_url(server, path),
+        headers={"X-Ctxgit-Worker-Token": token},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(detail or str(exc)) from exc
+
+
+def run_worker_claimed_job(
+    server: str,
+    token: str,
+    worker_id: str,
+    cache_dir: Path,
+    job: dict[str, Any],
+    provider_override: str | None = None,
+) -> None:
+    job_id = str(job.get("id") or "")
+    request_payload = job.get("request") if isinstance(job.get("request"), dict) else {}
+    kind = str(request_payload.get("kind") or job.get("kind") or "")
+    if not job_id or not kind:
+        raise RuntimeError("worker job is missing id or kind")
+    project_name = slugify(Path(str(job.get("projectPath") or "project")).name, fallback="project")
+    job_dir = cache_dir / f"{job_id}-{project_name}"
+    project_root = job_dir / "project"
+    if job_dir.exists():
+        shutil.rmtree(job_dir)
+    project_root.mkdir(parents=True, exist_ok=True)
+
+    def post_event(message: str) -> None:
+        try:
+            worker_json_request(
+                server,
+                "/api/worker/job/event",
+                token,
+                {"jobId": job_id, "workerId": worker_id, "message": message},
+                timeout=15,
+            )
+        except Exception:
+            pass
+
+    try:
+        post_event("프로젝트 snapshot 다운로드 중")
+        snapshot = worker_bytes_request(server, f"/api/worker/snapshot?id={urllib.parse.quote(job_id)}", token)
+        apply_project_snapshot_zip(project_root, snapshot)
+        store = ContextStore(project_root)
+        store.require_initialized()
+        load_project_env(project_root)
+
+        def progress(message: str) -> None:
+            post_event(message)
+
+        provider = provider_override or str(request_payload.get("provider") or "codex")
+        if provider == "codex-worker":
+            provider = "codex"
+        post_event(f"로컬 Codex worker 실행 중: {kind}")
+        if kind == "chat":
+            payload = run_chat_turn(
+                project_root,
+                store,
+                str(request_payload.get("branch") or ""),
+                str(request_payload.get("text") or ""),
+                provider=provider,
+                progress=progress,
+            )
+        elif kind == "info-chat":
+            payload = run_history_chat_turn(
+                project_root,
+                store,
+                str(request_payload.get("branch") or ""),
+                str(request_payload.get("text") or ""),
+                provider=provider,
+                progress=progress,
+            )
+        elif kind == "merge":
+            payload = run_merge_branches(
+                project_root,
+                store,
+                [str(item) for item in request_payload.get("branches", [])],
+                str(request_payload.get("name") or request_payload.get("branch") or ""),
+                title=str(request_payload.get("title") or "") or None,
+                history_limit=coerce_positive_int(request_payload.get("historyLimit"), 12),
+                provider=provider,
+                progress=progress,
+            )
+        elif kind == "research":
+            research_provider = provider if provider != "codex" else "hybrid"
+            timeout = coerce_positive_int(request_payload.get("timeout"), 180)
+            args = default_research_args(
+                research_provider,
+                title=str(request_payload.get("title") or "") or None,
+                timeout=timeout,
+            )
+            payload = run_research_turn(
+                project_root,
+                store,
+                str(request_payload.get("branch") or ""),
+                str(request_payload.get("text") or ""),
+                provider=research_provider,
+                args=args,
+                title=str(request_payload.get("title") or "") or None,
+                progress=progress,
+            )
+        else:
+            raise RuntimeError(f"unsupported worker job kind: {kind}")
+
+        post_event("서버로 결과 동기화 중")
+        encoded = base64.b64encode(make_project_snapshot_zip(project_root)).decode("ascii")
+        worker_json_request(
+            server,
+            "/api/worker/job/complete",
+            token,
+            {
+                "jobId": job_id,
+                "workerId": worker_id,
+                "payload": payload,
+                "projectZipBase64": encoded,
+            },
+            timeout=300,
+        )
+    except Exception as exc:
+        worker_json_request(
+            server,
+            "/api/worker/job/complete",
+            token,
+            {
+                "jobId": job_id,
+                "workerId": worker_id,
+                "error": "worker_failed",
+                "message": str(exc),
+            },
+            timeout=60,
+        )
+        raise
+
+
+def run_worker(
+    server: str,
+    token: str,
+    worker_id: str,
+    cache_dir: Path,
+    *,
+    once: bool = False,
+    interval: float = 2.0,
+    provider: str | None = None,
+) -> None:
+    cache_dir = cache_dir.expanduser().resolve()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    worker_id = worker_id or f"{os.uname().nodename if hasattr(os, 'uname') else 'ctxgit'}-{uuid.uuid4().hex[:8]}"
+    capabilities = ["chat", "info-chat", "merge", "research"]
+    print(f"ctxgit worker {worker_id} polling {server}", flush=True)
+    while True:
+        claim = worker_json_request(
+            server,
+            "/api/worker/claim",
+            token,
+            {"workerId": worker_id, "capabilities": capabilities},
+            timeout=30,
+        )
+        job = claim.get("job") if isinstance(claim.get("job"), dict) else None
+        if not job:
+            if once:
+                print("No worker job available.", flush=True)
+                return
+            time.sleep(max(0.5, interval))
+            continue
+        print(f"Claimed {job.get('kind')} job {job.get('id')}", flush=True)
+        run_worker_claimed_job(server, token, worker_id, cache_dir, job, provider_override=provider)
+        if once:
+            return
+
+
+def run_server(
+    root: Path,
+    host: str,
+    port: int,
+    *,
+    projects_root: Path | None = None,
+    worker_token: str = "",
+    prefer_worker: bool = False,
+) -> None:
     project_state = ProjectState(root)
-    handler = make_handler(project_state)
+    project_registry = ServerProjectRegistry(root, projects_root)
+    handler = make_handler(
+        project_state,
+        project_registry=project_registry,
+        worker_token=worker_token,
+        prefer_worker=prefer_worker,
+    )
     with ReusableThreadingHTTPServer((host, port), handler) as server:
         url = f"http://{host}:{server.server_port}"
         print(f"ctxgit chat interface: {url}", flush=True)
         print(f"active project: {project_state.root()}", flush=True)
+        if projects_root:
+            print(f"server projects root: {projects_root}", flush=True)
+        if prefer_worker:
+            print("codex execution: local worker", flush=True)
         print("Press Ctrl-C to stop.", flush=True)
         try:
             server.serve_forever()
@@ -5760,6 +6607,18 @@ def build_parser() -> argparse.ArgumentParser:
     serve = sub.add_parser("serve", help="Open the local chat/history interface")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8765)
+    serve.add_argument("--projects-root", help="Directory containing server-hosted ctxgit projects")
+    serve.add_argument("--worker-token", default="", help="Token local workers must send")
+    serve.add_argument("--codex-worker", action="store_true", help="Queue Codex-backed jobs for a local worker")
+
+    worker = sub.add_parser("worker", help="Run a local Codex worker for a ctxgit server")
+    worker.add_argument("--server", required=True, help="ctxgit server URL, for example http://127.0.0.1:8765")
+    worker.add_argument("--token", default=os.environ.get("CTXGIT_WORKER_TOKEN", ""))
+    worker.add_argument("--worker-id", default="")
+    worker.add_argument("--cache", default=str(Path.home() / ".ctxgit" / "worker-cache"))
+    worker.add_argument("--once", action="store_true", help="Claim at most one job and exit")
+    worker.add_argument("--interval", type=float, default=2.0)
+    worker.add_argument("--provider", help="Override provider used locally; defaults to the queued request")
 
     provider_cmd = sub.add_parser("provider", help="Inspect LLM provider status")
     provider_sub = provider_cmd.add_subparsers(dest="provider_command", required=True)
@@ -5771,6 +6630,18 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "worker":
+        run_worker(
+            args.server,
+            args.token,
+            args.worker_id,
+            Path(args.cache),
+            once=args.once,
+            interval=args.interval,
+            provider=args.provider,
+        )
+        return 0
+
     root = resolve_serve_root(args.root) if args.command == "serve" else resolve_workspace_root(args.root)
     store = ContextStore(root)
     load_project_env(root)
@@ -5888,7 +6759,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "serve":
-        run_server(root, args.host, args.port)
+        run_server(
+            root,
+            args.host,
+            args.port,
+            projects_root=Path(args.projects_root).expanduser().resolve() if args.projects_root else None,
+            worker_token=args.worker_token,
+            prefer_worker=args.codex_worker,
+        )
         return 0
 
     if args.command == "provider" and args.provider_command == "status":
