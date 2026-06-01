@@ -5,8 +5,14 @@ const state = {
   branches: [],
   views: [],
   globalized: [],
+  graph: null,
   payload: null,
   provider: null,
+  serverProjects: [],
+  worker: null,
+  auth: null,
+  authMode: "login",
+  fileBrowser: { path: "", parent: "", entries: [] },
   currentJob: null,
   jobs: {},
   branchJobs: {},
@@ -16,6 +22,20 @@ const state = {
 };
 
 const els = {
+  authGate: document.querySelector("#authGate"),
+  authModeLabel: document.querySelector("#authModeLabel"),
+  loginForm: document.querySelector("#loginForm"),
+  loginUsername: document.querySelector("#loginUsername"),
+  loginPassword: document.querySelector("#loginPassword"),
+  loginButton: document.querySelector("#loginButton"),
+  registerForm: document.querySelector("#registerForm"),
+  registerUsername: document.querySelector("#registerUsername"),
+  registerPassword: document.querySelector("#registerPassword"),
+  registerButton: document.querySelector("#registerButton"),
+  authSwitchButton: document.querySelector("#authSwitchButton"),
+  authStatus: document.querySelector("#authStatus"),
+  authSummary: document.querySelector("#authSummary"),
+  logoutButton: document.querySelector("#logoutButton"),
   projectSummary: document.querySelector("#projectSummary"),
   projectForm: document.querySelector("#projectForm"),
   projectPathInput: document.querySelector("#projectPathInput"),
@@ -23,11 +43,17 @@ const els = {
   initProjectButton: document.querySelector("#initProjectButton"),
   browseProjectButton: document.querySelector("#browseProjectButton"),
   projectStatus: document.querySelector("#projectStatus"),
+  serverProjectPanel: document.querySelector("#serverProjectPanel"),
+  serverProjectSelect: document.querySelector("#serverProjectSelect"),
+  openServerProjectButton: document.querySelector("#openServerProjectButton"),
+  serverProjectStatus: document.querySelector("#serverProjectStatus"),
   branchList: document.querySelector("#branchList"),
+  branchGraphButton: document.querySelector("#branchGraphButton"),
   viewList: document.querySelector("#viewList"),
   globalizedList: document.querySelector("#globalizedList"),
   gitSummary: document.querySelector("#gitSummary"),
   providerSummary: document.querySelector("#providerSummary"),
+  workerSummary: document.querySelector("#workerSummary"),
   mergeForm: document.querySelector("#mergeForm"),
   mergeSourcesInput: document.querySelector("#mergeSourcesInput"),
   mergeNameInput: document.querySelector("#mergeNameInput"),
@@ -53,11 +79,26 @@ const els = {
   eventMeta: document.querySelector("#eventMeta"),
   eventList: document.querySelector("#eventList"),
   reportView: document.querySelector("#reportView"),
+  filePathForm: document.querySelector("#filePathForm"),
+  fileUpButton: document.querySelector("#fileUpButton"),
+  fileRefreshButton: document.querySelector("#fileRefreshButton"),
+  filePathInput: document.querySelector("#filePathInput"),
+  fileGoButton: document.querySelector("#fileGoButton"),
+  newFolderButton: document.querySelector("#newFolderButton"),
+  fileUploadInput: document.querySelector("#fileUploadInput"),
+  folderUploadInput: document.querySelector("#folderUploadInput"),
+  fileStatus: document.querySelector("#fileStatus"),
+  fileList: document.querySelector("#fileList"),
+  filePreview: document.querySelector("#filePreview"),
   archiveList: document.querySelector("#archiveList"),
   archiveViewer: document.querySelector("#archiveViewer"),
+  graphRefreshButton: document.querySelector("#graphRefreshButton"),
+  branchGraphStatus: document.querySelector("#branchGraphStatus"),
+  branchGraph: document.querySelector("#branchGraph"),
   trackedFiles: document.querySelector("#trackedFiles"),
   historyLog: document.querySelector("#historyLog"),
   currentDiff: document.querySelector("#currentDiff"),
+  internalGitLog: document.querySelector("#internalGitLog"),
   researchList: document.querySelector("#researchList"),
   composer: document.querySelector("#composer"),
   messageInput: document.querySelector("#messageInput"),
@@ -99,13 +140,133 @@ async function api(path, options = {}) {
     }
   }
   if (!response.ok) {
+    if (response.status === 401 && payload?.error === "auth_required") {
+      renderAuth(payload.auth || { authenticated: false, registrationOpen: false });
+    }
     throw new ApiError(payload.message || payload.error || `Request failed: ${response.status}`, response.status, payload);
   }
   return payload;
 }
 
+function setAuthStatus(message, kind = "") {
+  els.authStatus.textContent = message;
+  els.authStatus.className = `settings-status ${kind}`.trim();
+}
+
+function showAuthMode(mode) {
+  state.authMode = mode === "register" ? "register" : "login";
+  const registrationOpen = state.auth?.registrationOpen === true;
+  const userCount = Number(state.auth?.userCount || 0);
+  const showRegister = state.authMode === "register" && registrationOpen;
+  els.loginForm.hidden = showRegister;
+  els.registerForm.hidden = !showRegister;
+  els.authModeLabel.textContent = showRegister
+    ? userCount ? "Create another account" : "Create the first admin account"
+    : "Login required";
+  if (registrationOpen) {
+    els.authSwitchButton.hidden = false;
+    els.authSwitchButton.textContent = showRegister ? "Use existing account" : "Create account";
+  } else {
+    els.authSwitchButton.hidden = true;
+    els.authSwitchButton.textContent = "";
+  }
+}
+
+function renderAuth(auth) {
+  state.auth = auth || { authenticated: false, registrationOpen: false };
+  const authenticated = state.auth.authenticated === true;
+  els.authGate.hidden = authenticated;
+  els.logoutButton.hidden = !authenticated;
+  if (authenticated) {
+    const user = state.auth.user || {};
+    els.authSummary.innerHTML = `
+      <div>Signed in: <strong>${escapeHtml(user.username || "")}</strong></div>
+      <div class="muted">${escapeHtml(user.role || "user")} · ${escapeHtml(user.provider || "local")}</div>
+    `;
+    setAuthStatus("");
+    return;
+  }
+  els.authSummary.innerHTML = '<div class="muted">Not signed in.</div>';
+  const userCount = Number(state.auth.userCount || 0);
+  showAuthMode(state.auth.registrationOpen && userCount === 0 ? "register" : state.authMode);
+}
+
+async function loadAuthStatus() {
+  const auth = await api("/api/auth/status");
+  renderAuth(auth);
+  return auth;
+}
+
+async function submitLogin(event) {
+  event.preventDefault();
+  const username = els.loginUsername.value.trim();
+  const password = els.loginPassword.value;
+  if (!username || !password) {
+    setAuthStatus("Username and password are required.", "error");
+    return;
+  }
+  els.loginButton.disabled = true;
+  setAuthStatus("Logging in...");
+  try {
+    const auth = await api("/api/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+    });
+    els.loginPassword.value = "";
+    renderAuth(auth);
+    await loadProject();
+  } catch (error) {
+    setAuthStatus(`Login failed: ${error.message}`, "error");
+  } finally {
+    els.loginButton.disabled = false;
+  }
+}
+
+async function submitRegister(event) {
+  event.preventDefault();
+  const username = els.registerUsername.value.trim();
+  const password = els.registerPassword.value;
+  if (!username || !password) {
+    setAuthStatus("Username and password are required.", "error");
+    return;
+  }
+  els.registerButton.disabled = true;
+  setAuthStatus("Creating account...");
+  try {
+    const auth = await api("/api/auth/register", {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+    });
+    els.registerPassword.value = "";
+    renderAuth(auth);
+    await loadProject();
+  } catch (error) {
+    setAuthStatus(`Signup failed: ${error.message}`, "error");
+  } finally {
+    els.registerButton.disabled = false;
+  }
+}
+
+async function logout() {
+  els.logoutButton.disabled = true;
+  try {
+    const auth = await api("/api/auth/logout", { method: "POST", body: JSON.stringify({}) });
+    renderAuth(auth);
+    clearWorkspace("Login required.");
+  } catch (error) {
+    window.alert(`Logout failed: ${error.message}`);
+  } finally {
+    els.logoutButton.disabled = false;
+  }
+}
+
 function sleep(ms) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function isNetworkFetchError(error) {
+  const message = String(error?.message || "");
+  return error instanceof TypeError || /Failed to fetch|NetworkError|Load failed/i.test(message);
 }
 
 function formatEventTime(value) {
@@ -237,17 +398,26 @@ function clearWorkspace(message = "Select or initialize a ctxgit project.") {
   state.branches = [];
   state.views = [];
   state.globalized = [];
+  state.graph = null;
   state.payload = null;
+  state.fileBrowser = { path: "", parent: "", entries: [] };
   renderBranches();
   els.activeTitle.textContent = "No project selected";
   els.activeMeta.textContent = message;
   els.messageList.innerHTML = `<div class="muted">${escapeHtml(message)}</div>`;
   els.reportView.innerHTML = "";
+  els.filePathInput.value = "";
+  els.fileList.innerHTML = "";
+  els.filePreview.textContent = "";
+  els.fileStatus.textContent = "";
   els.archiveList.innerHTML = "";
   els.archiveViewer.innerHTML = '<div class="muted">No archived source branch selected.</div>';
+  els.branchGraphStatus.textContent = "";
+  els.branchGraph.innerHTML = "";
   els.trackedFiles.innerHTML = "";
   els.historyLog.textContent = "";
   els.currentDiff.textContent = "";
+  els.internalGitLog.textContent = "";
   els.researchList.innerHTML = "";
   els.gitSummary.innerHTML = "";
   els.providerSummary.innerHTML = "";
@@ -267,6 +437,192 @@ function renderProject(project) {
     <div class="muted">${escapeHtml(path)}</div>
     <div class="muted">ctxgit: ${initialized ? "ready" : "not initialized"} · git: ${gitInitialized ? "ready" : "not initialized"}</div>
   `;
+}
+
+function setServerProjectStatus(message, kind = "") {
+  els.serverProjectStatus.textContent = message;
+  els.serverProjectStatus.className = `settings-status ${kind}`.trim();
+}
+
+function renderServerProjects(payload) {
+  const projects = payload?.projects || [];
+  state.serverProjects = projects;
+  const enabled = payload?.enabled === true || projects.length > 1;
+  els.serverProjectPanel.hidden = !enabled;
+  if (!enabled) return;
+  els.serverProjectSelect.innerHTML = projects
+    .map((project) => {
+      const label = `${project.name || project.id}${project.initialized ? "" : " (not initialized)"}`;
+      return `<option value="${escapeHtml(project.id)}" ${project.active ? "selected" : ""}>${escapeHtml(label)}</option>`;
+    })
+    .join("");
+  setServerProjectStatus(
+    payload.projectsRoot ? `Server root: ${payload.projectsRoot}` : "Current project only",
+    "",
+  );
+}
+
+function renderWorker(status) {
+  state.worker = status;
+  if (!status || status.enabled === false) {
+    els.workerSummary.innerHTML = '<div class="muted">Worker API unavailable.</div>';
+    return;
+  }
+  const mode = status.preferWorker ? "local worker" : "server process";
+  els.workerSummary.innerHTML = `
+    <div>Codex runs on: <strong>${escapeHtml(mode)}</strong></div>
+    <div class="muted">Active: ${status.activeWorkers || 0} · Queued: ${status.queued || 0} · Claimed: ${status.claimed || 0}</div>
+  `;
+}
+
+function formatBytes(value) {
+  const bytes = Number(value || 0);
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  let amount = bytes;
+  let unitIndex = 0;
+  while (amount >= 1024 && unitIndex < units.length - 1) {
+    amount /= 1024;
+    unitIndex += 1;
+  }
+  return `${amount >= 10 || unitIndex === 0 ? Math.round(amount) : amount.toFixed(1)} ${units[unitIndex]}`;
+}
+
+function setFileStatus(message, kind = "") {
+  els.fileStatus.textContent = message;
+  els.fileStatus.className = `settings-status ${kind}`.trim();
+}
+
+function renderProjectFiles(payload) {
+  state.fileBrowser = {
+    path: payload?.path || "",
+    parent: payload?.parent || "",
+    entries: payload?.entries || [],
+  };
+  els.filePathInput.value = state.fileBrowser.path;
+  els.fileUpButton.disabled = !state.fileBrowser.path;
+  els.fileList.innerHTML =
+    state.fileBrowser.entries
+      .map((entry) => {
+        const kind = entry.isDirectory ? "folder" : "file";
+        const meta = entry.isDirectory ? "folder" : `${formatBytes(entry.size)} · ${entry.modifiedAt || ""}`;
+        return `
+          <button class="file-row" data-file-path="${escapeHtml(entry.path)}" data-file-kind="${kind}" type="button" title="${escapeHtml(entry.path)}">
+            <span class="file-icon">${entry.isDirectory ? "▸" : "·"}</span>
+            <span class="file-name">${escapeHtml(entry.name)}</span>
+            <span class="file-meta">${escapeHtml(meta)}</span>
+          </button>
+        `;
+      })
+      .join("") || '<div class="muted">No files</div>';
+  els.fileList.querySelectorAll("[data-file-path]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const path = button.dataset.filePath || "";
+      if (button.dataset.fileKind === "folder") {
+        loadProjectFiles(path);
+      } else {
+        previewProjectFile(path);
+      }
+    });
+  });
+}
+
+async function loadProjectFiles(path = state.fileBrowser.path || "") {
+  if (!state.project?.initialized) return;
+  setFileStatus("Loading...");
+  try {
+    const payload = await api(`/api/project/files?path=${encodeURIComponent(path)}`);
+    renderProjectFiles(payload);
+    setFileStatus(payload.path || "Project root", "ok");
+  } catch (error) {
+    setFileStatus(`Load failed: ${error.message}`, "error");
+  }
+}
+
+async function previewProjectFile(path) {
+  setFileStatus("Opening...");
+  try {
+    const payload = await api(`/api/project/file/text?path=${encodeURIComponent(path)}`);
+    if (payload.binary) {
+      els.filePreview.textContent = `${payload.path}\n\n${formatBytes(payload.size)} binary file`;
+    } else {
+      els.filePreview.textContent = `${payload.path}${payload.truncated ? " (truncated)" : ""}\n\n${payload.text || ""}`;
+    }
+    setFileStatus(payload.path, "ok");
+  } catch (error) {
+    setFileStatus(`Open failed: ${error.message}`, "error");
+  }
+}
+
+function fileToUploadPayload(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.addEventListener("load", () => {
+      const result = String(reader.result || "");
+      const encoded = result.includes(",") ? result.split(",", 2)[1] : "";
+      resolve({
+        path: file.webkitRelativePath || file.name,
+        name: file.name,
+        contentBase64: encoded,
+      });
+    });
+    reader.addEventListener("error", () => reject(reader.error || new Error("file read failed")));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function uploadFiles(fileList) {
+  const files = Array.from(fileList || []);
+  if (!files.length) return;
+  setFileStatus("Uploading...");
+  try {
+    const payloads = await Promise.all(files.map(fileToUploadPayload));
+    const body = { directory: state.fileBrowser.path || "", files: payloads };
+    try {
+      const payload = await api("/api/project/file/upload", {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+      renderProjectFiles(payload.files);
+      setFileStatus(`Uploaded ${payload.uploaded?.length || 0} file(s).`, "ok");
+    } catch (error) {
+      if (!(error instanceof ApiError) || error.payload?.error !== "file_exists") throw error;
+      if (!window.confirm(`${error.message}\n\nOverwrite existing file(s)?`)) {
+        setFileStatus("Upload canceled.");
+        return;
+      }
+      const payload = await api("/api/project/file/upload", {
+        method: "POST",
+        body: JSON.stringify({ ...body, overwrite: true }),
+      });
+      renderProjectFiles(payload.files);
+      setFileStatus(`Uploaded ${payload.uploaded?.length || 0} file(s).`, "ok");
+    }
+    renderGit(await api("/api/git/status"));
+  } catch (error) {
+    setFileStatus(`Upload failed: ${error.message}`, "error");
+  } finally {
+    els.fileUploadInput.value = "";
+    els.folderUploadInput.value = "";
+  }
+}
+
+async function createFolderFromPrompt() {
+  const base = state.fileBrowser.path ? `${state.fileBrowser.path}/` : "";
+  const name = window.prompt("New folder path:", base);
+  if (!name) return;
+  setFileStatus("Creating folder...");
+  try {
+    const payload = await api("/api/project/directory/create", {
+      method: "POST",
+      body: JSON.stringify({ path: name.trim() }),
+    });
+    renderProjectFiles(payload.files);
+    setFileStatus(`Created ${payload.entry?.path || name}.`, "ok");
+    renderGit(await api("/api/git/status"));
+  } catch (error) {
+    setFileStatus(`Create failed: ${error.message}`, "error");
+  }
 }
 
 function renderBranches() {
@@ -386,6 +742,177 @@ function renderGlobalizedList() {
   });
 }
 
+function graphLabel(value, max = 24) {
+  const text = String(value || "");
+  return text.length > max ? `${text.slice(0, Math.max(0, max - 1))}…` : text;
+}
+
+function buildGraphLayout(payload) {
+  const nodeWidth = 190;
+  const nodeHeight = 64;
+  const columnGap = 112;
+  const rowGap = 92;
+  const margin = 40;
+  const nodes = Array.isArray(payload?.nodes) ? payload.nodes : [];
+  const edges = Array.isArray(payload?.edges) ? payload.edges : [];
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
+  const incoming = new Map();
+  edges.forEach((edge) => {
+    if (!nodeById.has(edge.source) || !nodeById.has(edge.target)) return;
+    if (!incoming.has(edge.target)) incoming.set(edge.target, []);
+    incoming.get(edge.target).push(edge.source);
+  });
+  const levels = new Map();
+  function levelFor(nodeId, stack = new Set()) {
+    if (levels.has(nodeId)) return levels.get(nodeId);
+    const node = nodeById.get(nodeId);
+    if (!node || node.kind === "root" || stack.has(nodeId)) {
+      levels.set(nodeId, 0);
+      return 0;
+    }
+    stack.add(nodeId);
+    const parents = incoming.get(nodeId) || [];
+    const level = parents.length ? Math.max(...parents.map((parent) => levelFor(parent, stack) + 1)) : 1;
+    stack.delete(nodeId);
+    levels.set(nodeId, level);
+    return level;
+  }
+  nodes.forEach((node) => levelFor(node.id));
+  const groups = new Map();
+  nodes.forEach((node) => {
+    const level = levels.get(node.id) || 0;
+    if (!groups.has(level)) groups.set(level, []);
+    groups.get(level).push(node);
+  });
+  groups.forEach((group) => {
+    group.sort((left, right) => {
+      if (left.kind === "root") return -1;
+      if (right.kind === "root") return 1;
+      const leftTime = Date.parse(left.createdAt || left.updatedAt || "") || 0;
+      const rightTime = Date.parse(right.createdAt || right.updatedAt || "") || 0;
+      if (leftTime !== rightTime) return leftTime - rightTime;
+      return String(left.label || left.id).localeCompare(String(right.label || right.id));
+    });
+  });
+  const positioned = new Map();
+  let maxLevel = 0;
+  let maxRows = 1;
+  groups.forEach((group, level) => {
+    maxLevel = Math.max(maxLevel, level);
+    maxRows = Math.max(maxRows, group.length);
+    group.forEach((node, index) => {
+      positioned.set(node.id, {
+        ...node,
+        x: margin + level * (nodeWidth + columnGap),
+        y: margin + index * rowGap,
+        width: nodeWidth,
+        height: nodeHeight,
+      });
+    });
+  });
+  return {
+    nodes: Array.from(positioned.values()),
+    edges: edges
+      .map((edge) => ({ ...edge, sourceNode: positioned.get(edge.source), targetNode: positioned.get(edge.target) }))
+      .filter((edge) => edge.sourceNode && edge.targetNode),
+    width: Math.max(900, margin * 2 + (maxLevel + 1) * nodeWidth + maxLevel * columnGap),
+    height: Math.max(520, margin * 2 + maxRows * nodeHeight + Math.max(0, maxRows - 1) * (rowGap - nodeHeight)),
+  };
+}
+
+function edgePath(edge) {
+  const source = edge.sourceNode;
+  const target = edge.targetNode;
+  const startX = source.x + source.width;
+  const startY = source.y + source.height / 2;
+  const endX = target.x;
+  const endY = target.y + target.height / 2;
+  const bend = Math.max(48, (endX - startX) / 2);
+  return `M ${startX} ${startY} C ${startX + bend} ${startY}, ${endX - bend} ${endY}, ${endX} ${endY}`;
+}
+
+function renderBranchGraph(payload) {
+  state.graph = payload;
+  const summary = payload?.summary || {};
+  els.branchGraphStatus.className = "settings-status";
+  els.branchGraphStatus.textContent = `${summary.activeBranches || 0} active · ${summary.archivedBranches || 0} archived · ${summary.mergeBranches || 0} merge · ${summary.globalizedArchives || 0} globalized`;
+  const layout = buildGraphLayout(payload);
+  if (!layout.nodes.length) {
+    els.branchGraph.innerHTML = '<div class="muted">No branch graph yet.</div>';
+    return;
+  }
+  const edgeMarkup = layout.edges
+    .map((edge) => {
+      const source = edge.sourceNode;
+      const target = edge.targetNode;
+      const labelX = (source.x + source.width + target.x) / 2;
+      const labelY = (source.y + target.y) / 2 + source.height / 2 - 6;
+      const label = edge.kind === "root" || edge.kind === "parent" ? "" : graphLabel(edge.label || edge.kind, 12);
+      return `
+        <g class="graph-edge graph-edge-${escapeHtml(edge.kind || "edge")}">
+          <path d="${edgePath(edge)}"></path>
+          ${label ? `<text x="${labelX}" y="${labelY}">${escapeHtml(label)}</text>` : ""}
+        </g>
+      `;
+    })
+    .join("");
+  const nodeMarkup = layout.nodes
+    .map((node) => {
+      const active = node.branchId === state.activeBranch || node.archiveId === state.activeGlobalized;
+      const canOpen = node.status !== "missing" && (node.branchId || node.archiveId);
+      const clickable = canOpen ? "clickable" : "";
+      const meta =
+        node.kind === "branch"
+          ? `${node.meta || ""}${node.shortHead ? ` · ${node.shortHead}` : ""}${Number.isFinite(node.historyCount) ? ` · ${node.historyCount} msg` : ""}`
+          : node.meta || "";
+      const data =
+        !canOpen
+          ? ""
+          : node.archiveId
+          ? `data-graph-archive="${escapeHtml(node.archiveId)}"`
+          : node.branchId
+          ? `data-graph-branch="${escapeHtml(node.branchId)}"`
+          : "";
+      return `
+        <g class="graph-node graph-node-${escapeHtml(node.kind || "node")} graph-status-${escapeHtml(node.status || "")} ${active ? "active" : ""} ${clickable}" transform="translate(${node.x}, ${node.y})" ${data}>
+          <title>${escapeHtml(`${node.title || node.label || node.id}\n${meta}`)}</title>
+          <rect width="${node.width}" height="${node.height}" rx="7"></rect>
+          <circle cx="16" cy="18" r="5"></circle>
+          <text class="graph-node-label" x="28" y="23">${escapeHtml(graphLabel(node.label || node.id, 23))}</text>
+          <text class="graph-node-meta" x="12" y="45">${escapeHtml(graphLabel(meta, 28))}</text>
+        </g>
+      `;
+    })
+    .join("");
+  els.branchGraph.innerHTML = `
+    <svg class="branch-graph-svg" viewBox="0 0 ${layout.width} ${layout.height}" role="img">
+      <defs>
+        <marker id="graphArrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+          <path d="M 0 0 L 10 4 L 0 8 z"></path>
+        </marker>
+      </defs>
+      ${edgeMarkup}
+      ${nodeMarkup}
+    </svg>
+  `;
+  els.branchGraph.querySelectorAll("[data-graph-branch]").forEach((node) => {
+    node.addEventListener("click", () => loadBranch(node.dataset.graphBranch));
+  });
+  els.branchGraph.querySelectorAll("[data-graph-archive]").forEach((node) => {
+    node.addEventListener("click", () => loadGlobalizedArchive(node.dataset.graphArchive));
+  });
+}
+
+async function loadBranchGraph() {
+  selectTab("graph");
+  els.activeTitle.textContent = "Branch graph";
+  els.activeMeta.textContent = "Simplified ctxgit lineage";
+  els.branchGraphStatus.className = "settings-status";
+  els.branchGraphStatus.textContent = "Loading graph...";
+  const payload = await api("/api/branch-graph");
+  renderBranchGraph(payload);
+}
+
 function closeBranchMenus() {
   document.querySelectorAll(".branch-row.open").forEach((row) => row.classList.remove("open"));
 }
@@ -473,10 +1000,20 @@ function uniqueBranchIdForTitle(title) {
 }
 
 function renderGit(status) {
+  const internal = status.internal || {};
   els.gitSummary.innerHTML = `
     <div>Branch: <strong>${escapeHtml(status.branch || "(none)")}</strong></div>
     <div>Staged: ${status.stagedCount} · Unstaged: ${status.unstagedCount} · Untracked: ${status.untrackedCount}</div>
+    <div class="muted">ctxgit Git: ${escapeHtml(String(internal.dirtyCount || 0))} pending · ${escapeHtml(internal.gitDir || "")}</div>
   `;
+  if (els.internalGitLog) {
+    const refs = (internal.refs || [])
+      .slice(0, 20)
+      .map((item) => `${item.short || ""} ${item.ref || ""} ${item.subject || ""}`.trim())
+      .join("\n");
+    els.internalGitLog.textContent =
+      [internal.log || "No internal ctxgit commits yet.", refs ? `\nRefs:\n${refs}` : ""].filter(Boolean).join("\n");
+  }
 }
 
 function renderProvider(status) {
@@ -786,6 +1323,7 @@ async function startTrackedJob(endpoint, body, { branch, mode, title }) {
   }
   updateComposerState();
   refreshBranchNavigation().catch(() => {});
+  loadWorkerStatus().catch(() => {});
   monitorTrackedJob(remembered.id).catch((error) => handleMonitorError(remembered, error));
   return remembered;
 }
@@ -826,13 +1364,51 @@ async function monitorTrackedJob(jobId) {
   if (!tracked) return;
   const branch = tracked.branch;
   let waitMs = 500;
+  let fetchFailures = 0;
   while (true) {
     await sleep(waitMs);
     let job;
     try {
       job = await api(`/api/job?id=${encodeURIComponent(jobId)}`);
+      fetchFailures = 0;
     } catch (error) {
-      if (error instanceof ApiError && error.payload?.error === "job_not_found") {
+      if (isNetworkFetchError(error)) {
+        fetchFailures += 1;
+        const now = new Date().toISOString();
+        const previous = state.jobs[jobId] || tracked;
+        const message =
+          fetchFailures === 1
+            ? "서버 연결이 잠시 끊겨 작업 상태를 다시 확인 중입니다."
+            : `서버 연결 재시도 중 (${fetchFailures})`;
+        const events =
+          fetchFailures === 1 || fetchFailures % 5 === 0
+            ? [...(previous.events || []), { message, createdAt: now }]
+            : previous.events || [];
+        const reconnecting = rememberJob(
+          {
+            ...previous,
+            status: "running",
+            error: "monitor_reconnecting",
+            message,
+            updatedAt: now,
+            events,
+            diagnostics: {
+              ...(previous.diagnostics || {}),
+              state: "monitor_reconnecting",
+              detail: message,
+              lastEvent: message,
+            },
+          },
+          { branch, mode: tracked.mode },
+        );
+        if (state.activeBranch === branch) {
+          updateProgress(reconnecting);
+          renderEventPanel(reconnecting);
+          updateComposerState();
+        }
+        waitMs = Math.min(2500, waitMs + 300);
+        continue;
+      } else if (error instanceof ApiError && error.payload?.error === "job_not_found") {
         const message =
           "ctxgit 서버가 이 작업을 더 이상 갖고 있지 않습니다. 서버가 재시작되었거나 브라우저가 다른 ctxgit 서버를 조회 중일 수 있습니다.";
         const now = new Date().toISOString();
@@ -877,6 +1453,7 @@ async function monitorTrackedJob(jobId) {
         hideProgressSoon();
       }
       updateComposerState();
+      loadWorkerStatus().catch(() => {});
       return;
     }
     if (remembered.status === "failed") {
@@ -890,6 +1467,7 @@ async function monitorTrackedJob(jobId) {
         hideProgress();
       }
       updateComposerState();
+      loadWorkerStatus().catch(() => {});
       return;
     }
     waitMs = Math.min(1200, waitMs + 100);
@@ -978,11 +1556,17 @@ function renderBranch(payload) {
     <dt>context</dt><dd>${escapeHtml(payload.paths.context)}</dd>
     <dt>history</dt><dd>${escapeHtml(payload.paths.history)}</dd>
     <dt>meta</dt><dd>${escapeHtml(payload.paths.meta)}</dd>
+    <dt>ctxgit ref</dt><dd>${escapeHtml(payload.git?.internal?.ref || "")}</dd>
+    <dt>ctxgit head</dt><dd>${escapeHtml(payload.git?.internal?.head || "")}</dd>
   `;
-  els.historyLog.textContent = payload.git.historyLog || "No commits for this history file yet.";
+  els.historyLog.textContent =
+    payload.git?.internal?.log || payload.git.historyLog || "No internal ctxgit commits for this branch yet.";
   els.currentDiff.textContent =
     [payload.git.status, payload.git.historyDiff, payload.git.contextDiff].filter(Boolean).join("\n\n") ||
     "No uncommitted branch file diff.";
+  if (els.internalGitLog) {
+    els.internalGitLog.textContent = payload.git?.internal?.log || "No internal ctxgit commits for this branch yet.";
+  }
   els.researchList.innerHTML =
     [
       ...(payload.sources || []).map((source) => ({
@@ -1052,13 +1636,33 @@ async function loadBranches() {
   }
 }
 
+async function loadServerProjects() {
+  try {
+    renderServerProjects(await api("/api/server/projects"));
+  } catch (error) {
+    els.serverProjectPanel.hidden = true;
+  }
+}
+
+async function loadWorkerStatus() {
+  try {
+    renderWorker(await api("/api/worker/status"));
+  } catch (error) {
+    renderWorker(null);
+  }
+}
+
 async function loadProject() {
+  await loadServerProjects();
+  await loadWorkerStatus();
   const project = await api("/api/project");
   renderProject(project);
   if (project.initialized) {
     await loadBranches();
+    await loadProjectFiles(state.fileBrowser.path || "");
     renderGit(await api("/api/git/status"));
     renderProvider(await api("/api/provider/status"));
+    await loadWorkerStatus();
   } else {
     clearWorkspace("This directory is not initialized for ctxgit yet.");
   }
@@ -1077,7 +1681,9 @@ async function openProject(path, { init }) {
     });
     renderProject(project);
     state.activeBranch = null;
+    state.fileBrowser = { path: "", parent: "", entries: [] };
     await loadBranches();
+    await loadProjectFiles("");
     renderGit(await api("/api/git/status"));
     renderProvider(await api("/api/provider/status"));
     setProjectStatus(init ? "Initialized and opened." : "Opened.", "ok");
@@ -1091,6 +1697,35 @@ async function openProject(path, { init }) {
     els.openProjectButton.disabled = false;
     els.initProjectButton.disabled = false;
     els.browseProjectButton.disabled = false;
+  }
+}
+
+async function openServerProject() {
+  const id = els.serverProjectSelect.value;
+  if (!id) return;
+  els.openServerProjectButton.disabled = true;
+  setServerProjectStatus("Opening server project...");
+  try {
+    const project = await api("/api/server/project/open", {
+      method: "POST",
+      body: JSON.stringify({ id }),
+    });
+    renderProject(project);
+    state.activeBranch = null;
+    state.activeGlobalized = null;
+    state.fileBrowser = { path: "", parent: "", entries: [] };
+    await loadServerProjects();
+    await loadBranches();
+    await loadProjectFiles("");
+    renderGit(await api("/api/git/status"));
+    renderProvider(await api("/api/provider/status"));
+    await loadWorkerStatus();
+    setServerProjectStatus("Opened.", "ok");
+  } catch (error) {
+    clearWorkspace(error.message);
+    setServerProjectStatus(`Open failed: ${error.message}`, "error");
+  } finally {
+    els.openServerProjectButton.disabled = false;
   }
 }
 
@@ -1407,10 +2042,34 @@ function selectTab(tab) {
   button.classList.add("active");
   panel.classList.add("active");
   if (tab === "chat") scrollChatToBottom();
+  if (tab === "files") loadProjectFiles().catch(() => {});
 }
 
 document.querySelectorAll(".tab").forEach((button) => {
-  button.addEventListener("click", () => selectTab(button.dataset.tab));
+  button.addEventListener("click", () => {
+    if (button.dataset.tab === "graph") {
+      loadBranchGraph().catch((error) => {
+        els.branchGraphStatus.textContent = `Graph failed: ${error.message}`;
+        els.branchGraphStatus.className = "settings-status error";
+      });
+      return;
+    }
+    selectTab(button.dataset.tab);
+  });
+});
+
+els.branchGraphButton.addEventListener("click", () => {
+  loadBranchGraph().catch((error) => {
+    els.branchGraphStatus.textContent = `Graph failed: ${error.message}`;
+    els.branchGraphStatus.className = "settings-status error";
+  });
+});
+
+els.graphRefreshButton.addEventListener("click", () => {
+  loadBranchGraph().catch((error) => {
+    els.branchGraphStatus.textContent = `Graph failed: ${error.message}`;
+    els.branchGraphStatus.className = "settings-status error";
+  });
 });
 
 document.addEventListener("click", (event) => {
@@ -1420,6 +2079,14 @@ document.addEventListener("click", (event) => {
   if (!event.target.closest(".message-options")) {
     closeMessageMenus();
   }
+});
+
+els.loginForm.addEventListener("submit", submitLogin);
+els.registerForm.addEventListener("submit", submitRegister);
+els.logoutButton.addEventListener("click", logout);
+els.authSwitchButton.addEventListener("click", () => {
+  showAuthMode(state.authMode === "register" ? "login" : "register");
+  setAuthStatus("");
 });
 
 els.projectForm.addEventListener("submit", async (event) => {
@@ -1441,6 +2108,31 @@ els.browseProjectButton.addEventListener("click", async () => {
   } else {
     setProjectStatus("Directory selected. Use Init/Open to initialize it.", "");
   }
+});
+
+els.openServerProjectButton.addEventListener("click", openServerProject);
+
+els.filePathForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  await loadProjectFiles(els.filePathInput.value.trim());
+});
+
+els.fileUpButton.addEventListener("click", async () => {
+  await loadProjectFiles(state.fileBrowser.parent || "");
+});
+
+els.fileRefreshButton.addEventListener("click", async () => {
+  await loadProjectFiles();
+});
+
+els.newFolderButton.addEventListener("click", createFolderFromPrompt);
+
+els.fileUploadInput.addEventListener("change", async () => {
+  await uploadFiles(els.fileUploadInput.files);
+});
+
+els.folderUploadInput.addEventListener("change", async () => {
+  await uploadFiles(els.folderUploadInput.files);
 });
 
 els.mergeForm.addEventListener("submit", async (event) => {
@@ -1507,18 +2199,20 @@ async function sendComposerMessage({ mode }) {
       return;
     }
     if (isChat) {
+      const provider = state.worker?.preferWorker ? "codex-worker" : "codex";
       await startTrackedJob(
         "/api/chat/start",
-        { branch, text, provider: "codex" },
+        { branch, text, provider },
         { branch, mode: "chat", title: "채팅 턴 시작 중" },
       );
       els.messageInput.value = "";
       return;
     }
     if (isInfoChat) {
+      const provider = state.worker?.preferWorker ? "codex-worker" : "codex";
       await startTrackedJob(
         "/api/info-chat/start",
-        { branch, text, provider: "codex" },
+        { branch, text, provider },
         { branch, mode: "info-chat", title: "정보 챗 시작 중" },
       );
       els.messageInput.value = "";
@@ -1601,7 +2295,14 @@ els.refreshButton.addEventListener("click", async () => {
   await loadProject();
 });
 
-loadProject()
+loadAuthStatus()
+  .then((auth) => {
+    if (auth.authenticated) {
+      return loadProject();
+    }
+    clearWorkspace("Login required.");
+    return null;
+  })
   .catch((error) => {
     els.activeTitle.textContent = "Could not load ctxgit project";
     els.activeMeta.textContent = error.message;

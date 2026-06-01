@@ -104,6 +104,12 @@ ctxgit snapshot -m "ctxgit: update AI trust contexts"
 ctxgit serve
 ```
 
+The web interface uses local accounts by default. The first signup creates the
+admin account, then signup closes unless `CTXGIT_ALLOW_SIGNUP=1` is set. User
+records are stored outside project snapshots in `.ctxgit/auth.json`; sessions
+use an HttpOnly cookie. Set `CTXGIT_COOKIE_SECURE=1` when serving through HTTPS
+unless the reverse proxy sends `X-Forwarded-Proto: https`.
+
 Open the printed local URL to view branch reports, chat histories, research
 notes, and Git status in one place. The `Project` panel can open another
 initialized project or initialize a new directory, so one long-running UI can

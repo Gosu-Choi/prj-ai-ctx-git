@@ -30,6 +30,81 @@ body {
   overflow: hidden;
 }
 
+.auth-gate {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: grid;
+  place-items: center;
+  background: rgb(247 247 244 / 94%);
+  padding: 20px;
+}
+
+.auth-gate[hidden] {
+  display: none;
+}
+
+.auth-card {
+  width: min(420px, 100%);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  padding: 22px;
+  box-shadow: 0 18px 42px rgb(0 0 0 / 14%);
+}
+
+.auth-form {
+  display: grid;
+  gap: 8px;
+  margin-top: 18px;
+}
+
+.auth-form[hidden] {
+  display: none;
+}
+
+.auth-form label {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.auth-form input {
+  min-width: 0;
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #ffffff;
+  color: var(--text);
+  padding: 9px 10px;
+}
+
+.auth-form button,
+.link-button {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+  padding: 9px 10px;
+}
+
+.auth-form button {
+  margin-top: 6px;
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #ffffff;
+}
+
+.link-button {
+  margin-top: 10px;
+  border: 0;
+  color: var(--accent);
+  text-align: left;
+  padding-left: 0;
+}
+
 button,
 select,
 input,
@@ -83,7 +158,14 @@ textarea {
   margin-top: 10px;
 }
 
+.server-project-panel {
+  display: grid;
+  gap: 7px;
+  margin-top: 10px;
+}
+
 .project-form input,
+.server-project-panel select,
 .merge-form input {
   min-width: 0;
   width: 100%;
@@ -116,6 +198,16 @@ textarea {
 
 .project-buttons button {
   padding: 7px 6px;
+}
+
+.server-project-panel button {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+  padding: 7px 8px;
 }
 
 .merge-form button {
@@ -217,14 +309,17 @@ textarea {
 .wide-button,
 .tab,
 .composer button,
-.branch-options-button,
-.branch-options-menu button,
-.message-options-menu button {
-  border: 1px solid var(--line);
-  background: var(--panel);
-  color: var(--text);
-  cursor: pointer;
-}
+	.branch-options-button,
+	.branch-options-menu button,
+	.message-options-menu button,
+	.file-toolbar button,
+	.file-upload-button,
+	.file-row {
+	  border: 1px solid var(--line);
+	  background: var(--panel);
+	  color: var(--text);
+	  cursor: pointer;
+	}
 
 .nav-item {
   min-width: 0;
@@ -759,6 +854,117 @@ textarea {
   vertical-align: top;
 }
 
+.file-browser {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  gap: 10px;
+  height: 100%;
+  min-height: 0;
+}
+
+.file-toolbar {
+  display: grid;
+  grid-template-columns: 70px 88px minmax(180px, 1fr) 58px 104px 112px 120px;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+}
+
+.file-toolbar input[type="text"] {
+  min-width: 0;
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  padding: 8px;
+}
+
+.file-toolbar button,
+.file-upload-button {
+  min-width: 0;
+  min-height: 36px;
+  border-radius: 6px;
+  padding: 8px 10px;
+  text-align: center;
+}
+
+.file-upload-button {
+  display: inline-grid;
+  place-items: center;
+  overflow: hidden;
+}
+
+.file-upload-button input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.file-browser-grid {
+  display: grid;
+  grid-template-columns: minmax(280px, 420px) minmax(0, 1fr);
+  gap: 14px;
+  min-height: 0;
+}
+
+.file-list {
+  display: grid;
+  align-content: start;
+  gap: 5px;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.file-row {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  border-radius: 6px;
+  padding: 9px 10px;
+  text-align: left;
+}
+
+.file-row:hover {
+  border-color: var(--accent);
+}
+
+.file-icon {
+  grid-row: span 2;
+  color: var(--accent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-weight: 700;
+}
+
+.file-name,
+.file-meta {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-name {
+  font-weight: 650;
+}
+
+.file-meta {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.file-preview {
+  min-height: 0;
+  height: 100%;
+  overflow: auto;
+}
+
 .version-grid {
   display: grid;
   grid-template-columns: minmax(260px, 420px) minmax(0, 1fr);
@@ -784,6 +990,152 @@ textarea {
 .archive-heading h2 {
   margin: 0 0 4px;
   font-size: 16px;
+}
+
+.graph-layout {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 10px;
+  height: 100%;
+  min-height: 0;
+}
+
+.graph-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.graph-toolbar button {
+  min-width: 86px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+  padding: 7px 10px;
+}
+
+.branch-graph {
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fbfbf8;
+}
+
+.branch-graph-svg {
+  display: block;
+  min-width: 100%;
+  height: auto;
+}
+
+.graph-edge path {
+  fill: none;
+  stroke: #8e948b;
+  stroke-width: 1.6;
+  marker-end: url("#graphArrow");
+}
+
+.graph-edge text {
+  fill: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  paint-order: stroke;
+  stroke: #fbfbf8;
+  stroke-width: 4px;
+}
+
+.graph-edge-merge path {
+  stroke: #8b4b96;
+  stroke-width: 2.1;
+}
+
+.graph-edge-fork path {
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+
+.graph-edge-clone path {
+  stroke-dasharray: 5 4;
+}
+
+.graph-edge-archive path {
+  stroke: #8a5a00;
+  stroke-dasharray: 4 4;
+}
+
+#graphArrow path {
+  fill: #8e948b;
+}
+
+.graph-node {
+  outline: none;
+}
+
+.graph-node rect {
+  fill: #ffffff;
+  stroke: var(--line);
+  stroke-width: 1.2;
+}
+
+.graph-node circle {
+  fill: var(--accent);
+}
+
+.graph-node.active rect {
+  stroke: var(--accent);
+  stroke-width: 2.2;
+  fill: var(--accent-soft);
+}
+
+.graph-node.clickable {
+  cursor: pointer;
+}
+
+.graph-node.clickable:hover rect {
+  stroke: var(--accent);
+}
+
+.graph-node-label {
+  fill: var(--text);
+  font-size: 13px;
+  font-weight: 750;
+}
+
+.graph-node-meta {
+  fill: var(--muted);
+  font-size: 11px;
+}
+
+.graph-node-root rect {
+  fill: #eff2ee;
+}
+
+.graph-node-archive rect {
+  fill: #fff8e8;
+  stroke: #d6b36a;
+}
+
+.graph-node-archive circle {
+  fill: #8a5a00;
+}
+
+.graph-status-archived rect {
+  fill: #f3f3ef;
+  stroke-dasharray: 4 3;
+}
+
+.graph-status-missing rect {
+  fill: #f6eded;
+  stroke: #d08b8b;
+  stroke-dasharray: 4 3;
+}
+
+.graph-status-missing circle {
+  fill: #842828;
 }
 
 .version-grid section {
@@ -860,10 +1212,17 @@ textarea {
 
   .topbar,
   .archive-layout,
+  .file-browser-grid,
+  .file-toolbar,
   #chatTab.active,
   .composer,
+  .graph-toolbar,
   .version-grid {
     grid-template-columns: 1fr;
+  }
+
+  .graph-toolbar {
+    display: grid;
   }
 
   .event-panel {

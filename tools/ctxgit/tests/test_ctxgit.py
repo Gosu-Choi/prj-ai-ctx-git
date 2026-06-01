@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import base64
 import contextlib
 import io
 import json
@@ -24,6 +25,11 @@ SPEC.loader.exec_module(ctxgit)
 
 
 class CtxgitTest(unittest.TestCase):
+    def test_new_turn_id_uses_timestamp_code(self) -> None:
+        turn_id = ctxgit.new_turn_id()
+
+        self.assertRegex(turn_id, r"^turn_\d{8}T\d{6}\d{6}Z$")
+
     def test_branch_append_and_merge_view(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -104,6 +110,226 @@ class CtxgitTest(unittest.TestCase):
             branch_meta.pop("archivedAs")
             ctxgit.dump_json(root / "contexts" / "branches" / "alpha" / "branch.json", branch_meta)
             self.assertEqual(store.list_branches(), [])
+
+    def test_server_project_registry_lists_and_resolves_server_projects(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            projects_root = Path(tmp) / "server-projects"
+            alpha = projects_root / "Alpha Project"
+            beta = projects_root / "beta"
+            ctxgit.ContextStore(alpha).init()
+            ctxgit.ContextStore(beta).init()
+            registry = ctxgit.ServerProjectRegistry(alpha, projects_root)
+
+            payload = registry.payload(alpha)
+
+            self.assertTrue(payload["enabled"])
+            ids = [project["id"] for project in payload["projects"]]
+            self.assertIn("alpha-project", ids)
+            self.assertIn("beta", ids)
+            self.assertEqual(registry.resolve("beta", alpha), beta.resolve())
+
+    def test_worker_job_queue_claim_and_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ctxgit.ContextStore(root).init()
+            project_state = ctxgit.ProjectState(root)
+            jobs = ctxgit.JobStore(project_state, prefer_worker=True)
+
+            queued = jobs.create_worker("chat", {"kind": "chat", "branch": "initial", "text": "hello"}, root=root)
+            claimed = jobs.claim_worker_job("local", ["chat"])
+
+            self.assertEqual(claimed["job"]["id"], queued["id"])
+            self.assertEqual(jobs.snapshot(queued["id"])["diagnostics"]["state"], "worker-claimed")
+            completed = jobs.complete_worker_job(queued["id"], "local", payload={"ok": True})
+            self.assertEqual(completed["status"], "done")
+            self.assertEqual(completed["payload"], {"ok": True})
+
+    def test_project_snapshot_round_trip_skips_secrets_and_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source"
+            target = Path(tmp) / "target"
+            ctxgit.ContextStore(source).init()
+            (source / ".env").write_text("SECRET=1\n", encoding="utf-8")
+            (source / ".ctxgit" / ".env").write_text("SECRET=2\n", encoding="utf-8")
+            (source / ".ctxgit" / "auth.json").write_text('{"secret": true}\n', encoding="utf-8")
+            write_job = source / "contexts" / "jobs" / "running.json"
+            write_job.parent.mkdir(parents=True, exist_ok=True)
+            write_job.write_text("{}", encoding="utf-8")
+            (source / "notes.md").write_text("sync me\n", encoding="utf-8")
+
+            changed = ctxgit.apply_project_snapshot_zip(target, ctxgit.make_project_snapshot_zip(source))
+
+            self.assertIn("notes.md", changed)
+            self.assertTrue((target / "contexts" / "branches" / "initial" / "branch.json").exists())
+            self.assertFalse((target / ".env").exists())
+            self.assertFalse((target / ".ctxgit" / ".env").exists())
+            self.assertFalse((target / ".ctxgit" / "auth.json").exists())
+            self.assertFalse((target / "contexts" / "jobs" / "running.json").exists())
+
+    def test_project_file_browser_uploads_and_previews_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ctxgit.ContextStore(root).init()
+
+            uploaded = ctxgit.upload_project_files(
+                root,
+                "uploads",
+                [
+                    {
+                        "path": "notes/hello.txt",
+                        "contentBase64": base64.b64encode(b"hello server").decode("ascii"),
+                    }
+                ],
+            )
+
+            self.assertEqual(uploaded[0]["path"], "uploads/notes/hello.txt")
+            listing = ctxgit.project_files_payload(root, "uploads")
+            self.assertEqual(listing["entries"][0]["name"], "notes")
+            preview = ctxgit.project_file_text_payload(root, "uploads/notes/hello.txt")
+            self.assertEqual(preview["text"], "hello server")
+
+    def test_project_file_upload_rejects_escape_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ctxgit.ContextStore(root).init()
+
+            with self.assertRaises(ValueError):
+                ctxgit.upload_project_files(
+                    root,
+                    "",
+                    [
+                        {
+                            "path": "../outside.txt",
+                            "contentBase64": base64.b64encode(b"nope").decode("ascii"),
+                        }
+                    ],
+                )
+            with self.assertRaises(ValueError):
+                ctxgit.project_files_payload(root, "../")
+
+    def test_auth_store_first_signup_login_and_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auth = ctxgit.AuthStore(root)
+            previous = os.environ.pop("CTXGIT_ALLOW_SIGNUP", None)
+            try:
+
+                self.assertTrue(auth.registration_open())
+                user = auth.create_user("Admin_User", "correct horse battery staple")
+
+                self.assertEqual(user["username"], "admin_user")
+                self.assertEqual(user["role"], "admin")
+                self.assertEqual(user["provider"], "local")
+                self.assertFalse(auth.registration_open())
+                self.assertIsNone(auth.verify_user("admin_user", "wrong password"))
+                self.assertEqual(auth.verify_user("admin_user", "correct horse battery staple")["username"], "admin_user")
+
+                token = auth.create_session("admin_user")
+                self.assertEqual(auth.session_user(token)["username"], "admin_user")
+                auth.destroy_session(token)
+                self.assertIsNone(auth.session_user(token))
+            finally:
+                if previous is not None:
+                    os.environ["CTXGIT_ALLOW_SIGNUP"] = previous
+
+    def test_auth_store_blocks_second_signup_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auth = ctxgit.AuthStore(root)
+            previous = os.environ.pop("CTXGIT_ALLOW_SIGNUP", None)
+            try:
+                auth.create_user("first", "password one")
+
+                with self.assertRaises(ValueError):
+                    auth.create_user("second", "password two")
+            finally:
+                if previous is not None:
+                    os.environ["CTXGIT_ALLOW_SIGNUP"] = previous
+
+    def test_internal_git_commits_turn_to_branch_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.init()
+            store.append_history("initial", "user", "hello")
+            self.assertIn(".ctxgit/git/", (root / ".gitignore").read_text())
+
+            turn = ctxgit.internal_git_commit_turn(
+                store,
+                kind="chat",
+                actor="user+agent",
+                summary="test turn",
+                branch_id="initial",
+            )
+
+            self.assertTrue(turn["commit"])
+            self.assertEqual(ctxgit.internal_git_rev_parse(root, "refs/ctxgit/branches/initial"), turn["commit"])
+            status = ctxgit.internal_git_status_payload(root)
+            self.assertEqual(status["dirtyCount"], 0)
+            self.assertIn("refs/ctxgit/branches/initial", [item["ref"] for item in status["refs"]])
+
+    def test_internal_git_merge_commit_uses_source_branch_parents(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("alpha")
+            store.create_branch("beta")
+            store.append_history("alpha", "user", "alpha")
+            alpha_turn = ctxgit.internal_git_commit_turn(
+                store,
+                kind="chat",
+                actor="user",
+                summary="alpha",
+                branch_id="alpha",
+            )
+            store.append_history("beta", "user", "beta")
+            beta_turn = ctxgit.internal_git_commit_turn(
+                store,
+                kind="chat",
+                actor="user",
+                summary="beta",
+                branch_id="beta",
+            )
+
+            store.merge_branches(["alpha", "beta"], "merged")
+            merge_turn = ctxgit.internal_git_commit_turn(
+                store,
+                kind="merge",
+                actor="user+agent",
+                summary="merge alpha beta",
+                branch_id="merged",
+            )
+
+            parents = ctxgit.run_internal_git(
+                root,
+                ["rev-list", "--parents", "-n", "1", merge_turn["commit"]],
+                check=True,
+            ).stdout.strip().split()
+            self.assertEqual(parents[0], merge_turn["commit"])
+            self.assertIn(alpha_turn["commit"], parents[1:])
+            self.assertIn(beta_turn["commit"], parents[1:])
+
+    def test_branch_graph_simplifies_lineage_to_branch_nodes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("alpha")
+            store.append_history("alpha", "user", "alpha")
+            store.fork_branch_at_history("alpha", "beta", 0)
+            store.create_branch("gamma")
+            store.merge_branches(["beta", "gamma"], "merged", branch_summarizer=lambda _request: "summary")
+
+            graph = store.branch_graph_payload()
+            nodes = {node["id"]: node for node in graph["nodes"]}
+            edge_kinds = {(edge["source"], edge["target"], edge["kind"]) for edge in graph["edges"]}
+
+            self.assertIn("branch:alpha", nodes)
+            self.assertIn("branch:beta", nodes)
+            self.assertIn("branch:merged", nodes)
+            self.assertIn(("branch:alpha", "branch:beta", "fork"), edge_kinds)
+            self.assertIn(("branch:beta", "branch:merged", "merge"), edge_kinds)
+            self.assertIn(("branch:gamma", "branch:merged", "merge"), edge_kinds)
+            self.assertFalse(any(str(node["id"]).startswith("turn:") for node in graph["nodes"]))
 
     def test_delete_history_record_rewrites_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -416,6 +642,50 @@ class CtxgitTest(unittest.TestCase):
             self.assertEqual(meta["forkedAtIndex"], 1)
             self.assertEqual(meta["forkedAtCreatedAt"], second["createdAt"])
             self.assertEqual(list(store.iter_history("forked"))[0]["createdAt"], first["createdAt"])
+
+    def test_fork_branch_restores_all_branch_files_from_turn_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("source", title="Source")
+            first_turn = "turn_20260101T000000000000Z"
+            second_turn = "turn_20260101T000001000000Z"
+            first = store.append_history("source", "user", "First", extra={"turnId": first_turn})
+            ctxgit.write_text(root / "contexts" / "branches" / "source" / "context.md", "# Source\n\nAt first.\n")
+            store.add_note("source", "Old Note", "Old body")
+            first_commit = ctxgit.internal_git_commit_turn(
+                store,
+                kind="chat",
+                actor="user+agent",
+                summary="first turn",
+                branch_id="source",
+                turn_id=first_turn,
+            )
+
+            store.append_history("source", "assistant", "Second", extra={"turnId": second_turn})
+            ctxgit.write_text(root / "contexts" / "branches" / "source" / "context.md", "# Source\n\nCurrent later context.\n")
+            store.add_note("source", "New Note", "New body")
+            ctxgit.internal_git_commit_turn(
+                store,
+                kind="chat",
+                actor="user+agent",
+                summary="second turn",
+                branch_id="source",
+                turn_id=second_turn,
+            )
+
+            store.fork_branch_at_history("source", "forked", 0, expected_created_at=first["createdAt"])
+
+            fork_root = root / "contexts" / "branches" / "forked"
+            self.assertEqual((fork_root / "context.md").read_text(encoding="utf-8"), "# Source\n\nAt first.\n")
+            note_text = "\n".join(path.read_text(encoding="utf-8") for path in (fork_root / "notes").glob("*.md"))
+            self.assertIn("Old body", note_text)
+            self.assertNotIn("New body", note_text)
+            self.assertEqual([item["text"] for item in store.iter_history("forked")], ["First"])
+            meta = ctxgit.load_json(fork_root / "branch.json")
+            self.assertEqual(meta["forkedFromTurnId"], first_turn)
+            self.assertEqual(meta["forkedFromCommit"], first_commit["commit"])
+            self.assertEqual(meta["forkedSnapshot"], "internal-git")
 
     def test_fork_branch_rejects_stale_history_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

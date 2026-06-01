@@ -7,6 +7,28 @@
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
+    <section id="authGate" class="auth-gate" hidden>
+      <div class="auth-card">
+        <div class="brand-title">ctxgit</div>
+        <div id="authModeLabel" class="brand-subtitle">Login required</div>
+        <form id="loginForm" class="auth-form">
+          <label for="loginUsername">Username</label>
+          <input id="loginUsername" autocomplete="username" type="text" />
+          <label for="loginPassword">Password</label>
+          <input id="loginPassword" autocomplete="current-password" type="password" />
+          <button id="loginButton" type="submit">Login</button>
+        </form>
+        <form id="registerForm" class="auth-form" hidden>
+          <label for="registerUsername">Username</label>
+          <input id="registerUsername" autocomplete="username" type="text" />
+          <label for="registerPassword">Password</label>
+          <input id="registerPassword" autocomplete="new-password" type="password" />
+          <button id="registerButton" type="submit">Create account</button>
+        </form>
+        <button id="authSwitchButton" class="link-button" type="button" hidden></button>
+        <div id="authStatus" class="settings-status"></div>
+      </div>
+    </section>
     <div class="shell">
       <aside class="sidebar">
         <div class="brand">
@@ -16,6 +38,8 @@
 
         <section class="sidebar-section">
           <div class="section-title">Project</div>
+          <div id="authSummary" class="git-summary"></div>
+          <button id="logoutButton" class="wide-button" type="button" hidden>Logout</button>
           <div id="projectSummary" class="git-summary"></div>
           <form id="projectForm" class="project-form">
             <input id="projectPathInput" type="text" placeholder="/path/to/project" />
@@ -26,11 +50,21 @@
             </div>
             <div id="projectStatus" class="settings-status"></div>
           </form>
+          <div id="serverProjectPanel" class="server-project-panel" hidden>
+            <select id="serverProjectSelect"></select>
+            <button id="openServerProjectButton" type="button">Open server project</button>
+            <div id="serverProjectStatus" class="settings-status"></div>
+          </div>
         </section>
 
         <section class="sidebar-section">
           <div class="section-title">Branches</div>
           <div id="branchList" class="nav-list"></div>
+        </section>
+
+        <section class="sidebar-section">
+          <div class="section-title">Map</div>
+          <button id="branchGraphButton" class="wide-button" type="button">Branch graph</button>
         </section>
 
         <section class="sidebar-section">
@@ -77,6 +111,11 @@
         </section>
 
         <section class="sidebar-section">
+          <div class="section-title">Worker</div>
+          <div id="workerSummary" class="git-summary"></div>
+        </section>
+
+        <section class="sidebar-section">
           <div class="section-title">Archived</div>
           <div id="globalizedList" class="nav-list"></div>
         </section>
@@ -91,7 +130,9 @@
           <div class="tabs" role="tablist">
             <button class="tab active" data-tab="chat" type="button">Chat</button>
             <button class="tab" data-tab="report" type="button">Report</button>
+            <button class="tab" data-tab="files" type="button">Files</button>
             <button class="tab" data-tab="archives" type="button">Archives</button>
+            <button class="tab" data-tab="graph" type="button">Graph</button>
             <button class="tab" data-tab="version" type="button">Version</button>
           </div>
         </header>
@@ -132,12 +173,47 @@
           <article id="reportView" class="markdown"></article>
         </section>
 
+        <section id="filesTab" class="tab-panel">
+          <div class="file-browser">
+            <form id="filePathForm" class="file-toolbar">
+              <button id="fileUpButton" type="button">Up</button>
+              <button id="fileRefreshButton" type="button">Refresh</button>
+              <input id="filePathInput" type="text" placeholder="project path" />
+              <button id="fileGoButton" type="submit">Go</button>
+              <button id="newFolderButton" type="button">New folder</button>
+              <label class="file-upload-button">
+                <input id="fileUploadInput" type="file" multiple />
+                <span>Upload files</span>
+              </label>
+              <label class="file-upload-button">
+                <input id="folderUploadInput" type="file" webkitdirectory multiple />
+                <span>Upload folder</span>
+              </label>
+            </form>
+            <div id="fileStatus" class="settings-status"></div>
+            <div class="file-browser-grid">
+              <div id="fileList" class="file-list"></div>
+              <pre id="filePreview" class="code-block file-preview"></pre>
+            </div>
+          </div>
+        </section>
+
         <section id="archivesTab" class="tab-panel">
           <div class="archive-layout">
             <aside id="archiveList" class="archive-list"></aside>
             <section id="archiveViewer" class="archive-viewer">
               <div class="muted">No archived source branch selected.</div>
             </section>
+          </div>
+        </section>
+
+        <section id="graphTab" class="tab-panel">
+          <div class="graph-layout">
+            <div class="graph-toolbar">
+              <div id="branchGraphStatus" class="settings-status"></div>
+              <button id="graphRefreshButton" type="button">Refresh</button>
+            </div>
+            <div id="branchGraph" class="branch-graph"></div>
           </div>
         </section>
 
@@ -154,6 +230,10 @@
             <section>
               <h2>Current Diff</h2>
               <pre id="currentDiff" class="code-block"></pre>
+            </section>
+            <section>
+              <h2>ctxgit Internal Git DAG</h2>
+              <pre id="internalGitLog" class="code-block"></pre>
             </section>
             <section>
               <h2>Research Notes And Artifacts</h2>

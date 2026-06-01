@@ -4,3 +4,10 @@ __pycache__/
 .env
 .env.*
 !.env.example
+.ctxgit/.env
+.ctxgit/.env.*
+!.ctxgit/.env.example
+.ctxgit/auth.json
+.ctxgit/auth.json.*
+.ctxgit/git/
+.ctxgit/logs/

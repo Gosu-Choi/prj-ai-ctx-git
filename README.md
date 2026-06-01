@@ -180,6 +180,12 @@ Run the local viewer:
 ctxgit serve
 ```
 
+The web interface requires login. On a fresh server, the first signup creates
+the admin account; after that, signup is closed by default. Set
+`CTXGIT_ALLOW_SIGNUP=1` only if you intentionally want additional open
+registrations. Behind HTTPS, set `CTXGIT_COOKIE_SECURE=1` unless your reverse
+proxy sends `X-Forwarded-Proto: https`.
+
 The UI has a `Project` panel. Open an already initialized project, or choose a
 directory and press `Init/Open` to create that project's `.ctxgit/`, `contexts/`,
 and `.git` if needed. The UI then shows that project's branches as chat
