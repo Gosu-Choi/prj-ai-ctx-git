@@ -30,6 +30,81 @@ body {
   overflow: hidden;
 }
 
+.auth-gate {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: grid;
+  place-items: center;
+  background: rgb(247 247 244 / 94%);
+  padding: 20px;
+}
+
+.auth-gate[hidden] {
+  display: none;
+}
+
+.auth-card {
+  width: min(420px, 100%);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  padding: 22px;
+  box-shadow: 0 18px 42px rgb(0 0 0 / 14%);
+}
+
+.auth-form {
+  display: grid;
+  gap: 8px;
+  margin-top: 18px;
+}
+
+.auth-form[hidden] {
+  display: none;
+}
+
+.auth-form label {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.auth-form input {
+  min-width: 0;
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #ffffff;
+  color: var(--text);
+  padding: 9px 10px;
+}
+
+.auth-form button,
+.link-button {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+  padding: 9px 10px;
+}
+
+.auth-form button {
+  margin-top: 6px;
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #ffffff;
+}
+
+.link-button {
+  margin-top: 10px;
+  border: 0;
+  color: var(--accent);
+  text-align: left;
+  padding-left: 0;
+}
+
 button,
 select,
 input,

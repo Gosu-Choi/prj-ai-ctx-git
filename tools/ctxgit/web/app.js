@@ -10,6 +10,8 @@ const state = {
   provider: null,
   serverProjects: [],
   worker: null,
+  auth: null,
+  authMode: "login",
   fileBrowser: { path: "", parent: "", entries: [] },
   currentJob: null,
   jobs: {},
@@ -20,6 +22,20 @@ const state = {
 };
 
 const els = {
+  authGate: document.querySelector("#authGate"),
+  authModeLabel: document.querySelector("#authModeLabel"),
+  loginForm: document.querySelector("#loginForm"),
+  loginUsername: document.querySelector("#loginUsername"),
+  loginPassword: document.querySelector("#loginPassword"),
+  loginButton: document.querySelector("#loginButton"),
+  registerForm: document.querySelector("#registerForm"),
+  registerUsername: document.querySelector("#registerUsername"),
+  registerPassword: document.querySelector("#registerPassword"),
+  registerButton: document.querySelector("#registerButton"),
+  authSwitchButton: document.querySelector("#authSwitchButton"),
+  authStatus: document.querySelector("#authStatus"),
+  authSummary: document.querySelector("#authSummary"),
+  logoutButton: document.querySelector("#logoutButton"),
   projectSummary: document.querySelector("#projectSummary"),
   projectForm: document.querySelector("#projectForm"),
   projectPathInput: document.querySelector("#projectPathInput"),
@@ -124,9 +140,124 @@ async function api(path, options = {}) {
     }
   }
   if (!response.ok) {
+    if (response.status === 401 && payload?.error === "auth_required") {
+      renderAuth(payload.auth || { authenticated: false, registrationOpen: false });
+    }
     throw new ApiError(payload.message || payload.error || `Request failed: ${response.status}`, response.status, payload);
   }
   return payload;
+}
+
+function setAuthStatus(message, kind = "") {
+  els.authStatus.textContent = message;
+  els.authStatus.className = `settings-status ${kind}`.trim();
+}
+
+function showAuthMode(mode) {
+  state.authMode = mode === "register" ? "register" : "login";
+  const registrationOpen = state.auth?.registrationOpen === true;
+  const userCount = Number(state.auth?.userCount || 0);
+  const showRegister = state.authMode === "register" && registrationOpen;
+  els.loginForm.hidden = showRegister;
+  els.registerForm.hidden = !showRegister;
+  els.authModeLabel.textContent = showRegister
+    ? userCount ? "Create another account" : "Create the first admin account"
+    : "Login required";
+  if (registrationOpen) {
+    els.authSwitchButton.hidden = false;
+    els.authSwitchButton.textContent = showRegister ? "Use existing account" : "Create account";
+  } else {
+    els.authSwitchButton.hidden = true;
+    els.authSwitchButton.textContent = "";
+  }
+}
+
+function renderAuth(auth) {
+  state.auth = auth || { authenticated: false, registrationOpen: false };
+  const authenticated = state.auth.authenticated === true;
+  els.authGate.hidden = authenticated;
+  els.logoutButton.hidden = !authenticated;
+  if (authenticated) {
+    const user = state.auth.user || {};
+    els.authSummary.innerHTML = `
+      <div>Signed in: <strong>${escapeHtml(user.username || "")}</strong></div>
+      <div class="muted">${escapeHtml(user.role || "user")} · ${escapeHtml(user.provider || "local")}</div>
+    `;
+    setAuthStatus("");
+    return;
+  }
+  els.authSummary.innerHTML = '<div class="muted">Not signed in.</div>';
+  const userCount = Number(state.auth.userCount || 0);
+  showAuthMode(state.auth.registrationOpen && userCount === 0 ? "register" : state.authMode);
+}
+
+async function loadAuthStatus() {
+  const auth = await api("/api/auth/status");
+  renderAuth(auth);
+  return auth;
+}
+
+async function submitLogin(event) {
+  event.preventDefault();
+  const username = els.loginUsername.value.trim();
+  const password = els.loginPassword.value;
+  if (!username || !password) {
+    setAuthStatus("Username and password are required.", "error");
+    return;
+  }
+  els.loginButton.disabled = true;
+  setAuthStatus("Logging in...");
+  try {
+    const auth = await api("/api/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+    });
+    els.loginPassword.value = "";
+    renderAuth(auth);
+    await loadProject();
+  } catch (error) {
+    setAuthStatus(`Login failed: ${error.message}`, "error");
+  } finally {
+    els.loginButton.disabled = false;
+  }
+}
+
+async function submitRegister(event) {
+  event.preventDefault();
+  const username = els.registerUsername.value.trim();
+  const password = els.registerPassword.value;
+  if (!username || !password) {
+    setAuthStatus("Username and password are required.", "error");
+    return;
+  }
+  els.registerButton.disabled = true;
+  setAuthStatus("Creating account...");
+  try {
+    const auth = await api("/api/auth/register", {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+    });
+    els.registerPassword.value = "";
+    renderAuth(auth);
+    await loadProject();
+  } catch (error) {
+    setAuthStatus(`Signup failed: ${error.message}`, "error");
+  } finally {
+    els.registerButton.disabled = false;
+  }
+}
+
+async function logout() {
+  els.logoutButton.disabled = true;
+  try {
+    const auth = await api("/api/auth/logout", { method: "POST", body: JSON.stringify({}) });
+    renderAuth(auth);
+    clearWorkspace("Login required.");
+  } catch (error) {
+    window.alert(`Logout failed: ${error.message}`);
+  } finally {
+    els.logoutButton.disabled = false;
+  }
 }
 
 function sleep(ms) {
@@ -1950,6 +2081,14 @@ document.addEventListener("click", (event) => {
   }
 });
 
+els.loginForm.addEventListener("submit", submitLogin);
+els.registerForm.addEventListener("submit", submitRegister);
+els.logoutButton.addEventListener("click", logout);
+els.authSwitchButton.addEventListener("click", () => {
+  showAuthMode(state.authMode === "register" ? "login" : "register");
+  setAuthStatus("");
+});
+
 els.projectForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   const path = await projectPathForAction();
@@ -2156,7 +2295,14 @@ els.refreshButton.addEventListener("click", async () => {
   await loadProject();
 });
 
-loadProject()
+loadAuthStatus()
+  .then((auth) => {
+    if (auth.authenticated) {
+      return loadProject();
+    }
+    clearWorkspace("Login required.");
+    return null;
+  })
   .catch((error) => {
     els.activeTitle.textContent = "Could not load ctxgit project";
     els.activeMeta.textContent = error.message;

@@ -7,6 +7,28 @@
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
+    <section id="authGate" class="auth-gate" hidden>
+      <div class="auth-card">
+        <div class="brand-title">ctxgit</div>
+        <div id="authModeLabel" class="brand-subtitle">Login required</div>
+        <form id="loginForm" class="auth-form">
+          <label for="loginUsername">Username</label>
+          <input id="loginUsername" autocomplete="username" type="text" />
+          <label for="loginPassword">Password</label>
+          <input id="loginPassword" autocomplete="current-password" type="password" />
+          <button id="loginButton" type="submit">Login</button>
+        </form>
+        <form id="registerForm" class="auth-form" hidden>
+          <label for="registerUsername">Username</label>
+          <input id="registerUsername" autocomplete="username" type="text" />
+          <label for="registerPassword">Password</label>
+          <input id="registerPassword" autocomplete="new-password" type="password" />
+          <button id="registerButton" type="submit">Create account</button>
+        </form>
+        <button id="authSwitchButton" class="link-button" type="button" hidden></button>
+        <div id="authStatus" class="settings-status"></div>
+      </div>
+    </section>
     <div class="shell">
       <aside class="sidebar">
         <div class="brand">
@@ -16,6 +38,8 @@
 
         <section class="sidebar-section">
           <div class="section-title">Project</div>
+          <div id="authSummary" class="git-summary"></div>
+          <button id="logoutButton" class="wide-button" type="button" hidden>Logout</button>
           <div id="projectSummary" class="git-summary"></div>
           <form id="projectForm" class="project-form">
             <input id="projectPathInput" type="text" placeholder="/path/to/project" />

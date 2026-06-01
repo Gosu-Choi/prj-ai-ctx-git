@@ -23,6 +23,7 @@ import contextlib
 import hashlib
 import hmac
 import html
+import http.cookies
 import io
 import importlib.util
 import http.server
@@ -30,6 +31,7 @@ import json
 import os
 import queue
 import re
+import secrets
 import shlex
 import shutil
 import socketserver
@@ -75,12 +77,23 @@ APPROVAL_STATUSES = {"approved", "denied"}
 PROJECT_ENV_ALLOWED_KEYS = {"BRAVE_API_KEY"}
 REPO_ENV_FILES = (".env",)
 PROJECT_ENV_FILES = (".ctxgit/.env", ".env")
-PROJECT_ENV_GITIGNORE_LINES = (".ctxgit/.env", ".ctxgit/.env.*", "!.ctxgit/.env.example", ".ctxgit/git/")
+PROJECT_ENV_GITIGNORE_LINES = (
+    ".ctxgit/.env",
+    ".ctxgit/.env.*",
+    "!.ctxgit/.env.example",
+    ".ctxgit/auth.json",
+    ".ctxgit/auth.json.*",
+    ".ctxgit/git/",
+)
 PROJECT_SYNC_SKIP_DIRS = {".git", "__pycache__", ".mypy_cache", ".pytest_cache", "node_modules", ".venv", "venv"}
 PROJECT_SYNC_SKIP_FILES = {".env", ".DS_Store"}
-PROJECT_SYNC_SKIP_PATHS = {(".ctxgit", ".env")}
+PROJECT_SYNC_SKIP_PATHS = {(".ctxgit", ".env"), (".ctxgit", "auth.json")}
 MAX_PROJECT_UPLOAD_BYTES = 100 * 1024 * 1024
 MAX_PROJECT_TEXT_PREVIEW_BYTES = 512 * 1024
+AUTH_COOKIE_NAME = "ctxgit_session"
+AUTH_SESSION_SECONDS = 7 * 24 * 60 * 60
+AUTH_PBKDF2_ITERATIONS = 240000
+AUTH_USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{2,39}$")
 PROJECT_CONTEXT_FILES = (
     ("Project Agent Instructions", "AGENTS.md"),
     ("User Preferences", "USER.md"),
@@ -334,6 +347,8 @@ def internal_git_excludes() -> str:
             ".ctxgit/git/**",
             ".ctxgit/.env",
             ".ctxgit/.env.*",
+            ".ctxgit/auth.json",
+            ".ctxgit/auth.json.*",
             ".env",
             ".DS_Store",
         ]
@@ -5591,6 +5606,184 @@ def project_registry_id(path: Path, used: set[str]) -> str:
     return candidate
 
 
+def auth_env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def password_hash(password: str, *, salt: bytes | None = None, iterations: int = AUTH_PBKDF2_ITERATIONS) -> dict[str, Any]:
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return {
+        "algorithm": "pbkdf2-sha256",
+        "iterations": iterations,
+        "salt": base64.b64encode(salt).decode("ascii"),
+        "hash": base64.b64encode(digest).decode("ascii"),
+    }
+
+
+def password_matches(password: str, record: dict[str, Any]) -> bool:
+    if record.get("algorithm") != "pbkdf2-sha256":
+        return False
+    try:
+        iterations = int(record.get("iterations") or 0)
+        salt = base64.b64decode(str(record.get("salt") or "").encode("ascii"), validate=True)
+        expected = base64.b64decode(str(record.get("hash") or "").encode("ascii"), validate=True)
+    except (ValueError, binascii.Error):
+        return False
+    if iterations <= 0 or not salt or not expected:
+        return False
+    actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return hmac.compare_digest(actual, expected)
+
+
+class AuthStore:
+    def __init__(self, root: Path) -> None:
+        self.root = root.expanduser().resolve()
+        self.path = self.root / ".ctxgit" / "auth.json"
+        self._lock = threading.RLock()
+        self._sessions: dict[str, dict[str, Any]] = {}
+
+    def load(self) -> dict[str, Any]:
+        if not self.path.exists():
+            return {"schemaVersion": 1, "users": {}, "allowSignup": False}
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return {"schemaVersion": 1, "users": {}, "allowSignup": False}
+        if not isinstance(data, dict):
+            return {"schemaVersion": 1, "users": {}, "allowSignup": False}
+        users = data.get("users")
+        if not isinstance(users, dict):
+            users = {}
+        return {
+            "schemaVersion": 1,
+            "users": users,
+            "allowSignup": data.get("allowSignup") is True,
+            "createdAt": data.get("createdAt") or "",
+        }
+
+    def save(self, data: dict[str, Any]) -> None:
+        data["schemaVersion"] = 1
+        data.setdefault("createdAt", utc_now())
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        dump_json(self.path, data)
+        with contextlib.suppress(OSError):
+            os.chmod(self.path, 0o600)
+
+    def users(self) -> dict[str, Any]:
+        data = self.load()
+        users = data.get("users")
+        return users if isinstance(users, dict) else {}
+
+    def registration_open(self) -> bool:
+        data = self.load()
+        users = data.get("users") if isinstance(data.get("users"), dict) else {}
+        return not users or data.get("allowSignup") is True or auth_env_truthy("CTXGIT_ALLOW_SIGNUP")
+
+    def normalize_username(self, username: str) -> str:
+        cleaned = username.strip()
+        if not AUTH_USERNAME_RE.match(cleaned):
+            raise ValueError("username must be 3-40 characters using letters, numbers, '.', '_', or '-'")
+        return cleaned.lower()
+
+    def create_user(self, username: str, password: str) -> dict[str, Any]:
+        if len(password) < 8:
+            raise ValueError("password must be at least 8 characters")
+        normalized = self.normalize_username(username)
+        with self._lock:
+            data = self.load()
+            users = data.get("users") if isinstance(data.get("users"), dict) else {}
+            if users and not self.registration_open():
+                raise ValueError("signup is closed after the first account")
+            if normalized in users:
+                raise ValueError("username already exists")
+            role = "admin" if not users else "user"
+            now = utc_now()
+            user = {
+                "id": f"local:{normalized}",
+                "username": normalized,
+                "role": role,
+                "authProvider": "local",
+                "authSubject": normalized,
+                "authMethods": [{"provider": "local", "subject": normalized, "createdAt": now}],
+                "createdAt": now,
+                "password": password_hash(password),
+            }
+            users[normalized] = user
+            data["users"] = users
+            self.save(data)
+            return self.public_user(user)
+
+    def verify_user(self, username: str, password: str) -> dict[str, Any] | None:
+        normalized = username.strip().lower()
+        with self._lock:
+            user = self.users().get(normalized)
+        if not isinstance(user, dict):
+            return None
+        password_record = user.get("password") if isinstance(user.get("password"), dict) else {}
+        if not password_matches(password, password_record):
+            return None
+        return self.public_user(user)
+
+    def public_user(self, user: dict[str, Any]) -> dict[str, str]:
+        return {
+            "id": str(user.get("id") or f"{user.get('authProvider') or 'local'}:{user.get('username') or ''}"),
+            "username": str(user.get("username") or ""),
+            "role": str(user.get("role") or "user"),
+            "provider": str(user.get("authProvider") or "local"),
+            "createdAt": str(user.get("createdAt") or ""),
+        }
+
+    def create_session(self, username: str) -> str:
+        token = secrets.token_urlsafe(32)
+        now = time.time()
+        with self._lock:
+            self._sessions[token] = {
+                "username": username.strip().lower(),
+                "createdAt": now,
+                "expiresAt": now + AUTH_SESSION_SECONDS,
+            }
+            self.cleanup_sessions_locked(now)
+        return token
+
+    def session_user(self, token: str) -> dict[str, Any] | None:
+        if not token:
+            return None
+        now = time.time()
+        with self._lock:
+            session = self._sessions.get(token)
+            if not isinstance(session, dict):
+                return None
+            if float(session.get("expiresAt") or 0) <= now:
+                self._sessions.pop(token, None)
+                return None
+            users = self.users()
+            user = users.get(str(session.get("username") or ""))
+            if not isinstance(user, dict):
+                self._sessions.pop(token, None)
+                return None
+            return self.public_user(user)
+
+    def destroy_session(self, token: str) -> None:
+        with self._lock:
+            self._sessions.pop(token, None)
+
+    def cleanup_sessions_locked(self, now: float) -> None:
+        expired = [token for token, session in self._sessions.items() if float(session.get("expiresAt") or 0) <= now]
+        for token in expired:
+            self._sessions.pop(token, None)
+
+    def status(self, user: dict[str, Any] | None = None) -> dict[str, Any]:
+        users = self.users()
+        return {
+            "enabled": True,
+            "authenticated": user is not None,
+            "user": user,
+            "registrationOpen": self.registration_open(),
+            "userCount": len(users),
+        }
+
+
 class ServerProjectRegistry:
     def __init__(self, initial_root: Path, projects_root: Path | None = None) -> None:
         self.initial_root = initial_root.resolve()
@@ -6142,21 +6335,25 @@ def make_handler(
     project_registry: ServerProjectRegistry | None = None,
     worker_token: str = "",
     prefer_worker: bool = False,
+    auth_root: Path | None = None,
 ):
     registry = project_registry or ServerProjectRegistry(project_state.root())
     jobs = JobStore(project_state, prefer_worker=prefer_worker)
     worker_token = worker_token or os.environ.get("CTXGIT_WORKER_TOKEN", "")
+    auth_store = AuthStore(auth_root or project_state.root())
 
     class CtxgitHandler(http.server.BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: Any) -> None:
             sys.stderr.write("ctxgit web: " + (format % args) + "\n")
 
-        def send_json(self, payload: Any, status: int = 200) -> None:
+        def send_json(self, payload: Any, status: int = 200, headers: dict[str, str] | None = None) -> None:
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(data)))
+            for key, value in (headers or {}).items():
+                self.send_header(key, value)
             self.end_headers()
             self.wfile.write(data)
 
@@ -6194,8 +6391,122 @@ def make_handler(
                 supplied = str(body.get("token") or "")
             return hmac.compare_digest(supplied, worker_token)
 
+        def auth_api_exempt(self, path: str) -> bool:
+            return path.startswith("/api/auth/") or path in {
+                "/api/worker/claim",
+                "/api/worker/job/event",
+                "/api/worker/job/complete",
+                "/api/worker/snapshot",
+            }
+
+        def secure_cookie_enabled(self) -> bool:
+            forwarded_proto = self.headers.get("X-Forwarded-Proto", "").lower()
+            return auth_env_truthy("CTXGIT_COOKIE_SECURE") or forwarded_proto == "https"
+
+        def auth_cookie_header(self, token: str, max_age: int = AUTH_SESSION_SECONDS) -> str:
+            cookie = http.cookies.SimpleCookie()
+            cookie[AUTH_COOKIE_NAME] = token
+            morsel = cookie[AUTH_COOKIE_NAME]
+            morsel["path"] = "/"
+            morsel["max-age"] = str(max_age)
+            morsel["httponly"] = True
+            morsel["samesite"] = "Lax"
+            if self.secure_cookie_enabled():
+                morsel["secure"] = True
+            return cookie.output(header="").strip()
+
+        def clear_auth_cookie_header(self) -> str:
+            cookie = http.cookies.SimpleCookie()
+            cookie[AUTH_COOKIE_NAME] = ""
+            morsel = cookie[AUTH_COOKIE_NAME]
+            morsel["path"] = "/"
+            morsel["max-age"] = "0"
+            morsel["expires"] = "Thu, 01 Jan 1970 00:00:00 GMT"
+            morsel["httponly"] = True
+            morsel["samesite"] = "Lax"
+            if self.secure_cookie_enabled():
+                morsel["secure"] = True
+            return cookie.output(header="").strip()
+
+        def auth_token(self) -> str:
+            raw_cookie = self.headers.get("Cookie", "")
+            if not raw_cookie:
+                return ""
+            try:
+                cookie = http.cookies.SimpleCookie(raw_cookie)
+            except http.cookies.CookieError:
+                return ""
+            morsel = cookie.get(AUTH_COOKIE_NAME)
+            return morsel.value if morsel else ""
+
+        def current_user(self) -> dict[str, Any] | None:
+            return auth_store.session_user(self.auth_token())
+
+        def require_authenticated(self, *, json_response: bool = True) -> bool:
+            if self.current_user():
+                return True
+            if json_response:
+                self.send_json(
+                    {
+                        "error": "auth_required",
+                        "message": "Login required.",
+                        "auth": auth_store.status(None),
+                    },
+                    status=401,
+                )
+            else:
+                self.send_text("Login required.", status=401)
+            return False
+
+        def handle_auth_get(self, parsed: urllib.parse.ParseResult) -> bool:
+            if parsed.path == "/api/auth/status":
+                self.send_json(auth_store.status(self.current_user()))
+                return True
+            return False
+
+        def handle_auth_post(self, parsed: urllib.parse.ParseResult, body: dict[str, Any]) -> bool:
+            if parsed.path == "/api/auth/register":
+                username = str(body.get("username") or "")
+                password = str(body.get("password") or "")
+                try:
+                    user = auth_store.create_user(username, password)
+                    token = auth_store.create_session(user["username"])
+                    self.send_json(
+                        {**auth_store.status(user), "message": "Account created."},
+                        headers={"Set-Cookie": self.auth_cookie_header(token)},
+                    )
+                except ValueError as exc:
+                    self.send_json({"error": "signup_failed", "message": str(exc), "auth": auth_store.status(None)}, status=400)
+                return True
+            if parsed.path == "/api/auth/login":
+                username = str(body.get("username") or "")
+                password = str(body.get("password") or "")
+                user = auth_store.verify_user(username, password)
+                if not user:
+                    self.send_json(
+                        {"error": "login_failed", "message": "Invalid username or password.", "auth": auth_store.status(None)},
+                        status=401,
+                    )
+                    return True
+                token = auth_store.create_session(user["username"])
+                self.send_json(
+                    {**auth_store.status(user), "message": "Logged in."},
+                    headers={"Set-Cookie": self.auth_cookie_header(token)},
+                )
+                return True
+            if parsed.path == "/api/auth/logout":
+                auth_store.destroy_session(self.auth_token())
+                self.send_json(
+                    {**auth_store.status(None), "message": "Logged out."},
+                    headers={"Set-Cookie": self.clear_auth_cookie_header()},
+                )
+                return True
+            return False
+
         def handle_api_get(self, parsed: urllib.parse.ParseResult) -> bool:
             query = urllib.parse.parse_qs(parsed.query)
+            if self.handle_auth_get(parsed):
+                return True
             if parsed.path == "/api/project":
                 self.send_json(project_state.payload())
                 return True
@@ -6336,9 +6647,14 @@ def make_handler(
 
         def do_GET(self) -> None:
             parsed = urllib.parse.urlparse(self.path)
+            if parsed.path.startswith("/api/") and not self.auth_api_exempt(parsed.path):
+                if not self.require_authenticated():
+                    return
             if parsed.path.startswith("/api/") and self.handle_api_get(parsed):
                 return
             if parsed.path == "/file":
+                if not self.require_authenticated(json_response=False):
+                    return
                 self.handle_file_get(parsed)
                 return
             self.serve_static(parsed, include_body=True)
@@ -6346,7 +6662,10 @@ def make_handler(
         def do_HEAD(self) -> None:
             parsed = urllib.parse.urlparse(self.path)
             if parsed.path.startswith("/api/"):
-                self.send_response(200)
+                if not self.auth_api_exempt(parsed.path) and not self.current_user():
+                    self.send_response(401)
+                else:
+                    self.send_response(200)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.end_headers()
                 return
@@ -6381,6 +6700,11 @@ def make_handler(
         def do_POST(self) -> None:
             parsed = urllib.parse.urlparse(self.path)
             body = self.read_json_body()
+            if self.handle_auth_post(parsed, body):
+                return
+            if parsed.path.startswith("/api/") and not self.auth_api_exempt(parsed.path):
+                if not self.require_authenticated():
+                    return
             if parsed.path == "/api/server/project/open":
                 project_id = str(body.get("id") or "")
                 init = body.get("init") is True
@@ -7231,6 +7555,7 @@ def run_server(
         project_registry=project_registry,
         worker_token=worker_token,
         prefer_worker=prefer_worker,
+        auth_root=projects_root or root,
     )
     with ReusableThreadingHTTPServer((host, port), handler) as server:
         url = f"http://{host}:{server.server_port}"

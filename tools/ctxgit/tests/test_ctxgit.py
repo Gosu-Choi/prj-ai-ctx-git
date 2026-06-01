@@ -151,6 +151,7 @@ class CtxgitTest(unittest.TestCase):
             ctxgit.ContextStore(source).init()
             (source / ".env").write_text("SECRET=1\n", encoding="utf-8")
             (source / ".ctxgit" / ".env").write_text("SECRET=2\n", encoding="utf-8")
+            (source / ".ctxgit" / "auth.json").write_text('{"secret": true}\n', encoding="utf-8")
             write_job = source / "contexts" / "jobs" / "running.json"
             write_job.parent.mkdir(parents=True, exist_ok=True)
             write_job.write_text("{}", encoding="utf-8")
@@ -162,6 +163,7 @@ class CtxgitTest(unittest.TestCase):
             self.assertTrue((target / "contexts" / "branches" / "initial" / "branch.json").exists())
             self.assertFalse((target / ".env").exists())
             self.assertFalse((target / ".ctxgit" / ".env").exists())
+            self.assertFalse((target / ".ctxgit" / "auth.json").exists())
             self.assertFalse((target / "contexts" / "jobs" / "running.json").exists())
 
     def test_project_file_browser_uploads_and_previews_files(self) -> None:
@@ -204,6 +206,45 @@ class CtxgitTest(unittest.TestCase):
                 )
             with self.assertRaises(ValueError):
                 ctxgit.project_files_payload(root, "../")
+
+    def test_auth_store_first_signup_login_and_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auth = ctxgit.AuthStore(root)
+            previous = os.environ.pop("CTXGIT_ALLOW_SIGNUP", None)
+            try:
+
+                self.assertTrue(auth.registration_open())
+                user = auth.create_user("Admin_User", "correct horse battery staple")
+
+                self.assertEqual(user["username"], "admin_user")
+                self.assertEqual(user["role"], "admin")
+                self.assertEqual(user["provider"], "local")
+                self.assertFalse(auth.registration_open())
+                self.assertIsNone(auth.verify_user("admin_user", "wrong password"))
+                self.assertEqual(auth.verify_user("admin_user", "correct horse battery staple")["username"], "admin_user")
+
+                token = auth.create_session("admin_user")
+                self.assertEqual(auth.session_user(token)["username"], "admin_user")
+                auth.destroy_session(token)
+                self.assertIsNone(auth.session_user(token))
+            finally:
+                if previous is not None:
+                    os.environ["CTXGIT_ALLOW_SIGNUP"] = previous
+
+    def test_auth_store_blocks_second_signup_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auth = ctxgit.AuthStore(root)
+            previous = os.environ.pop("CTXGIT_ALLOW_SIGNUP", None)
+            try:
+                auth.create_user("first", "password one")
+
+                with self.assertRaises(ValueError):
+                    auth.create_user("second", "password two")
+            finally:
+                if previous is not None:
+                    os.environ["CTXGIT_ALLOW_SIGNUP"] = previous
 
     def test_internal_git_commits_turn_to_branch_ref(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
