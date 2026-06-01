@@ -2348,6 +2348,163 @@ class ContextStore:
         )
         return archives
 
+    def branch_graph_payload(self) -> dict[str, Any]:
+        self.require_initialized()
+        nodes: dict[str, dict[str, Any]] = {
+            "root": {
+                "id": "root",
+                "kind": "root",
+                "status": "system",
+                "label": "Workspace",
+                "title": "Workspace baseline",
+                "meta": "ctxgit baseline",
+            }
+        }
+        edges: list[dict[str, Any]] = []
+        edge_keys: set[tuple[str, str, str]] = set()
+
+        def node_id(branch_id: str) -> str:
+            return f"branch:{branch_id}"
+
+        def add_missing_branch(branch_id: str) -> None:
+            key = node_id(branch_id)
+            if key not in nodes:
+                nodes[key] = {
+                    "id": key,
+                    "kind": "branch",
+                    "status": "missing",
+                    "branchId": branch_id,
+                    "label": branch_id,
+                    "title": branch_id,
+                    "meta": "missing source",
+                }
+
+        def add_edge(source: str, target: str, kind: str, label: str = "") -> None:
+            key = (source, target, kind)
+            if source == target or key in edge_keys:
+                return
+            edge_keys.add(key)
+            edges.append(
+                {
+                    "id": f"{kind}:{source}->{target}",
+                    "source": source,
+                    "target": target,
+                    "kind": kind,
+                    "label": label or kind,
+                }
+            )
+
+        branch_meta: dict[str, dict[str, Any]] = {}
+        active_count = 0
+        archived_count = 0
+        merge_count = 0
+        for meta_path in sorted(self.branches.glob("*/branch.json")):
+            try:
+                meta = load_json(meta_path)
+            except SystemExit:
+                continue
+            branch_id = str(meta.get("id") or meta_path.parent.name)
+            archived = self.branch_is_archived(meta_path)
+            history_count = len(list(self.iter_history(branch_id)))
+            branch_ref = ctxgit_branch_ref(branch_id)
+            head = internal_git_rev_parse(self.root, branch_ref)
+            merge = meta.get("merge") if isinstance(meta.get("merge"), dict) else {}
+            merge_sources = merge.get("sourceBranches") if isinstance(merge.get("sourceBranches"), list) else []
+            parents = meta.get("parents") if isinstance(meta.get("parents"), list) else []
+            branch_meta[branch_id] = meta
+            if archived:
+                archived_count += 1
+            else:
+                active_count += 1
+            if len(merge_sources or parents) > 1:
+                merge_count += 1
+            nodes[node_id(branch_id)] = {
+                "id": node_id(branch_id),
+                "kind": "branch",
+                "status": "archived" if archived else "active",
+                "branchId": branch_id,
+                "label": meta.get("title") or branch_id,
+                "title": meta.get("title") or branch_id,
+                "meta": branch_id,
+                "createdAt": meta.get("createdAt"),
+                "updatedAt": meta.get("updatedAt"),
+                "historyCount": history_count,
+                "head": head,
+                "shortHead": head[:7],
+                "tags": meta.get("tags") if isinstance(meta.get("tags"), list) else [],
+                "lineage": {
+                    "parent": meta.get("parent") or "",
+                    "forkedFrom": meta.get("forkedFrom") or "",
+                    "forkedAtIndex": meta.get("forkedAtIndex"),
+                    "clonedFrom": meta.get("clonedFrom") or "",
+                    "parents": parents,
+                    "mergeSources": merge_sources,
+                },
+            }
+
+        for branch_id, meta in branch_meta.items():
+            target = node_id(branch_id)
+            merge = meta.get("merge") if isinstance(meta.get("merge"), dict) else {}
+            merge_sources = merge.get("sourceBranches") if isinstance(merge.get("sourceBranches"), list) else []
+            parents = meta.get("parents") if isinstance(meta.get("parents"), list) else []
+            if len(merge_sources or parents) > 1:
+                for source_id in [str(item) for item in (merge_sources or parents) if str(item).strip()]:
+                    add_missing_branch(source_id)
+                    add_edge(node_id(source_id), target, "merge", "merge")
+                continue
+            forked_from = str(meta.get("forkedFrom") or "").strip()
+            if forked_from:
+                add_missing_branch(forked_from)
+                index = meta.get("forkedAtIndex")
+                label = f"fork #{int(index) + 1}" if isinstance(index, int) else "fork"
+                add_edge(node_id(forked_from), target, "fork", label)
+                continue
+            parent = str(meta.get("parent") or "").strip()
+            if parent:
+                add_missing_branch(parent)
+                add_edge(node_id(parent), target, "parent", "parent")
+                continue
+            cloned_from = str(meta.get("clonedFrom") or "").strip()
+            if cloned_from:
+                add_missing_branch(cloned_from)
+                add_edge(node_id(cloned_from), target, "clone", "clone")
+                continue
+            add_edge("root", target, "root", "root")
+
+        archives = self.list_globalized_archives()
+        for archive in archives:
+            archive_id = str(archive.get("id") or "").strip()
+            if not archive_id:
+                continue
+            source_branch = str(archive.get("sourceBranch") or "").strip()
+            archive_node = f"archive:{archive_id}"
+            nodes[archive_node] = {
+                "id": archive_node,
+                "kind": "archive",
+                "status": "archive",
+                "archiveId": archive_id,
+                "branchId": source_branch,
+                "label": archive.get("title") or archive_id,
+                "title": archive.get("title") or archive_id,
+                "meta": f"{source_branch} · {archive.get('rangeStart') or '?'}-{archive.get('rangeEnd') or '?'}",
+                "createdAt": archive.get("createdAt"),
+                "historyCount": archive.get("messageCount") or 0,
+            }
+            if source_branch:
+                add_missing_branch(source_branch)
+                add_edge(node_id(source_branch), archive_node, "archive", "archive")
+
+        return {
+            "nodes": list(nodes.values()),
+            "edges": edges,
+            "summary": {
+                "activeBranches": active_count,
+                "archivedBranches": archived_count,
+                "mergeBranches": merge_count,
+                "globalizedArchives": len(archives),
+            },
+        }
+
     def globalized_payload(self, archive_id: str) -> dict[str, Any]:
         safe_archive = validate_id(archive_id, "globalized archive")
         archive_root = self.globalized / safe_archive
@@ -6027,6 +6184,9 @@ def make_handler(
                         "globalized": store.list_globalized_archives(),
                     }
                 )
+                return True
+            if parsed.path == "/api/branch-graph":
+                self.send_json(store.branch_graph_payload())
                 return True
             if parsed.path == "/api/branch":
                 branch_id = (query.get("id") or [""])[0]

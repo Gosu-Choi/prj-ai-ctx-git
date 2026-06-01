@@ -39,6 +39,11 @@
         </section>
 
         <section class="sidebar-section">
+          <div class="section-title">Map</div>
+          <button id="branchGraphButton" class="wide-button" type="button">Branch graph</button>
+        </section>
+
+        <section class="sidebar-section">
           <div class="section-title">Views</div>
           <div id="viewList" class="nav-list"></div>
         </section>
@@ -103,6 +108,7 @@
             <button class="tab" data-tab="report" type="button">Report</button>
             <button class="tab" data-tab="files" type="button">Files</button>
             <button class="tab" data-tab="archives" type="button">Archives</button>
+            <button class="tab" data-tab="graph" type="button">Graph</button>
             <button class="tab" data-tab="version" type="button">Version</button>
           </div>
         </header>
@@ -174,6 +180,16 @@
             <section id="archiveViewer" class="archive-viewer">
               <div class="muted">No archived source branch selected.</div>
             </section>
+          </div>
+        </section>
+
+        <section id="graphTab" class="tab-panel">
+          <div class="graph-layout">
+            <div class="graph-toolbar">
+              <div id="branchGraphStatus" class="settings-status"></div>
+              <button id="graphRefreshButton" type="button">Refresh</button>
+            </div>
+            <div id="branchGraph" class="branch-graph"></div>
           </div>
         </section>
 

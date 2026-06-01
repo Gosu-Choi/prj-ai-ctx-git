@@ -268,6 +268,28 @@ class CtxgitTest(unittest.TestCase):
             self.assertIn(alpha_turn["commit"], parents[1:])
             self.assertIn(beta_turn["commit"], parents[1:])
 
+    def test_branch_graph_simplifies_lineage_to_branch_nodes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("alpha")
+            store.append_history("alpha", "user", "alpha")
+            store.fork_branch_at_history("alpha", "beta", 0)
+            store.create_branch("gamma")
+            store.merge_branches(["beta", "gamma"], "merged", branch_summarizer=lambda _request: "summary")
+
+            graph = store.branch_graph_payload()
+            nodes = {node["id"]: node for node in graph["nodes"]}
+            edge_kinds = {(edge["source"], edge["target"], edge["kind"]) for edge in graph["edges"]}
+
+            self.assertIn("branch:alpha", nodes)
+            self.assertIn("branch:beta", nodes)
+            self.assertIn("branch:merged", nodes)
+            self.assertIn(("branch:alpha", "branch:beta", "fork"), edge_kinds)
+            self.assertIn(("branch:beta", "branch:merged", "merge"), edge_kinds)
+            self.assertIn(("branch:gamma", "branch:merged", "merge"), edge_kinds)
+            self.assertFalse(any(str(node["id"]).startswith("turn:") for node in graph["nodes"]))
+
     def test_delete_history_record_rewrites_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

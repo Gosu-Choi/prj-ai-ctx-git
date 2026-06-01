@@ -5,6 +5,7 @@ const state = {
   branches: [],
   views: [],
   globalized: [],
+  graph: null,
   payload: null,
   provider: null,
   serverProjects: [],
@@ -31,6 +32,7 @@ const els = {
   openServerProjectButton: document.querySelector("#openServerProjectButton"),
   serverProjectStatus: document.querySelector("#serverProjectStatus"),
   branchList: document.querySelector("#branchList"),
+  branchGraphButton: document.querySelector("#branchGraphButton"),
   viewList: document.querySelector("#viewList"),
   globalizedList: document.querySelector("#globalizedList"),
   gitSummary: document.querySelector("#gitSummary"),
@@ -74,6 +76,9 @@ const els = {
   filePreview: document.querySelector("#filePreview"),
   archiveList: document.querySelector("#archiveList"),
   archiveViewer: document.querySelector("#archiveViewer"),
+  graphRefreshButton: document.querySelector("#graphRefreshButton"),
+  branchGraphStatus: document.querySelector("#branchGraphStatus"),
+  branchGraph: document.querySelector("#branchGraph"),
   trackedFiles: document.querySelector("#trackedFiles"),
   historyLog: document.querySelector("#historyLog"),
   currentDiff: document.querySelector("#currentDiff"),
@@ -262,6 +267,7 @@ function clearWorkspace(message = "Select or initialize a ctxgit project.") {
   state.branches = [];
   state.views = [];
   state.globalized = [];
+  state.graph = null;
   state.payload = null;
   state.fileBrowser = { path: "", parent: "", entries: [] };
   renderBranches();
@@ -275,6 +281,8 @@ function clearWorkspace(message = "Select or initialize a ctxgit project.") {
   els.fileStatus.textContent = "";
   els.archiveList.innerHTML = "";
   els.archiveViewer.innerHTML = '<div class="muted">No archived source branch selected.</div>';
+  els.branchGraphStatus.textContent = "";
+  els.branchGraph.innerHTML = "";
   els.trackedFiles.innerHTML = "";
   els.historyLog.textContent = "";
   els.currentDiff.textContent = "";
@@ -601,6 +609,177 @@ function renderGlobalizedList() {
   els.globalizedList.querySelectorAll("[data-globalized]").forEach((button) => {
     button.addEventListener("click", () => loadGlobalizedArchive(button.dataset.globalized));
   });
+}
+
+function graphLabel(value, max = 24) {
+  const text = String(value || "");
+  return text.length > max ? `${text.slice(0, Math.max(0, max - 1))}…` : text;
+}
+
+function buildGraphLayout(payload) {
+  const nodeWidth = 190;
+  const nodeHeight = 64;
+  const columnGap = 112;
+  const rowGap = 92;
+  const margin = 40;
+  const nodes = Array.isArray(payload?.nodes) ? payload.nodes : [];
+  const edges = Array.isArray(payload?.edges) ? payload.edges : [];
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
+  const incoming = new Map();
+  edges.forEach((edge) => {
+    if (!nodeById.has(edge.source) || !nodeById.has(edge.target)) return;
+    if (!incoming.has(edge.target)) incoming.set(edge.target, []);
+    incoming.get(edge.target).push(edge.source);
+  });
+  const levels = new Map();
+  function levelFor(nodeId, stack = new Set()) {
+    if (levels.has(nodeId)) return levels.get(nodeId);
+    const node = nodeById.get(nodeId);
+    if (!node || node.kind === "root" || stack.has(nodeId)) {
+      levels.set(nodeId, 0);
+      return 0;
+    }
+    stack.add(nodeId);
+    const parents = incoming.get(nodeId) || [];
+    const level = parents.length ? Math.max(...parents.map((parent) => levelFor(parent, stack) + 1)) : 1;
+    stack.delete(nodeId);
+    levels.set(nodeId, level);
+    return level;
+  }
+  nodes.forEach((node) => levelFor(node.id));
+  const groups = new Map();
+  nodes.forEach((node) => {
+    const level = levels.get(node.id) || 0;
+    if (!groups.has(level)) groups.set(level, []);
+    groups.get(level).push(node);
+  });
+  groups.forEach((group) => {
+    group.sort((left, right) => {
+      if (left.kind === "root") return -1;
+      if (right.kind === "root") return 1;
+      const leftTime = Date.parse(left.createdAt || left.updatedAt || "") || 0;
+      const rightTime = Date.parse(right.createdAt || right.updatedAt || "") || 0;
+      if (leftTime !== rightTime) return leftTime - rightTime;
+      return String(left.label || left.id).localeCompare(String(right.label || right.id));
+    });
+  });
+  const positioned = new Map();
+  let maxLevel = 0;
+  let maxRows = 1;
+  groups.forEach((group, level) => {
+    maxLevel = Math.max(maxLevel, level);
+    maxRows = Math.max(maxRows, group.length);
+    group.forEach((node, index) => {
+      positioned.set(node.id, {
+        ...node,
+        x: margin + level * (nodeWidth + columnGap),
+        y: margin + index * rowGap,
+        width: nodeWidth,
+        height: nodeHeight,
+      });
+    });
+  });
+  return {
+    nodes: Array.from(positioned.values()),
+    edges: edges
+      .map((edge) => ({ ...edge, sourceNode: positioned.get(edge.source), targetNode: positioned.get(edge.target) }))
+      .filter((edge) => edge.sourceNode && edge.targetNode),
+    width: Math.max(900, margin * 2 + (maxLevel + 1) * nodeWidth + maxLevel * columnGap),
+    height: Math.max(520, margin * 2 + maxRows * nodeHeight + Math.max(0, maxRows - 1) * (rowGap - nodeHeight)),
+  };
+}
+
+function edgePath(edge) {
+  const source = edge.sourceNode;
+  const target = edge.targetNode;
+  const startX = source.x + source.width;
+  const startY = source.y + source.height / 2;
+  const endX = target.x;
+  const endY = target.y + target.height / 2;
+  const bend = Math.max(48, (endX - startX) / 2);
+  return `M ${startX} ${startY} C ${startX + bend} ${startY}, ${endX - bend} ${endY}, ${endX} ${endY}`;
+}
+
+function renderBranchGraph(payload) {
+  state.graph = payload;
+  const summary = payload?.summary || {};
+  els.branchGraphStatus.className = "settings-status";
+  els.branchGraphStatus.textContent = `${summary.activeBranches || 0} active · ${summary.archivedBranches || 0} archived · ${summary.mergeBranches || 0} merge · ${summary.globalizedArchives || 0} globalized`;
+  const layout = buildGraphLayout(payload);
+  if (!layout.nodes.length) {
+    els.branchGraph.innerHTML = '<div class="muted">No branch graph yet.</div>';
+    return;
+  }
+  const edgeMarkup = layout.edges
+    .map((edge) => {
+      const source = edge.sourceNode;
+      const target = edge.targetNode;
+      const labelX = (source.x + source.width + target.x) / 2;
+      const labelY = (source.y + target.y) / 2 + source.height / 2 - 6;
+      const label = edge.kind === "root" || edge.kind === "parent" ? "" : graphLabel(edge.label || edge.kind, 12);
+      return `
+        <g class="graph-edge graph-edge-${escapeHtml(edge.kind || "edge")}">
+          <path d="${edgePath(edge)}"></path>
+          ${label ? `<text x="${labelX}" y="${labelY}">${escapeHtml(label)}</text>` : ""}
+        </g>
+      `;
+    })
+    .join("");
+  const nodeMarkup = layout.nodes
+    .map((node) => {
+      const active = node.branchId === state.activeBranch || node.archiveId === state.activeGlobalized;
+      const canOpen = node.status !== "missing" && (node.branchId || node.archiveId);
+      const clickable = canOpen ? "clickable" : "";
+      const meta =
+        node.kind === "branch"
+          ? `${node.meta || ""}${node.shortHead ? ` · ${node.shortHead}` : ""}${Number.isFinite(node.historyCount) ? ` · ${node.historyCount} msg` : ""}`
+          : node.meta || "";
+      const data =
+        !canOpen
+          ? ""
+          : node.archiveId
+          ? `data-graph-archive="${escapeHtml(node.archiveId)}"`
+          : node.branchId
+          ? `data-graph-branch="${escapeHtml(node.branchId)}"`
+          : "";
+      return `
+        <g class="graph-node graph-node-${escapeHtml(node.kind || "node")} graph-status-${escapeHtml(node.status || "")} ${active ? "active" : ""} ${clickable}" transform="translate(${node.x}, ${node.y})" ${data}>
+          <title>${escapeHtml(`${node.title || node.label || node.id}\n${meta}`)}</title>
+          <rect width="${node.width}" height="${node.height}" rx="7"></rect>
+          <circle cx="16" cy="18" r="5"></circle>
+          <text class="graph-node-label" x="28" y="23">${escapeHtml(graphLabel(node.label || node.id, 23))}</text>
+          <text class="graph-node-meta" x="12" y="45">${escapeHtml(graphLabel(meta, 28))}</text>
+        </g>
+      `;
+    })
+    .join("");
+  els.branchGraph.innerHTML = `
+    <svg class="branch-graph-svg" viewBox="0 0 ${layout.width} ${layout.height}" role="img">
+      <defs>
+        <marker id="graphArrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+          <path d="M 0 0 L 10 4 L 0 8 z"></path>
+        </marker>
+      </defs>
+      ${edgeMarkup}
+      ${nodeMarkup}
+    </svg>
+  `;
+  els.branchGraph.querySelectorAll("[data-graph-branch]").forEach((node) => {
+    node.addEventListener("click", () => loadBranch(node.dataset.graphBranch));
+  });
+  els.branchGraph.querySelectorAll("[data-graph-archive]").forEach((node) => {
+    node.addEventListener("click", () => loadGlobalizedArchive(node.dataset.graphArchive));
+  });
+}
+
+async function loadBranchGraph() {
+  selectTab("graph");
+  els.activeTitle.textContent = "Branch graph";
+  els.activeMeta.textContent = "Simplified ctxgit lineage";
+  els.branchGraphStatus.className = "settings-status";
+  els.branchGraphStatus.textContent = "Loading graph...";
+  const payload = await api("/api/branch-graph");
+  renderBranchGraph(payload);
 }
 
 function closeBranchMenus() {
@@ -1736,7 +1915,30 @@ function selectTab(tab) {
 }
 
 document.querySelectorAll(".tab").forEach((button) => {
-  button.addEventListener("click", () => selectTab(button.dataset.tab));
+  button.addEventListener("click", () => {
+    if (button.dataset.tab === "graph") {
+      loadBranchGraph().catch((error) => {
+        els.branchGraphStatus.textContent = `Graph failed: ${error.message}`;
+        els.branchGraphStatus.className = "settings-status error";
+      });
+      return;
+    }
+    selectTab(button.dataset.tab);
+  });
+});
+
+els.branchGraphButton.addEventListener("click", () => {
+  loadBranchGraph().catch((error) => {
+    els.branchGraphStatus.textContent = `Graph failed: ${error.message}`;
+    els.branchGraphStatus.className = "settings-status error";
+  });
+});
+
+els.graphRefreshButton.addEventListener("click", () => {
+  loadBranchGraph().catch((error) => {
+    els.branchGraphStatus.textContent = `Graph failed: ${error.message}`;
+    els.branchGraphStatus.className = "settings-status error";
+  });
 });
 
 document.addEventListener("click", (event) => {
