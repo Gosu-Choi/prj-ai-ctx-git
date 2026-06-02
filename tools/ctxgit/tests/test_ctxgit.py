@@ -112,6 +112,25 @@ class CtxgitTest(unittest.TestCase):
             ctxgit.dump_json(root / "contexts" / "branches" / "alpha" / "branch.json", branch_meta)
             self.assertEqual(store.list_branches(), [])
 
+    def test_archive_branch_without_range_hides_branch_without_globalizing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("alpha")
+            store.append_history("alpha", "user", "first")
+
+            payload = store.archive_branch("alpha")
+
+            self.assertEqual(payload["id"], "alpha")
+            self.assertEqual(payload["mode"], "branch")
+            self.assertEqual(store.list_branches(), [])
+            self.assertEqual(store.list_globalized_archives(), [])
+            self.assertFalse((root / "contexts" / "globalized" / "alpha_globalized").exists())
+            branch_meta = ctxgit.load_json(root / "contexts" / "branches" / "alpha" / "branch.json")
+            self.assertEqual(branch_meta["archiveMode"], "branch")
+            self.assertIn("archivedAt", branch_meta)
+            self.assertNotIn("archivedAs", branch_meta)
+
     def test_server_project_registry_lists_and_resolves_server_projects(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             projects_root = Path(tmp) / "server-projects"

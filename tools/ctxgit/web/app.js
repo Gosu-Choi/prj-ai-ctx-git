@@ -1995,20 +1995,26 @@ async function removeBranch(branch) {
 
 async function archiveBranch(branch) {
   if (!branch) return;
-  const range = window.prompt(`Archive some range from ${branch}? Enter start,end message numbers:`, "1,1");
-  if (!range) return;
-  const parts = range
-    .split(/[,\s]+/)
-    .map((item) => Number.parseInt(item.trim(), 10))
-    .filter((item) => Number.isInteger(item));
-  if (parts.length !== 2) {
-    window.alert("Archive range must be two message numbers, like 2,5.");
-    return;
+  const range = window.prompt(`Archive ${branch}. Leave blank for archive only, or enter start,end to globalize a range:`, "");
+  if (range === null) return;
+  const body = { branch };
+  const trimmed = range.trim();
+  if (trimmed) {
+    const parts = trimmed
+      .split(/[,\s]+/)
+      .map((item) => Number.parseInt(item.trim(), 10))
+      .filter((item) => Number.isInteger(item));
+    if (parts.length !== 2) {
+      window.alert("Archive range must be blank, or two message numbers like 2,5.");
+      return;
+    }
+    body.start = parts[0];
+    body.end = parts[1];
   }
   try {
     const payload = await api("/api/branch/archive", {
       method: "POST",
-      body: JSON.stringify({ branch, start: parts[0], end: parts[1] }),
+      body: JSON.stringify(body),
     });
     state.globalized = payload.globalized || state.globalized;
     if (state.activeBranch === branch) {
@@ -2016,7 +2022,11 @@ async function archiveBranch(branch) {
       state.payload = null;
     }
     await refreshBranchNavigation();
-    await loadGlobalizedArchive(payload.archive?.id);
+    if (payload.archive?.id) {
+      await loadGlobalizedArchive(payload.archive.id);
+    } else {
+      await loadBranches();
+    }
   } catch (error) {
     window.alert(`Archive failed: ${error.message}`);
   }

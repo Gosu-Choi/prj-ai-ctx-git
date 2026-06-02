@@ -1495,6 +1495,29 @@ class ContextStore:
         self.touch_branch(safe_branch)
         return self.globalized_payload(archive_id)
 
+    def archive_branch(self, branch_id: str) -> dict[str, Any]:
+        self.require_initialized()
+        safe_branch = validate_id(branch_id, "branch")
+        paths = self.branch_paths(safe_branch)
+        if not paths.root.exists():
+            die(f"branch does not exist: {branch_id}")
+        created_at = utc_now()
+        branch_meta = load_json(paths.meta)
+        branch_meta["archivedAt"] = created_at
+        branch_meta["archiveMode"] = "branch"
+        branch_meta.pop("archivedAs", None)
+        branch_meta.pop("archivedRangeStart", None)
+        branch_meta.pop("archivedRangeEnd", None)
+        dump_json(paths.meta, branch_meta)
+        self.touch_branch(safe_branch)
+        return {
+            "id": safe_branch,
+            "title": branch_meta.get("title") or safe_branch,
+            "archivedAt": created_at,
+            "mode": "branch",
+            "path": relpath(self.root, paths.root),
+        }
+
     def ensure_initial_branch(self) -> bool:
         if self.branch_paths(INITIAL_BRANCH_ID).meta.exists():
             return False
@@ -7156,24 +7179,35 @@ def make_handler(
                 return
             if parsed.path == "/api/branch/archive":
                 branch_id = str(body.get("branch") or "")
+                start_raw = body.get("start")
+                end_raw = body.get("end")
+                has_range = bool(str(start_raw or "").strip() or str(end_raw or "").strip())
                 try:
-                    start = int(body.get("start"))
-                    end = int(body.get("end"))
+                    start = int(start_raw) if has_range else 0
+                    end = int(end_raw) if has_range else 0
                 except (TypeError, ValueError):
-                    self.send_json({"error": "invalid_archive_range", "message": "archive range is required"}, status=400)
+                    self.send_json({"error": "invalid_archive_range", "message": "archive range must be two message numbers"}, status=400)
                     return
                 try:
-                    archive = store.archive_branch_range(branch_id, start, end)
+                    archive = store.archive_branch_range(branch_id, start, end) if has_range else None
+                    branch_archive = None if has_range else store.archive_branch(branch_id)
                     payload = branch_payload(store, branch_id)
                     payload["archive"] = archive
+                    payload["branchArchive"] = branch_archive
                     payload["globalized"] = store.list_globalized_archives()
                     payload["turnCommit"] = internal_git_commit_turn(
                         store,
                         kind="branch-archive",
                         actor="user",
-                        summary=f"Archive {branch_id} messages {start}-{end}",
+                        summary=f"Archive {branch_id} messages {start}-{end}" if has_range else f"Archive branch {branch_id}",
                         branch_id=branch_id,
-                        metadata={"branch": branch_id, "start": start, "end": end, "archive": archive.get("meta", {})},
+                        metadata={
+                            "branch": branch_id,
+                            "mode": "range-globalize" if has_range else "branch",
+                            "start": start if has_range else None,
+                            "end": end if has_range else None,
+                            "archive": archive.get("meta", {}) if archive else branch_archive,
+                        },
                     )
                     self.send_json(payload)
                 except ValueError as exc:
