@@ -1627,6 +1627,13 @@ function renderBranch(payload) {
                     >Fork here</button>
                     <button
                       class="danger"
+                      data-history-cut="${index}"
+                      data-history-created-at="${escapeHtml(message.createdAt || "")}"
+                      data-history-role="${escapeHtml(message.role || "")}"
+                      type="button"
+                    >Cut here</button>
+                    <button
+                      class="danger"
                       data-history-delete="${index}"
                       data-history-created-at="${escapeHtml(message.createdAt || "")}"
                       data-history-role="${escapeHtml(message.role || "")}"
@@ -1660,6 +1667,13 @@ function renderBranch(payload) {
       event.stopPropagation();
       closeMessageMenus();
       forkHistoryMessage(button);
+    });
+  });
+  els.messageList.querySelectorAll("[data-history-cut]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      closeMessageMenus();
+      cutHistoryMessage(button);
     });
   });
   els.messageList.querySelectorAll("[data-history-delete]").forEach((button) => {
@@ -1949,6 +1963,41 @@ async function deleteHistoryMessage(button) {
     }
   } catch (error) {
     window.alert(`Delete failed: ${error.message}`);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function cutHistoryMessage(button) {
+  if (!state.activeBranch) return;
+  const index = Number.parseInt(button.dataset.historyCut || "", 10);
+  if (!Number.isInteger(index)) return;
+  const branch = state.activeBranch;
+  if (
+    !window.confirm(
+      `Cut ${branch} after message ${index + 1}?\n\nThis rewinds branch history and context to that internal ctxgit snapshot. Messages and context after it will disappear from this branch.`,
+    )
+  ) {
+    return;
+  }
+  button.disabled = true;
+  try {
+    const payload = await api("/api/history/cut", {
+      method: "POST",
+      body: JSON.stringify({
+        branch,
+        index,
+        createdAt: button.dataset.historyCreatedAt || "",
+        role: button.dataset.historyRole || "",
+      }),
+    });
+    if (state.activeBranch === branch) {
+      renderBranch(payload);
+      renderGit(await api("/api/git/status"));
+      await refreshBranchNavigation();
+    }
+  } catch (error) {
+    window.alert(`Cut failed: ${error.message}`);
   } finally {
     button.disabled = false;
   }

@@ -792,6 +792,80 @@ class CtxgitTest(unittest.TestCase):
             self.assertEqual(meta["forkedFromCommit"], first_commit["commit"])
             self.assertEqual(meta["forkedSnapshot"], "internal-git")
 
+    def test_cut_branch_restores_history_and_context_to_turn_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("source", title="Source")
+            first_turn = "turn_20260101T000000000000Z"
+            second_turn = "turn_20260101T000001000000Z"
+            first = store.append_history("source", "user", "First", extra={"turnId": first_turn})
+            ctxgit.write_text(root / "contexts" / "branches" / "source" / "context.md", "# Source\n\nAt first.\n")
+            store.add_note("source", "Old Note", "Old body")
+            first_commit = ctxgit.internal_git_commit_turn(
+                store,
+                kind="chat",
+                actor="user+agent",
+                summary="first turn",
+                branch_id="source",
+                turn_id=first_turn,
+            )
+
+            store.append_history("source", "assistant", "Second", extra={"turnId": second_turn})
+            ctxgit.write_text(root / "contexts" / "branches" / "source" / "context.md", "# Source\n\nLater context.\n")
+            store.add_note("source", "New Note", "New body")
+            second_commit = ctxgit.internal_git_commit_turn(
+                store,
+                kind="chat",
+                actor="user+agent",
+                summary="second turn",
+                branch_id="source",
+                turn_id=second_turn,
+            )
+
+            cut = store.cut_branch_at_history(
+                "source",
+                0,
+                expected_created_at=first["createdAt"],
+                expected_role=first["role"],
+            )
+
+            branch_root = root / "contexts" / "branches" / "source"
+            self.assertEqual([item["text"] for item in store.iter_history("source")], ["First"])
+            self.assertEqual((branch_root / "context.md").read_text(encoding="utf-8"), "# Source\n\nAt first.\n")
+            note_text = "\n".join(path.read_text(encoding="utf-8") for path in (branch_root / "notes").glob("*.md"))
+            self.assertIn("Old body", note_text)
+            self.assertNotIn("New body", note_text)
+            self.assertEqual(cut["turnId"], first_turn)
+            self.assertEqual(cut["commit"], first_commit["commit"])
+            self.assertEqual(ctxgit.internal_git_rev_parse(root, ctxgit.ctxgit_branch_ref("source")), first_commit["commit"])
+            self.assertEqual(ctxgit.internal_git_rev_parse(root, "HEAD"), second_commit["commit"])
+
+    def test_cut_branch_rejects_mid_turn_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("source")
+            turn_id = "turn_20260101T000000000000Z"
+            first = store.append_history("source", "user", "Question", extra={"turnId": turn_id})
+            store.append_history("source", "assistant", "Answer", extra={"turnId": turn_id})
+            ctxgit.internal_git_commit_turn(
+                store,
+                kind="chat",
+                actor="user+agent",
+                summary="one full turn",
+                branch_id="source",
+                turn_id=turn_id,
+            )
+
+            with self.assertRaises(ValueError):
+                store.cut_branch_at_history(
+                    "source",
+                    0,
+                    expected_created_at=first["createdAt"],
+                    expected_role=first["role"],
+                )
+
     def test_fork_branch_rejects_stale_history_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

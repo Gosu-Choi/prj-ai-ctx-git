@@ -1314,6 +1314,86 @@ class ContextStore:
             shutil.copytree(extracted_source, target_paths.root)
             return True
 
+    def restore_existing_branch_from_internal_commit(self, branch_id: str, commit: str) -> bool:
+        if not commit:
+            return False
+        paths = self.branch_paths(branch_id)
+        source_rel = relpath(self.root, paths.root)
+        completed = subprocess.run(
+            ["git", f"--git-dir={internal_git_dir(self.root)}", "archive", "--format=tar", commit, source_rel],
+            cwd=self.root,
+            text=False,
+            capture_output=True,
+        )
+        if completed.returncode != 0 or not completed.stdout:
+            return False
+        with tempfile.TemporaryDirectory(prefix="ctxgit-cut-") as tmp:
+            tmp_path = Path(tmp).resolve()
+            with tarfile.open(fileobj=io.BytesIO(completed.stdout), mode="r:") as archive:
+                for member in archive:
+                    target = (tmp_path / member.name).resolve()
+                    if not path_is_within(tmp_path, target):
+                        raise ValueError("internal git archive contains an unsafe path")
+                    if member.isdir():
+                        target.mkdir(parents=True, exist_ok=True)
+                    elif member.isfile():
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        extracted = archive.extractfile(member)
+                        if extracted is None:
+                            continue
+                        target.write_bytes(extracted.read())
+                        try:
+                            os.chmod(target, member.mode & 0o777)
+                        except OSError:
+                            pass
+            extracted_source = tmp_path / source_rel
+            if not extracted_source.exists():
+                return False
+            if paths.root.exists():
+                shutil.rmtree(paths.root)
+            shutil.copytree(extracted_source, paths.root)
+            return True
+
+    def cut_branch_at_history(
+        self,
+        branch_id: str,
+        index: int,
+        expected_created_at: str = "",
+        expected_role: str = "",
+    ) -> dict[str, Any]:
+        self.require_initialized()
+        paths = self.branch_paths(branch_id)
+        if not paths.root.exists():
+            die(f"branch does not exist: {branch_id}")
+        records = self.read_history_file(paths.history)
+        if index < 0 or index >= len(records):
+            raise ValueError(f"history record index out of range: {index}")
+        record = records[index]
+        if expected_created_at and str(record.get("createdAt") or "") != expected_created_at:
+            raise ValueError("history record changed before cut; refresh and try again")
+        if expected_role and str(record.get("role") or "") != expected_role:
+            raise ValueError("history record changed before cut; refresh and try again")
+        selected_turn_id = str(record.get("turnId") or "").strip()
+        if selected_turn_id and any(str(item.get("turnId") or "").strip() == selected_turn_id for item in records[index + 1 :]):
+            raise ValueError("cut point is inside a multi-message turn; choose the final message of that turn")
+        snapshot_turn_id = self.completed_turn_id_for_history_index(records, index)
+        snapshot_commit = internal_git_rev_parse(self.root, ctxgit_turn_ref(snapshot_turn_id)) if snapshot_turn_id else ""
+        if not snapshot_commit:
+            raise ValueError("no internal ctxgit snapshot exists for this cut point")
+        if not self.restore_existing_branch_from_internal_commit(branch_id, snapshot_commit):
+            raise ValueError("could not restore branch files from internal ctxgit snapshot")
+        with internal_git_lock(self.root):
+            ensure_internal_git(self.root)
+            run_internal_git(self.root, ["update-ref", ctxgit_branch_ref(branch_id), snapshot_commit], check=True)
+        return {
+            "branch": branch_id,
+            "index": index,
+            "createdAt": record.get("createdAt"),
+            "role": record.get("role"),
+            "turnId": snapshot_turn_id,
+            "commit": snapshot_commit,
+        }
+
     def fork_branch_at_history(
         self,
         source_id: str,
@@ -7298,6 +7378,30 @@ def make_handler(
                     self.send_json({"error": "delete_failed", "message": str(exc)}, status=409)
                 except SystemExit as exc:
                     self.send_json({"error": "delete_failed"}, status=int(exc.code or 400))
+                return
+            if parsed.path == "/api/history/cut":
+                branch_id = str(body.get("branch") or "")
+                try:
+                    index = int(body.get("index"))
+                except (TypeError, ValueError):
+                    self.send_json({"error": "invalid_history_index", "message": "history index is required"}, status=400)
+                    return
+                expected_created_at = str(body.get("createdAt") or "")
+                expected_role = str(body.get("role") or "")
+                try:
+                    cut = store.cut_branch_at_history(
+                        branch_id,
+                        index,
+                        expected_created_at=expected_created_at,
+                        expected_role=expected_role,
+                    )
+                    payload = branch_payload(store, branch_id)
+                    payload["cut"] = cut
+                    self.send_json(payload)
+                except ValueError as exc:
+                    self.send_json({"error": "cut_failed", "message": str(exc)}, status=409)
+                except SystemExit as exc:
+                    self.send_json({"error": "cut_failed"}, status=int(exc.code or 400))
                 return
             if parsed.path == "/api/history/fork":
                 branch_id = str(body.get("branch") or "")
