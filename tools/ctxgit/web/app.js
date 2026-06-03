@@ -1317,6 +1317,39 @@ function hideProgressSoon() {
   }, 900);
 }
 
+function appendPendingUserMessage({ branch, text, mode }) {
+  if (state.activeBranch !== branch) return "";
+  const pendingId = `pending-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const historyCount = Array.isArray(state.payload?.history) ? state.payload.history.length : 0;
+  const number = historyCount + els.messageList.querySelectorAll(".message.pending-message").length + 1;
+  if (els.messageList.querySelector(".muted")) {
+    els.messageList.innerHTML = "";
+  }
+  els.messageList.insertAdjacentHTML(
+    "beforeend",
+    `
+      <article class="message pending-message" data-pending-message="${escapeHtml(pendingId)}">
+        <div class="message-header">
+          <span class="message-role">user</span>
+          <span class="message-meta-actions">
+            <span class="message-number">${number}</span>
+            <span>${escapeHtml(new Date().toISOString())}</span>
+            <span class="pending-label">${escapeHtml(mode === "research" ? "research queued" : mode === "info-chat" ? "info queued" : "sending")}</span>
+          </span>
+        </div>
+        <div class="message-text">${renderMessageText(text)}</div>
+      </article>
+    `,
+  );
+  scrollChatToBottom();
+  return pendingId;
+}
+
+function removePendingUserMessage(pendingId) {
+  if (!pendingId) return;
+  els.messageList.querySelector(`[data-pending-message="${pendingId}"]`)?.remove();
+}
+
 function rememberJob(job, meta = {}) {
   if (!job || !job.id) return job;
   const previous = state.jobs[job.id] || {};
@@ -2274,6 +2307,7 @@ async function sendComposerMessage({ mode }) {
   markBranchActivity(branch);
   updateComposerState();
   renderBranches();
+  const pendingMessageId = appendPendingUserMessage({ branch, text, mode: requestedMode });
   try {
     if (isResearch) {
       await startTrackedJob(
@@ -2305,6 +2339,7 @@ async function sendComposerMessage({ mode }) {
       return;
     }
   } catch (error) {
+    removePendingUserMessage(pendingMessageId);
     const isTimeout = error instanceof ApiError && error.payload?.error === "timeout";
     const isMissingJob = error instanceof ApiError && error.payload?.error === "job_not_found";
     const prefix = isTimeout ? "시간 초과" : isMissingJob ? "중단됨" : isResearch ? "리서치 실패" : "채팅 실패";

@@ -512,6 +512,17 @@ textarea {
   padding: 12px;
 }
 
+.pending-message {
+  border-style: dashed;
+  background: #fbfbf8;
+}
+
+.pending-label {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
 .message-header {
   display: flex;
   justify-content: space-between;
