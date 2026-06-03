@@ -1381,6 +1381,17 @@ function activeBranchRunningJob(branch = state.activeBranch) {
   return job?.status === "running" ? job : null;
 }
 
+function resizeMessageInput() {
+  const input = els.messageInput;
+  if (!input) return;
+  const maxHeight = Number.parseFloat(window.getComputedStyle(input).maxHeight);
+  input.style.height = "auto";
+  const nextHeight = Number.isFinite(maxHeight)
+    ? Math.min(input.scrollHeight, maxHeight)
+    : input.scrollHeight;
+  input.style.height = `${nextHeight}px`;
+}
+
 function updateComposerState() {
   const running = activeBranchRunningJob();
   const startingMode = state.activeBranch ? state.startingBranches[state.activeBranch] : "";
@@ -2316,6 +2327,7 @@ async function sendComposerMessage({ mode }) {
         { branch, mode: "research", title: "리서치 시작 중" },
       );
       els.messageInput.value = "";
+      resizeMessageInput();
       return;
     }
     if (isChat) {
@@ -2326,6 +2338,7 @@ async function sendComposerMessage({ mode }) {
         { branch, mode: "chat", title: "채팅 턴 시작 중" },
       );
       els.messageInput.value = "";
+      resizeMessageInput();
       return;
     }
     if (isInfoChat) {
@@ -2336,6 +2349,7 @@ async function sendComposerMessage({ mode }) {
         { branch, mode: "info-chat", title: "정보 챗 시작 중" },
       );
       els.messageInput.value = "";
+      resizeMessageInput();
       return;
     }
   } catch (error) {
@@ -2368,6 +2382,9 @@ els.messageInput.addEventListener("keydown", async (event) => {
   event.preventDefault();
   await sendComposerMessage({ mode: "info-chat" });
 });
+
+els.messageInput.addEventListener("input", resizeMessageInput);
+resizeMessageInput();
 
 els.copyEventLogButton.addEventListener("click", copyEventLog);
 

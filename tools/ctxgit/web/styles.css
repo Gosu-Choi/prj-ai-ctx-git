@@ -633,10 +633,14 @@ textarea {
 }
 
 .composer textarea {
+  min-height: 72px;
+  max-height: 216px;
   border: 1px solid var(--line);
   border-radius: 6px;
   padding: 8px;
   background: #ffffff;
+  overflow-y: auto;
+  resize: vertical;
 }
 
 .composer button {
