@@ -74,6 +74,7 @@ const els = {
   progressPanel: document.querySelector("#progressPanel"),
   progressTitle: document.querySelector("#progressTitle"),
   progressEvents: document.querySelector("#progressEvents"),
+  chatError: document.querySelector("#chatError"),
   eventPanel: document.querySelector("#eventPanel"),
   eventStatus: document.querySelector("#eventStatus"),
   copyEventLogButton: document.querySelector("#copyEventLogButton"),
@@ -322,8 +323,134 @@ function renderProjectFileLinks(text) {
   );
 }
 
+function safeMarkdownHref(href) {
+  const value = String(href || "").trim();
+  if (/^(https?:|mailto:)/i.test(value)) return escapeHtml(value);
+  return "";
+}
+
+function renderChatEmphasis(text) {
+  return escapeHtml(text)
+    .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
+}
+
+function renderChatInlineNoCode(text) {
+  const pattern =
+    /\[([^\]\n]+)\]\(([^)\s]+)\)|(^|[\s(`])((?:contexts|\.ctxgit)\/[^\s<>"'`)]*\.(?:md|txt|json|jsonl|pdf|csv|tsv|html?))/g;
+  let html = "";
+  let lastIndex = 0;
+  for (const match of text.matchAll(pattern)) {
+    html += renderChatEmphasis(text.slice(lastIndex, match.index));
+    if (match[1] !== undefined) {
+      const href = safeMarkdownHref(match[2]);
+      html += href
+        ? `<a href="${href}" target="_blank" rel="noreferrer">${renderChatEmphasis(match[1])}</a>`
+        : renderChatEmphasis(match[0]);
+    } else {
+      const prefix = match[3] || "";
+      const path = match[4] || "";
+      html += `${renderChatEmphasis(prefix)}<a class="file-link" href="${escapeHtml(obsidianFileUrl(path))}" title="Open in Obsidian">${escapeHtml(path)}</a>`;
+    }
+    lastIndex = (match.index || 0) + match[0].length;
+  }
+  html += renderChatEmphasis(text.slice(lastIndex));
+  return html;
+}
+
+function renderChatInline(text) {
+  return String(text || "")
+    .split(/(`[^`\n]+`)/g)
+    .map((part) => {
+      if (part.startsWith("`") && part.endsWith("`")) {
+        return `<code>${escapeHtml(part.slice(1, -1))}</code>`;
+      }
+      return renderChatInlineNoCode(part);
+    })
+    .join("");
+}
+
 function renderMessageText(text) {
-  return renderProjectFileLinks(text);
+  const lines = String(text || "").replace(/\r\n?/g, "\n").split("\n");
+  const html = [];
+  let listType = "";
+  let inFence = false;
+  let fenceLines = [];
+
+  const closeList = () => {
+    if (!listType) return;
+    html.push(`</${listType}>`);
+    listType = "";
+  };
+  const openList = (type) => {
+    if (listType === type) return;
+    closeList();
+    html.push(`<${type}>`);
+    listType = type;
+  };
+  const closeFence = () => {
+    html.push(`<pre><code>${escapeHtml(fenceLines.join("\n"))}</code></pre>`);
+    fenceLines = [];
+    inFence = false;
+  };
+
+  for (const line of lines) {
+    if (/^```/.test(line.trim())) {
+      if (inFence) {
+        closeFence();
+      } else {
+        closeList();
+        inFence = true;
+        fenceLines = [];
+      }
+      continue;
+    }
+    if (inFence) {
+      fenceLines.push(line);
+      continue;
+    }
+
+    const trimmed = line.trim();
+    if (!trimmed) {
+      closeList();
+      continue;
+    }
+
+    const heading = line.match(/^(#{1,4})\s+(.*)$/);
+    if (heading) {
+      closeList();
+      const level = heading[1].length;
+      html.push(`<h${level}>${renderChatInline(heading[2])}</h${level}>`);
+      continue;
+    }
+
+    const unordered = line.match(/^\s*[-*]\s+(.*)$/);
+    if (unordered) {
+      openList("ul");
+      html.push(`<li>${renderChatInline(unordered[1])}</li>`);
+      continue;
+    }
+
+    const ordered = line.match(/^\s*\d+\.\s+(.*)$/);
+    if (ordered) {
+      openList("ol");
+      html.push(`<li>${renderChatInline(ordered[1])}</li>`);
+      continue;
+    }
+
+    const quote = line.match(/^\s*>\s?(.*)$/);
+    if (quote) {
+      closeList();
+      html.push(`<blockquote>${renderChatInline(quote[1])}</blockquote>`);
+      continue;
+    }
+
+    closeList();
+    html.push(`<p>${renderChatInline(line)}</p>`);
+  }
+  if (inFence) closeFence();
+  closeList();
+  return html.join("\n");
 }
 
 function renderMarkdown(markdown) {
@@ -411,9 +538,10 @@ function clearWorkspace(message = "Select or initialize a ctxgit project.") {
   state.payload = null;
   state.fileBrowser = { path: "", parent: "", entries: [] };
   renderBranches();
+  hideChatError();
   els.activeTitle.textContent = "No project selected";
   els.activeMeta.textContent = message;
-  els.messageList.innerHTML = `<div class="muted">${escapeHtml(message)}</div>`;
+  replaceMessageListHtml(`<div class="muted">${escapeHtml(message)}</div>`);
   els.reportView.innerHTML = "";
   els.filePathInput.value = "";
   els.fileList.innerHTML = "";
@@ -1179,7 +1307,29 @@ function scrollChatToBottom() {
   });
 }
 
+function attachProgressPanel() {
+  if (!els.progressPanel || !els.messageList) return;
+  if (els.progressPanel.parentElement !== els.messageList) {
+    els.messageList.appendChild(els.progressPanel);
+  }
+}
+
+function replaceMessageListHtml(html) {
+  els.messageList.innerHTML = html;
+  attachProgressPanel();
+}
+
+function appendMessageListHtml(html) {
+  attachProgressPanel();
+  if (els.progressPanel.parentElement === els.messageList) {
+    els.progressPanel.insertAdjacentHTML("beforebegin", html);
+  } else {
+    els.messageList.insertAdjacentHTML("beforeend", html);
+  }
+}
+
 function showProgress(title) {
+  attachProgressPanel();
   els.progressPanel.hidden = false;
   els.progressTitle.textContent = title;
   els.progressEvents.innerHTML = "";
@@ -1187,6 +1337,8 @@ function showProgress(title) {
 }
 
 function updateProgress(job) {
+  attachProgressPanel();
+  els.progressPanel.hidden = false;
   const events = Array.isArray(job.events) ? job.events.slice(-5) : [];
   const latest = events.length ? events[events.length - 1].message : job.status || "Working";
   els.progressTitle.textContent =
@@ -1200,6 +1352,20 @@ function hideProgress() {
   els.progressPanel.hidden = true;
   els.progressTitle.textContent = "";
   els.progressEvents.innerHTML = "";
+}
+
+function showChatError(message) {
+  if (!els.chatError) return;
+  document.querySelectorAll(".chat-main > .error-banner:not(#chatError)").forEach((item) => item.remove());
+  els.chatError.textContent = message || "작업 실패";
+  els.chatError.hidden = false;
+}
+
+function hideChatError() {
+  if (!els.chatError) return;
+  els.chatError.hidden = true;
+  els.chatError.textContent = "";
+  document.querySelectorAll(".chat-main > .error-banner:not(#chatError)").forEach((item) => item.remove());
 }
 
 function isEventListNearBottom() {
@@ -1323,10 +1489,9 @@ function appendPendingUserMessage({ branch, text, mode }) {
   const historyCount = Array.isArray(state.payload?.history) ? state.payload.history.length : 0;
   const number = historyCount + els.messageList.querySelectorAll(".message.pending-message").length + 1;
   if (els.messageList.querySelector(".muted")) {
-    els.messageList.innerHTML = "";
+    replaceMessageListHtml("");
   }
-  els.messageList.insertAdjacentHTML(
-    "beforeend",
+  appendMessageListHtml(
     `
       <article class="message pending-message" data-pending-message="${escapeHtml(pendingId)}">
         <div class="message-header">
@@ -1416,6 +1581,7 @@ function renderActiveBranchJob() {
   renderEventPanel(job);
   if (job.status === "running") {
     updateProgress(job);
+    scrollChatToBottom();
   } else {
     hideProgress();
   }
@@ -1470,10 +1636,7 @@ function handleMonitorError(job, error) {
   );
   if (state.activeBranch === failed.branch) {
     renderEventPanel(failed);
-    els.messageList.insertAdjacentHTML(
-      "beforebegin",
-      `<div class="error-banner">작업 모니터링 실패: ${escapeHtml(failed.message)}</div>`,
-    );
+    showChatError(`작업 모니터링 실패: ${failed.message}`);
     hideProgress();
   }
   updateComposerState();
@@ -1580,10 +1743,7 @@ async function monitorTrackedJob(jobId) {
       renderBranches();
       if (state.activeBranch === branch) {
         const prefix = remembered.error === "timeout" ? "시간 초과" : remembered.error === "job_not_found" ? "중단됨" : remembered.mode === "research" ? "리서치 실패" : remembered.mode === "merge" ? "머지 실패" : "채팅 실패";
-        els.messageList.insertAdjacentHTML(
-          "beforebegin",
-          `<div class="error-banner">${prefix}: ${escapeHtml(remembered.message || "작업 실패")}</div>`,
-        );
+        showChatError(`${prefix}: ${remembered.message || "작업 실패"}`);
         hideProgress();
       }
       updateComposerState();
@@ -1595,12 +1755,13 @@ async function monitorTrackedJob(jobId) {
 }
 
 function renderBranch(payload) {
+  hideChatError();
   state.payload = payload;
   const meta = payload.meta;
   els.activeTitle.textContent = meta.title || meta.id;
   els.activeMeta.textContent = `${meta.id} · history.jsonl is Git-tracked conversation history`;
 
-  els.messageList.innerHTML =
+  replaceMessageListHtml(
     payload.history
       .map(
         (message, index) => `
@@ -1649,7 +1810,8 @@ function renderBranch(payload) {
           </article>
         `,
       )
-      .join("") || '<div class="muted">No messages yet.</div>';
+      .join("") || '<div class="muted">No messages yet.</div>',
+  );
   els.messageList.querySelectorAll("[data-approval]").forEach((button) => {
     button.addEventListener("click", () => decideApproval(button));
   });
@@ -1766,7 +1928,7 @@ async function loadBranches() {
   } else {
     els.activeTitle.textContent = "No branch selected";
     els.activeMeta.textContent = "Create a branch from the terminal with ctxgit branch <id>.";
-    els.messageList.innerHTML = '<div class="muted">No messages yet.</div>';
+    replaceMessageListHtml('<div class="muted">No messages yet.</div>');
   }
 }
 
@@ -2355,6 +2517,7 @@ async function sendComposerMessage({ mode }) {
   const branch = state.activeBranch;
   const text = els.messageInput.value.trim();
   if (!text) return;
+  hideChatError();
   const isChat = mode === "chat";
   const isResearch = mode === "research";
   const isInfoChat = mode === "info-chat";
@@ -2407,10 +2570,7 @@ async function sendComposerMessage({ mode }) {
     const isMissingJob = error instanceof ApiError && error.payload?.error === "job_not_found";
     const prefix = isTimeout ? "시간 초과" : isMissingJob ? "중단됨" : isResearch ? "리서치 실패" : "채팅 실패";
     if (state.activeBranch === branch) {
-      els.messageList.insertAdjacentHTML(
-        "beforebegin",
-        `<div class="error-banner">${prefix}: ${escapeHtml(error.message)}</div>`,
-      );
+      showChatError(`${prefix}: ${error.message}`);
       hideProgress();
     } else {
       window.alert(`${prefix} on ${branch}: ${error.message}`);
