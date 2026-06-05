@@ -295,9 +295,15 @@ function formatDuration(seconds) {
 }
 
 function renderInline(text) {
-  return escapeHtml(text)
-    .replace(/`([^`]+)`/g, "<code>$1</code>")
-    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+  return String(text || "")
+    .split(/(`[^`\n]+`)/g)
+    .map((part) => {
+      if (part.startsWith("`") && part.endsWith("`")) {
+        return renderCodeSpan(part.slice(1, -1));
+      }
+      return renderMarkdownInlineNoCode(part);
+    })
+    .join("");
 }
 
 function projectAbsolutePath(path) {
@@ -314,12 +320,34 @@ function obsidianFileUrl(path) {
   return `obsidian://open?path=${encodeURIComponent(absolutePath)}&paneType=tab`;
 }
 
+function isProjectFilePath(path) {
+  const value = String(path || "");
+  if (!/^(?:contexts|\.ctxgit)\/[^\s<>"'`)]*\.(?:md|txt|json|jsonl|pdf|csv|tsv|html?)$/.test(value)) {
+    return false;
+  }
+  if (/[\\]/.test(value)) return false;
+  return !value.split("/").some((part) => part === "" || part === "." || part === ".." || part === "~");
+}
+
+function renderProjectFileLink(path, labelHtml = escapeHtml(path)) {
+  if (!state.project?.path || !isProjectFilePath(path)) return labelHtml;
+  return `<a class="file-link" href="${escapeHtml(obsidianFileUrl(path))}" title="Open in Obsidian">${labelHtml}</a>`;
+}
+
+function renderCodeSpan(text) {
+  const value = String(text || "");
+  if (isProjectFilePath(value)) {
+    return renderProjectFileLink(value, `<code>${escapeHtml(value)}</code>`);
+  }
+  return `<code>${escapeHtml(value)}</code>`;
+}
+
 function renderProjectFileLinks(text) {
   const escaped = escapeHtml(text);
   return escaped.replace(
     /(^|[\s(`])((?:contexts|\.ctxgit)\/[^\s<>"'`)]*\.(?:md|txt|json|jsonl|pdf|csv|tsv|html?))/g,
     (_match, prefix, path) =>
-      `${prefix}<a class="file-link" href="${escapeHtml(obsidianFileUrl(path))}" title="Open in Obsidian">${path}</a>`,
+      `${prefix}${renderProjectFileLink(path, path)}`,
   );
 }
 
@@ -327,6 +355,33 @@ function safeMarkdownHref(href) {
   const value = String(href || "").trim();
   if (/^(https?:|mailto:)/i.test(value)) return escapeHtml(value);
   return "";
+}
+
+function linkTargetAttrs() {
+  return 'target="_blank" rel="noopener noreferrer"';
+}
+
+function renderMarkdownInlineNoCode(text) {
+  const pattern = /\[([^\]\n]+)\]\(([^)\s]+)\)|(^|[\s(])((?:https?:\/\/|mailto:)[^\s<>"'`]+[^\s<>"'`.,;:!?)]?)/g;
+  let html = "";
+  let lastIndex = 0;
+  for (const match of text.matchAll(pattern)) {
+    html += escapeHtml(text.slice(lastIndex, match.index));
+    if (match[1] !== undefined) {
+      const href = safeMarkdownHref(match[2]);
+      html += href
+        ? `<a href="${href}" ${linkTargetAttrs()}>${escapeHtml(match[1])}</a>`
+        : escapeHtml(match[0]);
+    } else {
+      const prefix = match[3] || "";
+      const url = match[4] || "";
+      const href = safeMarkdownHref(url);
+      html += `${escapeHtml(prefix)}${href ? `<a href="${href}" ${linkTargetAttrs()}>${escapeHtml(url)}</a>` : escapeHtml(url)}`;
+    }
+    lastIndex = (match.index || 0) + match[0].length;
+  }
+  html += escapeHtml(text.slice(lastIndex));
+  return html;
 }
 
 function renderChatEmphasis(text) {
@@ -337,7 +392,7 @@ function renderChatEmphasis(text) {
 
 function renderChatInlineNoCode(text) {
   const pattern =
-    /\[([^\]\n]+)\]\(([^)\s]+)\)|(^|[\s(`])((?:contexts|\.ctxgit)\/[^\s<>"'`)]*\.(?:md|txt|json|jsonl|pdf|csv|tsv|html?))/g;
+    /\[([^\]\n]+)\]\(([^)\s]+)\)|(^|[\s(`])((?:contexts|\.ctxgit)\/[^\s<>"'`)]*\.(?:md|txt|json|jsonl|pdf|csv|tsv|html?))|(^|[\s(])((?:https?:\/\/|mailto:)[^\s<>"'`]+[^\s<>"'`.,;:!?)]?)/g;
   let html = "";
   let lastIndex = 0;
   for (const match of text.matchAll(pattern)) {
@@ -345,12 +400,17 @@ function renderChatInlineNoCode(text) {
     if (match[1] !== undefined) {
       const href = safeMarkdownHref(match[2]);
       html += href
-        ? `<a href="${href}" target="_blank" rel="noreferrer">${renderChatEmphasis(match[1])}</a>`
+        ? `<a href="${href}" ${linkTargetAttrs()}>${renderChatEmphasis(match[1])}</a>`
         : renderChatEmphasis(match[0]);
-    } else {
+    } else if (match[4] !== undefined) {
       const prefix = match[3] || "";
       const path = match[4] || "";
-      html += `${renderChatEmphasis(prefix)}<a class="file-link" href="${escapeHtml(obsidianFileUrl(path))}" title="Open in Obsidian">${escapeHtml(path)}</a>`;
+      html += `${renderChatEmphasis(prefix)}${renderProjectFileLink(path)}`;
+    } else {
+      const prefix = match[5] || "";
+      const url = match[6] || "";
+      const href = safeMarkdownHref(url);
+      html += `${renderChatEmphasis(prefix)}${href ? `<a href="${href}" ${linkTargetAttrs()}>${escapeHtml(url)}</a>` : renderChatEmphasis(url)}`;
     }
     lastIndex = (match.index || 0) + match[0].length;
   }
@@ -363,7 +423,7 @@ function renderChatInline(text) {
     .split(/(`[^`\n]+`)/g)
     .map((part) => {
       if (part.startsWith("`") && part.endsWith("`")) {
-        return `<code>${escapeHtml(part.slice(1, -1))}</code>`;
+        return renderCodeSpan(part.slice(1, -1));
       }
       return renderChatInlineNoCode(part);
     })
@@ -382,16 +442,29 @@ function renderMessageText(text) {
     html.push(`</${listType}>`);
     listType = "";
   };
-  const openList = (type) => {
+  const openList = (type, start = null) => {
     if (listType === type) return;
     closeList();
-    html.push(`<${type}>`);
+    if (type === "ol") {
+      const startValue = Number.parseInt(start, 10);
+      const startAttr = Number.isFinite(startValue) && startValue > 1 ? ` start="${startValue}"` : "";
+      html.push(`<ol${startAttr}>`);
+    } else {
+      html.push(`<${type}>`);
+    }
     listType = type;
   };
   const closeFence = () => {
     html.push(`<pre><code>${escapeHtml(fenceLines.join("\n"))}</code></pre>`);
     fenceLines = [];
     inFence = false;
+  };
+  const appendListContinuation = (value) => {
+    if (!listType || !html.length) return false;
+    const last = html[html.length - 1];
+    if (!last.endsWith("</li>")) return false;
+    html[html.length - 1] = `${last.slice(0, -5)}<br>${renderChatInline(value)}</li>`;
+    return true;
   };
 
   for (const line of lines) {
@@ -431,10 +504,10 @@ function renderMessageText(text) {
       continue;
     }
 
-    const ordered = line.match(/^\s*\d+\.\s+(.*)$/);
+    const ordered = line.match(/^\s*(\d+)\.\s+(.*)$/);
     if (ordered) {
-      openList("ol");
-      html.push(`<li>${renderChatInline(ordered[1])}</li>`);
+      openList("ol", ordered[1]);
+      html.push(`<li>${renderChatInline(ordered[2])}</li>`);
       continue;
     }
 
@@ -445,6 +518,7 @@ function renderMessageText(text) {
       continue;
     }
 
+    if (appendListContinuation(line)) continue;
     closeList();
     html.push(`<p>${renderChatInline(line)}</p>`);
   }
@@ -456,14 +530,32 @@ function renderMessageText(text) {
 function renderMarkdown(markdown) {
   const lines = String(markdown || "").split("\n");
   const html = [];
-  let listOpen = false;
+  let listType = "";
   let tableRows = [];
 
   const closeList = () => {
-    if (listOpen) {
-      html.push("</ul>");
-      listOpen = false;
+    if (!listType) return;
+    html.push(`</${listType}>`);
+    listType = "";
+  };
+  const openList = (type, start = null) => {
+    if (listType === type) return;
+    closeList();
+    if (type === "ol") {
+      const startValue = Number.parseInt(start, 10);
+      const startAttr = Number.isFinite(startValue) && startValue > 1 ? ` start="${startValue}"` : "";
+      html.push(`<ol${startAttr}>`);
+    } else {
+      html.push(`<${type}>`);
     }
+    listType = type;
+  };
+  const appendListContinuation = (value) => {
+    if (!listType || !html.length) return false;
+    const last = html[html.length - 1];
+    if (!last.endsWith("</li>")) return false;
+    html[html.length - 1] = `${last.slice(0, -5)}<br>${renderInline(value)}</li>`;
+    return true;
   };
   const flushTable = () => {
     if (tableRows.length === 0) return;
@@ -504,17 +596,21 @@ function renderMarkdown(markdown) {
     }
     const bullet = line.match(/^\s*-\s+(.*)$/);
     if (bullet) {
-      if (!listOpen) {
-        html.push("<ul>");
-        listOpen = true;
-      }
+      openList("ul");
       html.push(`<li>${renderInline(bullet[1])}</li>`);
+      continue;
+    }
+    const ordered = line.match(/^\s*(\d+)\.\s+(.*)$/);
+    if (ordered) {
+      openList("ol", ordered[1]);
+      html.push(`<li>${renderInline(ordered[2])}</li>`);
       continue;
     }
     if (!line.trim()) {
       closeList();
       continue;
     }
+    if (appendListContinuation(line)) continue;
     closeList();
     html.push(`<p>${renderInline(line)}</p>`);
   }
@@ -1256,7 +1352,7 @@ function renderArtifacts(artifacts) {
         .map(
           (artifact) => {
             const path = artifact.path || "";
-            const label = path ? `<a class="file-link" href="${escapeHtml(obsidianFileUrl(path))}" title="Open in Obsidian"><code>${escapeHtml(path)}</code></a>` : "<code></code>";
+            const label = path ? renderProjectFileLink(path, `<code>${escapeHtml(path)}</code>`) : "<code></code>";
             return `<div>${escapeHtml(artifact.kind || "artifact")}: ${label}</div>`;
           },
         )
