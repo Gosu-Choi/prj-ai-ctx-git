@@ -465,7 +465,7 @@ def internal_git_ref_summary(root: Path) -> list[dict[str, str]]:
 def internal_git_parent_refs_for_branch(store: "ContextStore", branch_id: str, ref: str) -> list[str]:
     if internal_git_rev_parse(store.root, ref):
         return [ref]
-    paths = store.branch_paths(branch_id)
+    paths = store.branch_paths_for_read(branch_id)
     if not paths.meta.exists():
         return []
     meta = load_json(paths.meta)
@@ -837,15 +837,15 @@ class ContextStore:
         self.root = root.resolve()
         self.contexts = self.root / "contexts"
         self.branches = self.contexts / "branches"
+        self.archived_branches = self.branches / "archived"
         self.views = self.contexts / "views"
         self.globalized = self.contexts / "globalized"
         self.agents = self.contexts / "agents"
         self.config_dir = self.root / ".ctxgit"
         self.config = self.config_dir / "config.json"
 
-    def branch_paths(self, branch_id: str) -> BranchPaths:
-        safe_id = validate_id(branch_id, "branch")
-        root = self.branches / safe_id
+    @staticmethod
+    def make_branch_paths(root: Path) -> BranchPaths:
         return BranchPaths(
             root=root,
             meta=root / "branch.json",
@@ -860,8 +860,26 @@ class ContextStore:
             archived=root / "archived",
         )
 
+    def branch_paths(self, branch_id: str) -> BranchPaths:
+        safe_id = validate_id(branch_id, "branch")
+        return self.make_branch_paths(self.branches / safe_id)
+
+    def archived_branch_paths(self, branch_id: str) -> BranchPaths:
+        safe_id = validate_id(branch_id, "branch")
+        return self.make_branch_paths(self.archived_branches / safe_id)
+
+    def branch_paths_for_read(self, branch_id: str) -> BranchPaths:
+        paths = self.branch_paths(branch_id)
+        if paths.root.exists():
+            return paths
+        archived_paths = self.archived_branch_paths(branch_id)
+        if archived_paths.root.exists():
+            return archived_paths
+        return paths
+
     def init(self, create_initial_branch: bool = True) -> None:
         self.branches.mkdir(parents=True, exist_ok=True)
+        self.archived_branches.mkdir(parents=True, exist_ok=True)
         self.views.mkdir(parents=True, exist_ok=True)
         self.globalized.mkdir(parents=True, exist_ok=True)
         (self.contexts / "turns").mkdir(parents=True, exist_ok=True)
@@ -905,6 +923,7 @@ class ContextStore:
                     - `AGENTS.md`, `USER.md`, `MEMORY.md`, and `agents/` contain project-level AI context.
                     - `imports/` contains copied workspace imports used by AI context.
                     - `branches/` contains separate conversation or research contexts.
+                    - `branches/archived/` contains archived branch directories removed from the active branch list.
                     - `views/` contains generated conceptual merge views.
                     - `branches/<id>/artifacts/` contains optional AI-created markdown outputs.
                     - `branches/<id>/sources/` contains files the branch agent may read.
@@ -1498,15 +1517,80 @@ class ContextStore:
         self.ensure_initial_branch()
         self.write_index()
 
+    def migrate_legacy_globalized_archive_copies(self, branch_id: str, paths: BranchPaths) -> None:
+        legacy_root = paths.archived
+        if not legacy_root.exists():
+            return
+        archived_branch_root = self.archived_branch_paths(branch_id).root
+        for meta_path in sorted(legacy_root.glob("*/globalized.json")):
+            archive_root = meta_path.parent
+            archive_id = str(load_json(meta_path).get("id") or archive_root.name)
+            target_root = self.globalized / validate_id(archive_id, "globalized archive")
+            if not target_root.exists():
+                target_root.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(archive_root), str(target_root))
+            else:
+                shutil.rmtree(archive_root)
+            target_meta_path = target_root / "globalized.json"
+            if target_meta_path.exists():
+                meta = load_json(target_meta_path)
+                meta["branchArchivePath"] = relpath(self.root, archived_branch_root)
+                meta["archivedBranchPath"] = relpath(self.root, archived_branch_root)
+                dump_json(target_meta_path, meta)
+        with contextlib.suppress(OSError):
+            legacy_root.rmdir()
+
+    def active_branch_marked_archived(self, meta_path: Path) -> bool:
+        meta = load_json(meta_path)
+        if meta.get("archivedAt"):
+            return True
+        branch_id = str(meta.get("id") or meta_path.parent.name)
+        return any(self.branch_paths(branch_id).archived.glob("*/globalized.json"))
+
+    def move_branch_to_archive_storage(self, branch_id: str) -> BranchPaths:
+        paths = self.branch_paths(branch_id)
+        archived_paths = self.archived_branch_paths(branch_id)
+        if archived_paths.root.exists():
+            if paths.root.exists():
+                die(f"archived branch already exists: {branch_id}")
+            return archived_paths
+        if not paths.root.exists():
+            die(f"branch does not exist: {branch_id}")
+        self.migrate_legacy_globalized_archive_copies(branch_id, paths)
+        archived_paths.root.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(paths.root), str(archived_paths.root))
+        return archived_paths
+
+    def migrate_archived_branch_storage(self) -> None:
+        if not self.branches.exists():
+            return
+        self.archived_branches.mkdir(parents=True, exist_ok=True)
+        for meta_path in sorted(self.branches.glob("*/branch.json")):
+            if meta_path.parent == self.archived_branches:
+                continue
+            try:
+                branch_id = str(load_json(meta_path).get("id") or meta_path.parent.name)
+                paths = self.branch_paths(branch_id)
+                self.migrate_legacy_globalized_archive_copies(branch_id, paths)
+                if self.active_branch_marked_archived(meta_path):
+                    self.move_branch_to_archive_storage(branch_id)
+            except SystemExit:
+                continue
+        for meta_path in sorted(self.archived_branches.glob("*/branch.json")):
+            try:
+                branch_id = str(load_json(meta_path).get("id") or meta_path.parent.name)
+                self.migrate_legacy_globalized_archive_copies(branch_id, self.archived_branch_paths(branch_id))
+            except SystemExit:
+                continue
+
     def unique_globalized_archive_id(self, branch_id: str) -> str:
         branch_slug = slugify(branch_id, fallback="branch")
         suffix = "_globalized"
         base = f"{branch_slug[: max(1, 80 - len(suffix))]}{suffix}"
-        paths = self.branch_paths(branch_id)
         for index in range(1, 1000):
             numbered_suffix = "" if index == 1 else f"_{index}"
             candidate = f"{base[: 80 - len(numbered_suffix)]}{numbered_suffix}"
-            if not (self.globalized / candidate).exists() and not (paths.archived / candidate).exists():
+            if not (self.globalized / candidate).exists():
                 return candidate
         return f"{base[:66]}_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
 
@@ -1567,7 +1651,7 @@ class ContextStore:
         archive_id = self.unique_globalized_archive_id(safe_branch)
         history_text = "".join(json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n" for item in selected)
         markdown = self.archived_history_markdown(archive_id, safe_branch, selected, low, high, created_at)
-        branch_archive_root = paths.archived / archive_id
+        archived_branch_root = self.archived_branch_paths(safe_branch).root
         globalized_root = self.globalized / archive_id
         meta = {
             "schemaVersion": 1,
@@ -1578,22 +1662,25 @@ class ContextStore:
             "rangeStart": low,
             "rangeEnd": high,
             "messageCount": len(selected),
-            "branchArchivePath": relpath(self.root, branch_archive_root),
+            "branchArchivePath": relpath(self.root, archived_branch_root),
+            "archivedBranchPath": relpath(self.root, archived_branch_root),
             "globalizedPath": relpath(self.root, globalized_root),
             "history": relpath(self.root, globalized_root / "history.jsonl"),
             "markdown": relpath(self.root, globalized_root / "archive.md"),
         }
-        for archive_root in (branch_archive_root, globalized_root):
-            write_text(archive_root / "history.jsonl", history_text)
-            write_text(archive_root / "archive.md", markdown)
-            dump_json(archive_root / "globalized.json", meta)
+        write_text(globalized_root / "history.jsonl", history_text)
+        write_text(globalized_root / "archive.md", markdown)
+        dump_json(globalized_root / "globalized.json", meta)
         branch_meta = load_json(paths.meta)
         branch_meta["archivedAt"] = created_at
         branch_meta["archivedAs"] = archive_id
         branch_meta["archivedRangeStart"] = low
         branch_meta["archivedRangeEnd"] = high
+        branch_meta["archiveMode"] = "range-globalize"
+        branch_meta["archivedPath"] = relpath(self.root, archived_branch_root)
+        branch_meta["updatedAt"] = created_at
         dump_json(paths.meta, branch_meta)
-        self.touch_branch(safe_branch)
+        self.move_branch_to_archive_storage(safe_branch)
         return self.globalized_payload(archive_id)
 
     def archive_branch(self, branch_id: str) -> dict[str, Any]:
@@ -1603,20 +1690,23 @@ class ContextStore:
         if not paths.root.exists():
             die(f"branch does not exist: {branch_id}")
         created_at = utc_now()
+        archived_branch_root = self.archived_branch_paths(safe_branch).root
         branch_meta = load_json(paths.meta)
         branch_meta["archivedAt"] = created_at
         branch_meta["archiveMode"] = "branch"
+        branch_meta["archivedPath"] = relpath(self.root, archived_branch_root)
+        branch_meta["updatedAt"] = created_at
         branch_meta.pop("archivedAs", None)
         branch_meta.pop("archivedRangeStart", None)
         branch_meta.pop("archivedRangeEnd", None)
         dump_json(paths.meta, branch_meta)
-        self.touch_branch(safe_branch)
+        self.move_branch_to_archive_storage(safe_branch)
         return {
             "id": safe_branch,
             "title": branch_meta.get("title") or safe_branch,
             "archivedAt": created_at,
             "mode": "branch",
-            "path": relpath(self.root, paths.root),
+            "path": relpath(self.root, archived_branch_root),
         }
 
     def ensure_initial_branch(self) -> bool:
@@ -1632,6 +1722,8 @@ class ContextStore:
         parent: str | None = None,
         tags: Iterable[str] = (),
     ) -> None:
+        if branch_id == "archived":
+            die("branch id 'archived' is reserved for archived branch storage")
         paths = self.branch_paths(branch_id)
         if paths.root.exists():
             die(f"branch already exists: {branch_id}")
@@ -1645,7 +1737,6 @@ class ContextStore:
         paths.sources.mkdir(parents=True, exist_ok=True)
         paths.compactions.mkdir(parents=True, exist_ok=True)
         paths.archives.mkdir(parents=True, exist_ok=True)
-        paths.archived.mkdir(parents=True, exist_ok=True)
         meta = {
             "schemaVersion": 1,
             "id": validate_id(branch_id, "branch"),
@@ -1661,11 +1752,26 @@ class ContextStore:
 
     def list_branches(self) -> list[dict[str, Any]]:
         self.require_initialized()
+        self.migrate_archived_branch_storage()
         items: list[dict[str, Any]] = []
         for meta_path in sorted(self.branches.glob("*/branch.json")):
             if self.branch_is_archived(meta_path):
                 continue
             items.append(self.branch_list_item(meta_path))
+        self.sort_branch_list(items)
+        return items
+
+    def list_archived_branches(self) -> list[dict[str, Any]]:
+        self.require_initialized()
+        self.migrate_archived_branch_storage()
+        items: list[dict[str, Any]] = []
+        for meta_path in sorted(self.archived_branches.glob("*/branch.json")):
+            try:
+                item = self.branch_list_item(meta_path)
+            except SystemExit:
+                continue
+            item["archived"] = True
+            items.append(item)
         self.sort_branch_list(items)
         return items
 
@@ -2397,6 +2503,7 @@ class ContextStore:
         write_text(self.contexts / "index.md", "\n".join(lines).rstrip() + "\n")
 
     def list_branches_without_require(self) -> list[dict[str, Any]]:
+        self.migrate_archived_branch_storage()
         items: list[dict[str, Any]] = []
         for meta_path in sorted(self.branches.glob("*/branch.json")):
             try:
@@ -2409,11 +2516,16 @@ class ContextStore:
         return items
 
     def branch_is_archived(self, meta_path: Path) -> bool:
+        with contextlib.suppress(ValueError):
+            meta_path.resolve().relative_to(self.archived_branches.resolve())
+            return True
         meta = load_json(meta_path)
         if meta.get("archivedAt"):
             return True
         branch_id = str(meta.get("id") or meta_path.parent.name)
-        return any(self.branch_paths(branch_id).archived.glob("*/globalized.json"))
+        return self.archived_branch_paths(branch_id).root.exists() or any(
+            self.branch_paths(branch_id).archived.glob("*/globalized.json")
+        )
 
     def branch_list_item(self, meta_path: Path) -> dict[str, Any]:
         meta = load_json(meta_path)
@@ -2453,7 +2565,7 @@ class ContextStore:
         items.sort(key=lambda item: bool(item.get("lastUserMessageAt")), reverse=True)
 
     def iter_history(self, branch_id: str) -> Iterable[dict[str, Any]]:
-        return self.read_history_file(self.branch_paths(branch_id).history)
+        return self.read_history_file(self.branch_paths_for_read(branch_id).history)
 
     def read_history_file(self, history_path: Path) -> list[dict[str, Any]]:
         records = []
@@ -2493,7 +2605,7 @@ class ContextStore:
         return removed
 
     def list_archives(self, branch_id: str) -> list[dict[str, Any]]:
-        paths = self.branch_paths(branch_id)
+        paths = self.branch_paths_for_read(branch_id)
         meta = load_json(paths.meta)
         merge = meta.get("merge") if isinstance(meta.get("merge"), dict) else {}
         archived = merge.get("archivedSources")
@@ -2519,6 +2631,7 @@ class ContextStore:
         return archives
 
     def list_globalized_archives(self) -> list[dict[str, Any]]:
+        self.migrate_archived_branch_storage()
         archives: list[dict[str, Any]] = []
         if not self.globalized.exists():
             return archives
@@ -2551,6 +2664,7 @@ class ContextStore:
 
     def branch_graph_payload(self) -> dict[str, Any]:
         self.require_initialized()
+        self.migrate_archived_branch_storage()
         nodes: dict[str, dict[str, Any]] = {
             "root": {
                 "id": "root",
@@ -2610,14 +2724,16 @@ class ContextStore:
         active_count = 0
         archived_count = 0
         merge_count = 0
-        for meta_path in sorted(self.branches.glob("*/branch.json")):
+        meta_paths: list[tuple[Path, bool]] = [(path, False) for path in sorted(self.branches.glob("*/branch.json"))]
+        meta_paths.extend((path, True) for path in sorted(self.archived_branches.glob("*/branch.json")))
+        for meta_path, stored_archived in meta_paths:
             try:
                 meta = load_json(meta_path)
             except SystemExit:
                 continue
             branch_id = str(meta.get("id") or meta_path.parent.name)
-            archived = self.branch_is_archived(meta_path)
-            history_count = len(list(self.iter_history(branch_id)))
+            archived = stored_archived or self.branch_is_archived(meta_path)
+            history_count = len(self.read_history_file(meta_path.parent / "history.jsonl"))
             branch_ref = ctxgit_branch_ref(branch_id)
             head = internal_git_rev_parse(self.root, branch_ref)
             merge = meta.get("merge") if isinstance(meta.get("merge"), dict) else {}
@@ -2735,7 +2851,7 @@ class ContextStore:
         }
 
     def archive_payload(self, branch_id: str, archive_id: str) -> dict[str, Any]:
-        paths = self.branch_paths(branch_id)
+        paths = self.branch_paths_for_read(branch_id)
         safe_archive = validate_id(archive_id, "archive")
         archive_root = paths.archives / safe_archive
         if not archive_root.exists():
@@ -2753,7 +2869,7 @@ class ContextStore:
         }
 
     def list_branch_documents(self, branch_id: str, kind: str) -> list[dict[str, str]]:
-        paths = self.branch_paths(branch_id)
+        paths = self.branch_paths_for_read(branch_id)
         if kind == "research":
             directory = paths.research
         elif kind == "artifacts":
@@ -2785,7 +2901,7 @@ class ContextStore:
         return documents
 
     def list_sources(self, branch_id: str) -> list[dict[str, Any]]:
-        paths = self.branch_paths(branch_id)
+        paths = self.branch_paths_for_read(branch_id)
         if not paths.sources.exists():
             return []
         items = []
@@ -2798,7 +2914,7 @@ class ContextStore:
         return items
 
     def list_compactions(self, branch_id: str) -> list[dict[str, str]]:
-        paths = self.branch_paths(branch_id)
+        paths = self.branch_paths_for_read(branch_id)
         if not paths.compactions.exists():
             return []
         documents = []
@@ -5495,13 +5611,16 @@ def run_snapshot(root: Path, message: str, include_tools: bool = False) -> None:
 
 
 def branch_payload(store: ContextStore, branch_id: str) -> dict[str, Any]:
-    paths = store.branch_paths(branch_id)
+    store.migrate_archived_branch_storage()
+    paths = store.branch_paths_for_read(branch_id)
     if not paths.root.exists():
         die(f"branch does not exist: {branch_id}")
+    archived = store.branch_is_archived(paths.meta)
     history_path = relpath(store.root, paths.history)
     context_path = relpath(store.root, paths.context)
     return {
         "meta": load_json(paths.meta),
+        "archived": archived,
         "paths": {
             "context": context_path,
             "history": history_path,
@@ -6794,6 +6913,7 @@ def make_handler(
                 self.send_json(
                     {
                         "branches": store.list_branches(),
+                        "archived": store.list_archived_branches(),
                         "views": store.list_views(),
                         "globalized": store.list_globalized_archives(),
                     }
@@ -7300,7 +7420,11 @@ def make_handler(
                 try:
                     archive = store.archive_branch_range(branch_id, start, end) if has_range else None
                     branch_archive = None if has_range else store.archive_branch(branch_id)
-                    payload = branch_payload(store, branch_id)
+                    payload = {
+                        "branches": store.list_branches(),
+                        "archived": store.list_archived_branches(),
+                        "views": store.list_views(),
+                    }
                     payload["archive"] = archive
                     payload["branchArchive"] = branch_archive
                     payload["globalized"] = store.list_globalized_archives()

@@ -3,6 +3,7 @@ const state = {
   activeBranch: null,
   activeGlobalized: null,
   branches: [],
+  archived: [],
   views: [],
   globalized: [],
   graph: null,
@@ -628,6 +629,7 @@ function clearWorkspace(message = "Select or initialize a ctxgit project.") {
   state.activeBranch = null;
   state.activeGlobalized = null;
   state.branches = [];
+  state.archived = [];
   state.views = [];
   state.globalized = [];
   state.graph = null;
@@ -1026,17 +1028,33 @@ function renderBranches() {
 }
 
 function renderGlobalizedList() {
+  const archivedBranchMarkup = (state.archived || [])
+    .map(
+      (branch) => `
+        <button class="nav-item ${branch.id === state.activeBranch ? "active" : ""}" data-archived-branch="${escapeHtml(branch.id)}" type="button" title="${escapeHtml(`${branch.title || branch.id} (${branch.id})`)}">
+          <span class="nav-title" title="${escapeHtml(branch.title || branch.id)}">${escapeHtml(branch.title || branch.id)}</span>
+          <span class="nav-meta" title="${escapeHtml(`${branch.id} · ${branch.historyCount || 0} messages · archived branch`)}">${escapeHtml(branch.id)} · ${branch.historyCount || 0} messages · branch</span>
+        </button>
+      `,
+    )
+    .join("");
+  const rangeArchiveMarkup = (state.globalized || [])
+    .map(
+      (archive) => `
+        <button class="nav-item ${archive.id === state.activeGlobalized ? "active" : ""}" data-globalized="${escapeHtml(archive.id)}" type="button" title="${escapeHtml(`${archive.title || archive.id} (${archive.sourceBranch || "archived"})`)}">
+          <span class="nav-title" title="${escapeHtml(archive.title || archive.id)}">${escapeHtml(archive.title || archive.id)}</span>
+          <span class="nav-meta" title="${escapeHtml(`${archive.sourceBranch || ""} · ${archive.rangeStart || "?"}-${archive.rangeEnd || "?"} · ${archive.messageCount || 0} messages`)}">${escapeHtml(archive.sourceBranch || "")} · ${archive.rangeStart || "?"}-${archive.rangeEnd || "?"} · ${archive.messageCount || 0} messages</span>
+        </button>
+      `,
+    )
+    .join("");
   els.globalizedList.innerHTML =
-    state.globalized
-      .map(
-        (archive) => `
-          <button class="nav-item ${archive.id === state.activeGlobalized ? "active" : ""}" data-globalized="${escapeHtml(archive.id)}" type="button" title="${escapeHtml(`${archive.title || archive.id} (${archive.sourceBranch || "archived"})`)}">
-            <span class="nav-title" title="${escapeHtml(archive.title || archive.id)}">${escapeHtml(archive.title || archive.id)}</span>
-            <span class="nav-meta" title="${escapeHtml(`${archive.sourceBranch || ""} · ${archive.rangeStart || "?"}-${archive.rangeEnd || "?"} · ${archive.messageCount || 0} messages`)}">${escapeHtml(archive.sourceBranch || "")} · ${archive.rangeStart || "?"}-${archive.rangeEnd || "?"} · ${archive.messageCount || 0} messages</span>
-          </button>
-        `,
-      )
-      .join("") || '<div class="muted">No archived chats yet</div>';
+    (archivedBranchMarkup || rangeArchiveMarkup)
+      ? `${archivedBranchMarkup}${rangeArchiveMarkup}`
+      : '<div class="muted">No archived chats yet</div>';
+  els.globalizedList.querySelectorAll("[data-archived-branch]").forEach((button) => {
+    button.addEventListener("click", () => loadBranch(button.dataset.archivedBranch));
+  });
   els.globalizedList.querySelectorAll("[data-globalized]").forEach((button) => {
     button.addEventListener("click", () => loadGlobalizedArchive(button.dataset.globalized));
   });
@@ -1656,14 +1674,15 @@ function resizeMessageInput() {
 function updateComposerState() {
   const running = activeBranchRunningJob();
   const startingMode = state.activeBranch ? state.startingBranches[state.activeBranch] : "";
-  const disabled = !state.activeBranch || Boolean(running) || Boolean(startingMode);
+  const archived = state.payload?.archived === true;
+  const disabled = !state.activeBranch || archived || Boolean(running) || Boolean(startingMode);
   els.sendButton.disabled = disabled;
   els.researchButton.disabled = disabled;
   els.historyChatButton.disabled = disabled;
   const busyMode = running?.mode || startingMode;
-  els.sendButton.textContent = busyMode === "chat" ? "생각 중" : "Send";
-  els.researchButton.textContent = busyMode === "research" ? "리서치 중" : "Research";
-  els.historyChatButton.textContent = busyMode === "info-chat" ? "Info..." : "Info chat";
+  els.sendButton.textContent = archived ? "Archived" : busyMode === "chat" ? "생각 중" : "Send";
+  els.researchButton.textContent = archived ? "Archived" : busyMode === "research" ? "리서치 중" : "Research";
+  els.historyChatButton.textContent = archived ? "Archived" : busyMode === "info-chat" ? "Info..." : "Info chat";
 }
 
 function renderActiveBranchJob() {
@@ -1687,6 +1706,7 @@ function renderActiveBranchJob() {
 async function refreshBranchNavigation() {
   const data = await api("/api/branches");
   state.branches = data.branches || [];
+  state.archived = data.archived || [];
   state.views = data.views || [];
   state.globalized = data.globalized || [];
   renderBranches();
@@ -1854,8 +1874,11 @@ function renderBranch(payload) {
   hideChatError();
   state.payload = payload;
   const meta = payload.meta;
+  const archived = payload.archived === true;
   els.activeTitle.textContent = meta.title || meta.id;
-  els.activeMeta.textContent = `${meta.id} · history.jsonl is Git-tracked conversation history`;
+  els.activeMeta.textContent = archived
+    ? `${meta.id} · archived branch · read only`
+    : `${meta.id} · history.jsonl is Git-tracked conversation history`;
 
   replaceMessageListHtml(
     payload.history
@@ -1864,45 +1887,49 @@ function renderBranch(payload) {
           <article class="message">
             <div class="message-header">
               <span class="message-role">${escapeHtml(message.role)}</span>
-              <span class="message-meta-actions">
-                <span class="message-number">${index + 1}</span>
-                <span>${escapeHtml(message.createdAt)}</span>
-                <span class="message-options">
-                  <button
-                    class="message-options-button"
-                    data-message-options="${index}"
-                    type="button"
-                    title="Message options"
-                    aria-label="Message options"
-                  >...</button>
-                  <span class="message-options-menu">
-                    <button
-                      data-history-fork="${index}"
-                      data-history-created-at="${escapeHtml(message.createdAt || "")}"
-                      data-history-role="${escapeHtml(message.role || "")}"
-                      type="button"
-                    >Fork here</button>
-                    <button
-                      class="danger"
-                      data-history-cut="${index}"
-                      data-history-created-at="${escapeHtml(message.createdAt || "")}"
-                      data-history-role="${escapeHtml(message.role || "")}"
-                      type="button"
-                    >Cut here</button>
-                    <button
-                      class="danger"
-                      data-history-delete="${index}"
-                      data-history-created-at="${escapeHtml(message.createdAt || "")}"
-                      data-history-role="${escapeHtml(message.role || "")}"
-                      type="button"
-                    >Delete message</button>
-                  </span>
-                </span>
+                <span class="message-meta-actions">
+                  <span class="message-number">${index + 1}</span>
+                  <span>${escapeHtml(message.createdAt)}</span>
+                  ${
+                    archived
+                      ? ""
+                      : `<span class="message-options">
+                          <button
+                            class="message-options-button"
+                            data-message-options="${index}"
+                            type="button"
+                            title="Message options"
+                            aria-label="Message options"
+                          >...</button>
+                          <span class="message-options-menu">
+                            <button
+                              data-history-fork="${index}"
+                              data-history-created-at="${escapeHtml(message.createdAt || "")}"
+                              data-history-role="${escapeHtml(message.role || "")}"
+                              type="button"
+                            >Fork here</button>
+                            <button
+                              class="danger"
+                              data-history-cut="${index}"
+                              data-history-created-at="${escapeHtml(message.createdAt || "")}"
+                              data-history-role="${escapeHtml(message.role || "")}"
+                              type="button"
+                            >Cut here</button>
+                            <button
+                              class="danger"
+                              data-history-delete="${index}"
+                              data-history-created-at="${escapeHtml(message.createdAt || "")}"
+                              data-history-role="${escapeHtml(message.role || "")}"
+                              type="button"
+                            >Delete message</button>
+                          </span>
+                        </span>`
+                  }
               </span>
             </div>
             <div class="message-text">${renderMessageText(message.text)}</div>
             ${renderArtifacts(message.artifacts)}
-            ${renderApprovalRequests(message.approvalRequests, payload.approvalStatuses || {})}
+            ${archived ? "" : renderApprovalRequests(message.approvalRequests, payload.approvalStatuses || {})}
           </article>
         `,
       )
@@ -2013,6 +2040,7 @@ function renderArchives(archives) {
 async function loadBranches() {
   const data = await api("/api/branches");
   state.branches = data.branches || [];
+  state.archived = data.archived || [];
   state.views = data.views || [];
   state.globalized = data.globalized || [];
   if (!state.activeBranch && !state.activeGlobalized && state.branches.length) {
@@ -2367,6 +2395,9 @@ async function archiveBranch(branch) {
       method: "POST",
       body: JSON.stringify(body),
     });
+    state.branches = payload.branches || state.branches;
+    state.archived = payload.archived || state.archived;
+    state.views = payload.views || state.views;
     state.globalized = payload.globalized || state.globalized;
     if (state.activeBranch === branch) {
       state.activeBranch = null;
@@ -2610,6 +2641,10 @@ els.mergeForm.addEventListener("submit", async (event) => {
 
 async function sendComposerMessage({ mode }) {
   if (!state.activeBranch) return;
+  if (state.payload?.archived === true) {
+    window.alert("Archived branches are read-only. Fork or clone it before continuing work.");
+    return;
+  }
   const branch = state.activeBranch;
   const text = els.messageInput.value.trim();
   if (!text) return;

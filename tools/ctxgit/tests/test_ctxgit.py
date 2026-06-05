@@ -98,19 +98,19 @@ class CtxgitTest(unittest.TestCase):
 
             self.assertEqual(payload["id"], "alpha_globalized")
             self.assertEqual([record["text"] for record in payload["history"]], ["second", "third"])
-            self.assertTrue((root / "contexts" / "branches" / "alpha" / "archived" / "alpha_globalized" / "history.jsonl").exists())
+            self.assertFalse((root / "contexts" / "branches" / "alpha").exists())
+            self.assertTrue((root / "contexts" / "branches" / "archived" / "alpha" / "history.jsonl").exists())
+            self.assertFalse((root / "contexts" / "branches" / "archived" / "alpha" / "archived").exists())
             self.assertTrue((root / "contexts" / "globalized" / "alpha_globalized" / "history.jsonl").exists())
             archives = store.list_globalized_archives()
             self.assertEqual([item["id"] for item in archives], ["alpha_globalized"])
             self.assertEqual(archives[0]["rangeStart"], 2)
             self.assertEqual(archives[0]["rangeEnd"], 3)
             self.assertEqual(store.list_branches(), [])
-            branch_meta = ctxgit.load_json(root / "contexts" / "branches" / "alpha" / "branch.json")
+            archived = store.list_archived_branches()
+            self.assertEqual([item["id"] for item in archived], ["alpha"])
+            branch_meta = ctxgit.load_json(root / "contexts" / "branches" / "archived" / "alpha" / "branch.json")
             self.assertEqual(branch_meta["archivedAs"], "alpha_globalized")
-            branch_meta.pop("archivedAt")
-            branch_meta.pop("archivedAs")
-            ctxgit.dump_json(root / "contexts" / "branches" / "alpha" / "branch.json", branch_meta)
-            self.assertEqual(store.list_branches(), [])
 
     def test_archive_branch_without_range_hides_branch_without_globalizing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -123,13 +123,51 @@ class CtxgitTest(unittest.TestCase):
 
             self.assertEqual(payload["id"], "alpha")
             self.assertEqual(payload["mode"], "branch")
+            self.assertFalse((root / "contexts" / "branches" / "alpha").exists())
+            self.assertTrue((root / "contexts" / "branches" / "archived" / "alpha" / "history.jsonl").exists())
             self.assertEqual(store.list_branches(), [])
+            self.assertEqual([item["id"] for item in store.list_archived_branches()], ["alpha"])
             self.assertEqual(store.list_globalized_archives(), [])
             self.assertFalse((root / "contexts" / "globalized" / "alpha_globalized").exists())
-            branch_meta = ctxgit.load_json(root / "contexts" / "branches" / "alpha" / "branch.json")
+            branch_meta = ctxgit.load_json(root / "contexts" / "branches" / "archived" / "alpha" / "branch.json")
             self.assertEqual(branch_meta["archiveMode"], "branch")
             self.assertIn("archivedAt", branch_meta)
             self.assertNotIn("archivedAs", branch_meta)
+
+    def test_legacy_inner_archived_folder_migrates_to_outer_storage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("alpha")
+            store.append_history("alpha", "user", "first")
+            branch_root = root / "contexts" / "branches" / "alpha"
+            legacy_root = branch_root / "archived" / "alpha_globalized"
+            ctxgit.write_text(legacy_root / "history.jsonl", json.dumps({"role": "user", "text": "first"}) + "\n")
+            ctxgit.write_text(legacy_root / "archive.md", "# alpha_globalized\n")
+            ctxgit.dump_json(
+                legacy_root / "globalized.json",
+                {
+                    "schemaVersion": 1,
+                    "id": "alpha_globalized",
+                    "title": "alpha_globalized",
+                    "sourceBranch": "alpha",
+                    "createdAt": "2026-01-01T00:00:00Z",
+                    "rangeStart": 1,
+                    "rangeEnd": 1,
+                    "messageCount": 1,
+                },
+            )
+            meta = ctxgit.load_json(branch_root / "branch.json")
+            meta["archivedAt"] = "2026-01-01T00:00:00Z"
+            ctxgit.dump_json(branch_root / "branch.json", meta)
+
+            self.assertEqual(store.list_branches(), [])
+
+            self.assertFalse(branch_root.exists())
+            self.assertTrue((root / "contexts" / "branches" / "archived" / "alpha" / "branch.json").exists())
+            self.assertFalse((root / "contexts" / "branches" / "archived" / "alpha" / "archived").exists())
+            self.assertTrue((root / "contexts" / "globalized" / "alpha_globalized" / "globalized.json").exists())
+            self.assertEqual([item["id"] for item in store.list_archived_branches()], ["alpha"])
 
     def test_server_project_registry_lists_and_resolves_server_projects(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
