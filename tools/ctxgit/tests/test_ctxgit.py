@@ -436,6 +436,38 @@ class CtxgitTest(unittest.TestCase):
             self.assertIn(("branch:gamma", "branch:merged", "merge"), edge_kinds)
             self.assertFalse(any(str(node["id"]).startswith("turn:") for node in graph["nodes"]))
 
+    def test_branch_graph_treats_fork_from_merged_branch_as_fork(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("alpha")
+            store.append_history("alpha", "user", "alpha")
+            store.create_branch("beta")
+            store.append_history("beta", "user", "beta")
+            store.merge_branches(["alpha", "beta"], "merged", branch_summarizer=lambda _request: "summary")
+
+            store.fork_branch_at_history("merged", "forked", 0)
+            fork_meta_path = root / "contexts" / "branches" / "forked" / "branch.json"
+            fork_meta = ctxgit.load_json(fork_meta_path)
+            self.assertNotIn("merge", fork_meta)
+            self.assertNotIn("parents", fork_meta)
+
+            # Existing projects may already have inherited merge fields on forks.
+            # The graph should still prefer the explicit fork lineage.
+            fork_meta["merge"] = {"sourceBranches": ["alpha", "beta"]}
+            fork_meta["parents"] = ["alpha", "beta"]
+            ctxgit.dump_json(fork_meta_path, fork_meta)
+
+            graph = store.branch_graph_payload()
+            edge_kinds = {(edge["source"], edge["target"], edge["kind"]) for edge in graph["edges"]}
+
+            self.assertIn(("branch:alpha", "branch:merged", "merge"), edge_kinds)
+            self.assertIn(("branch:beta", "branch:merged", "merge"), edge_kinds)
+            self.assertIn(("branch:merged", "branch:forked", "fork"), edge_kinds)
+            self.assertNotIn(("branch:alpha", "branch:forked", "merge"), edge_kinds)
+            self.assertNotIn(("branch:beta", "branch:forked", "merge"), edge_kinds)
+            self.assertEqual(graph["summary"]["mergeBranches"], 1)
+
     def test_delete_history_record_rewrites_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

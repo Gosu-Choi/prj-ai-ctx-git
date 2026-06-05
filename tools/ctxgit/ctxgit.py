@@ -1254,6 +1254,7 @@ class ContextStore:
         now = utc_now()
         meta = load_json(target_paths.meta)
         source_title = str(meta.get("title") or source_id)
+        self.reset_copied_branch_lineage(meta)
         meta["id"] = validate_id(target_id, "branch")
         meta["title"] = title or f"{source_title} copy"
         meta["clonedFrom"] = validate_id(source_id, "branch")
@@ -1261,6 +1262,25 @@ class ContextStore:
         meta["updatedAt"] = now
         dump_json(target_paths.meta, meta)
         self.write_index()
+
+    @staticmethod
+    def reset_copied_branch_lineage(meta: dict[str, Any]) -> None:
+        for key in (
+            "parent",
+            "parents",
+            "merge",
+            "forkedFrom",
+            "forkedAtIndex",
+            "forkedAtCreatedAt",
+            "forkedFromTurnId",
+            "forkedFromCommit",
+            "forkedSnapshot",
+            "clonedFrom",
+        ):
+            meta.pop(key, None)
+        tags = meta.get("tags")
+        if isinstance(tags, list):
+            meta["tags"] = [tag for tag in tags if str(tag).strip() != "merge"]
 
     @staticmethod
     def completed_turn_id_for_history_index(records: list[dict[str, Any]], index: int) -> str:
@@ -1427,6 +1447,7 @@ class ContextStore:
         now = utc_now()
         meta = load_json(target_paths.meta)
         source_title = str(meta.get("title") or source_id)
+        self.reset_copied_branch_lineage(meta)
         meta["id"] = validate_id(target_id, "branch")
         meta["title"] = title or f"{source_title} fork"
         meta["forkedFrom"] = validate_id(source_id, "branch")
@@ -2574,6 +2595,17 @@ class ContextStore:
                 }
             )
 
+        def merge_source_ids(meta: dict[str, Any]) -> list[str]:
+            merge = meta.get("merge") if isinstance(meta.get("merge"), dict) else {}
+            merge_sources = merge.get("sourceBranches") if isinstance(merge.get("sourceBranches"), list) else []
+            parents = meta.get("parents") if isinstance(meta.get("parents"), list) else []
+            return [str(item).strip() for item in (merge_sources or parents) if str(item).strip()]
+
+        def is_merge_lineage(meta: dict[str, Any]) -> bool:
+            if str(meta.get("forkedFrom") or "").strip() or str(meta.get("clonedFrom") or "").strip():
+                return False
+            return len(merge_source_ids(meta)) > 1
+
         branch_meta: dict[str, dict[str, Any]] = {}
         active_count = 0
         archived_count = 0
@@ -2596,7 +2628,7 @@ class ContextStore:
                 archived_count += 1
             else:
                 active_count += 1
-            if len(merge_sources or parents) > 1:
+            if is_merge_lineage(meta):
                 merge_count += 1
             nodes[node_id(branch_id)] = {
                 "id": node_id(branch_id),
@@ -2624,14 +2656,6 @@ class ContextStore:
 
         for branch_id, meta in branch_meta.items():
             target = node_id(branch_id)
-            merge = meta.get("merge") if isinstance(meta.get("merge"), dict) else {}
-            merge_sources = merge.get("sourceBranches") if isinstance(merge.get("sourceBranches"), list) else []
-            parents = meta.get("parents") if isinstance(meta.get("parents"), list) else []
-            if len(merge_sources or parents) > 1:
-                for source_id in [str(item) for item in (merge_sources or parents) if str(item).strip()]:
-                    add_missing_branch(source_id)
-                    add_edge(node_id(source_id), target, "merge", "merge")
-                continue
             forked_from = str(meta.get("forkedFrom") or "").strip()
             if forked_from:
                 add_missing_branch(forked_from)
@@ -2639,15 +2663,20 @@ class ContextStore:
                 label = f"fork #{int(index) + 1}" if isinstance(index, int) else "fork"
                 add_edge(node_id(forked_from), target, "fork", label)
                 continue
-            parent = str(meta.get("parent") or "").strip()
-            if parent:
-                add_missing_branch(parent)
-                add_edge(node_id(parent), target, "parent", "parent")
-                continue
             cloned_from = str(meta.get("clonedFrom") or "").strip()
             if cloned_from:
                 add_missing_branch(cloned_from)
                 add_edge(node_id(cloned_from), target, "clone", "clone")
+                continue
+            if is_merge_lineage(meta):
+                for source_id in merge_source_ids(meta):
+                    add_missing_branch(source_id)
+                    add_edge(node_id(source_id), target, "merge", "merge")
+                continue
+            parent = str(meta.get("parent") or "").strip()
+            if parent:
+                add_missing_branch(parent)
+                add_edge(node_id(parent), target, "parent", "parent")
                 continue
             add_edge("root", target, "root", "root")
 
