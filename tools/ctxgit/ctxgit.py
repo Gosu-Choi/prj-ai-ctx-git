@@ -883,6 +883,8 @@ class ContextStore:
         self.views.mkdir(parents=True, exist_ok=True)
         self.globalized.mkdir(parents=True, exist_ok=True)
         (self.contexts / "turns").mkdir(parents=True, exist_ok=True)
+        if not self.context_history_path().exists():
+            write_text(self.context_history_path(), "")
         self.config_dir.mkdir(parents=True, exist_ok=True)
         ensure_internal_git(self.root)
         ensure_project_gitignore(self.root)
@@ -1810,6 +1812,40 @@ class ContextStore:
         with paths.history.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
         self.touch_branch(branch_id)
+        return record
+
+    def context_history_path(self) -> Path:
+        return self.contexts / "history.jsonl"
+
+    def iter_context_history(self) -> Iterable[dict[str, Any]]:
+        return self.read_history_file(self.context_history_path())
+
+    def append_context_history(
+        self,
+        role: str,
+        text: str,
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        self.require_initialized()
+        role = role.strip().lower()
+        if role not in {"user", "assistant", "system", "note"}:
+            die("role must be one of: user, assistant, system, note")
+        record = {
+            "schemaVersion": 1,
+            "id": new_history_record_id(),
+            "scope": "contexts",
+            "role": role,
+            "text": text,
+            "createdAt": utc_now(),
+        }
+        if extra:
+            record.update(extra)
+        if not str(record.get("id") or "").strip():
+            record["id"] = new_history_record_id()
+        path = self.context_history_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
         return record
 
     def add_note(self, branch_id: str, title: str, body: str, kind: str = "note") -> Path:
@@ -4398,6 +4434,116 @@ def build_history_chat_prompt(store: ContextStore, branch_id: str, user_message:
     return "\n".join(parts)
 
 
+def contexts_file_overview(store: ContextStore, budget_chars: int = 12000) -> str:
+    roots = [
+        store.contexts / "README.md",
+        store.contexts / "index.md",
+        store.contexts / "AGENTS.md",
+        store.contexts / "USER.md",
+        store.contexts / "MEMORY.md",
+    ]
+    sections = []
+    remaining = budget_chars
+    for path in roots:
+        if not path.exists():
+            continue
+        rel = relpath(store.root, path)
+        text = read_text(path).strip()
+        if not text:
+            continue
+        chunk = f"## {rel}\n\n{truncate_middle(text, max(0, remaining - len(rel) - 20))}"
+        sections.append(chunk)
+        remaining -= len(chunk)
+        if remaining <= 0:
+            break
+    return "\n\n".join(sections) or "(none)"
+
+
+def contexts_branch_overview(store: ContextStore, budget_chars: int = 14000) -> str:
+    rows = []
+    for label, items in (("active", store.list_branches()), ("archived", store.list_archived_branches())):
+        for item in items:
+            rows.append(
+                "- "
+                f"[{label}] `{item.get('id')}`: {item.get('title') or item.get('id')} "
+                f"({item.get('historyCount') or 0} messages, "
+                f"last user: {item.get('lastUserMessageAt') or 'n/a'})"
+            )
+    globalized = store.list_globalized_archives()
+    if globalized:
+        rows.append("")
+        rows.append("Globalized range archives:")
+        for item in globalized:
+            rows.append(
+                "- "
+                f"`{item.get('id')}` from `{item.get('sourceBranch') or ''}` "
+                f"messages {item.get('rangeStart') or '?'}-{item.get('rangeEnd') or '?'} "
+                f"({item.get('messageCount') or 0} messages)"
+            )
+    return truncate_middle("\n".join(rows), budget_chars) or "(none)"
+
+
+def build_context_chat_prompt(store: ContextStore, user_message: str) -> str:
+    llm = read_llm_config(store.root)
+    codex_config = llm.get("codex") if isinstance(llm.get("codex"), dict) else {}
+    budget = coerce_positive_int(
+        codex_config.get("infoChatBudgetCharacters") or codex_config.get("historyOnlyBudgetCharacters"),
+        min(DEFAULT_CONTEXT_BUDGET_CHARS, 50000),
+    )
+    project_budget = max(10000, budget // 4)
+    overview_budget = max(10000, budget // 4)
+    history_budget = max(12000, budget - project_budget - overview_budget)
+    project_context = "\n\n".join(project_context_sections(store, project_budget)).strip()
+    file_overview = contexts_file_overview(store, overview_budget // 2)
+    branch_overview = contexts_branch_overview(store, overview_budget // 2)
+    records = list(store.iter_context_history())
+    history_records = select_history_for_budget(records, history_budget)
+    omitted = max(0, len(records) - len(history_records))
+    history_lines = [format_history_record(item) for item in history_records]
+    if omitted:
+        history_lines.insert(0, f"- [ctxgit omitted {omitted} older top-level context chat records]")
+    parts = [
+        "You are answering in ctxgit top-level contexts-chat mode.",
+        "",
+        "This chat is scoped to the `contexts/` directory as a whole, not to any one branch.",
+        "Use it to help the user understand the overall state, relationships, and accumulated context.",
+        "Do not fork branches. Do not edit files. Do not create artifacts. Answer directly.",
+        "You may read files under the current working directory (`contexts/`) when helpful.",
+        "Reply in the user's language unless the user asks otherwise.",
+        "",
+        "Project memory and standing instructions:",
+        "<project_context>",
+        project_context or "(none)",
+        "</project_context>",
+        "",
+        "Top-level contexts files:",
+        "<contexts_files>",
+        file_overview,
+        "</contexts_files>",
+        "",
+        "Branch and archive overview:",
+        "<branch_overview>",
+        branch_overview,
+        "</branch_overview>",
+        "",
+        "Top-level contexts chat history:",
+        "<history>",
+        "\n".join(history_lines) or "(none)",
+        "</history>",
+        "",
+        "Current user message:",
+        "<user_message>",
+        user_message,
+        "</user_message>",
+        "",
+        "Return JSON only. The JSON must have:",
+        "- assistant: string conversational answer to show in the chat timeline.",
+        "- artifacts: empty array.",
+        "- approvalRequests: empty array.",
+    ]
+    return "\n".join(parts)
+
+
 def chat_output_schema() -> dict[str, Any]:
     return {
         "type": "object",
@@ -4541,6 +4687,7 @@ def localize_progress_message(message: str) -> str:
         "Codex is working": "Codex 작업 중",
         "Parsing Codex response": "Codex 응답 파싱 중",
         "Preparing branch context": "브랜치 컨텍스트 준비 중",
+        "Preparing contexts overview": "contexts 개요 준비 중",
         "Recording user message": "사용자 메시지 기록 중",
         "Saving assistant output": "어시스턴트 응답 저장 중",
         "Refreshing branch view": "브랜치 화면 갱신 중",
@@ -4933,6 +5080,83 @@ def call_codex_history_chat(
         return parsed
 
 
+def call_codex_context_chat(
+    root: Path,
+    store: ContextStore,
+    user_message: str,
+    progress: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    emit_progress(progress, "Checking Codex login")
+    status = codex_login_status(root)
+    if not status["ok"]:
+        raise RuntimeError(status["message"])
+    llm = read_llm_config(root)
+    codex_config = llm.get("codex") if isinstance(llm.get("codex"), dict) else {}
+    timeout_seconds = coerce_positive_int(codex_config.get("timeoutSeconds"), 900)
+    emit_progress(progress, "Building context prompt")
+    prompt = build_context_chat_prompt(store, user_message)
+    with tempfile.TemporaryDirectory(prefix="ctxgit-context-chat-") as tmp:
+        tmp_path = Path(tmp)
+        schema_path = tmp_path / "chat-output.schema.json"
+        output_path = tmp_path / "last-message.txt"
+        write_text(schema_path, json.dumps(chat_output_schema(), indent=2))
+        cmd = resolve_codex_command(root)
+        if codex_config.get("webSearch") is not False:
+            cmd.append("--search")
+        cmd.extend(
+            [
+                "--ask-for-approval",
+                "never",
+                "exec",
+            ]
+        )
+        if progress:
+            cmd.append("--json")
+        cmd.extend(
+            [
+                "--cd",
+                str(store.contexts),
+                "--sandbox",
+                "read-only",
+                "--output-schema",
+                str(schema_path),
+                "--output-last-message",
+                str(output_path),
+            ]
+        )
+        model = str(codex_config.get("model") or "").strip()
+        if model:
+            cmd.extend(["--model", model])
+        cmd.append("-")
+        try:
+            emit_progress(progress, "Codex is working")
+            if progress:
+                completed = run_process_with_progress(cmd, store.contexts, timeout_seconds, progress, stdin_text=prompt)
+            else:
+                completed = subprocess.run(
+                    cmd,
+                    cwd=store.contexts,
+                    check=False,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    input=prompt,
+                    capture_output=True,
+                    timeout=timeout_seconds,
+                )
+        except subprocess.TimeoutExpired as exc:
+            raise ChatTimeoutError(f"Codex contexts chat timed out after {timeout_seconds} seconds") from exc
+        raw = read_text(output_path).strip()
+        if completed.returncode != 0 and not raw:
+            detail = completed.stderr.strip() or completed.stdout.strip()
+            raise RuntimeError(detail or f"Codex contexts chat failed with exit code {completed.returncode}")
+        emit_progress(progress, "Parsing Codex response")
+        parsed = parse_chat_result(raw or completed.stdout)
+        parsed["provider"] = "codex"
+        parsed["command"] = cmd
+        return parsed
+
+
 def run_chat_turn(
     root: Path,
     store: ContextStore,
@@ -5054,6 +5278,48 @@ def run_history_chat_turn(
     )
     emit_progress(progress, "Refreshing branch view")
     payload = branch_payload(store, branch_id)
+    payload["turnCommit"] = turn_commit
+    return payload
+
+
+def run_context_chat_turn(
+    root: Path,
+    store: ContextStore,
+    user_message: str,
+    provider: str | None = None,
+    progress: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    selected_provider = provider or str(read_llm_config(root).get("provider") or "codex")
+    turn_id = new_turn_id()
+    emit_progress(progress, "Preparing contexts overview")
+    if selected_provider != "codex":
+        raise RuntimeError(f"Unsupported chat provider: {selected_provider}")
+    emit_progress(progress, "Recording user message")
+    store.append_context_history("user", user_message, extra={"turnId": turn_id, "mode": "context-chat"})
+    result = call_codex_context_chat(root, store, user_message, progress=progress)
+    assistant = str(result.get("assistant") or "").strip() or "(No assistant message returned.)"
+    emit_progress(progress, "Saving assistant output")
+    store.append_context_history(
+        "assistant",
+        assistant,
+        extra={
+            "provider": selected_provider,
+            "mode": "context-chat",
+            "turnId": turn_id,
+            "artifacts": [],
+            "approvalRequests": [],
+        },
+    )
+    turn_commit = internal_git_commit_turn(
+        store,
+        kind="context-chat",
+        actor="user+agent",
+        summary="Top-level contexts chat turn",
+        turn_id=turn_id,
+        metadata={"provider": selected_provider, "scope": "contexts"},
+    )
+    emit_progress(progress, "Refreshing branch view")
+    payload = context_chat_payload(store)
     payload["turnCommit"] = turn_commit
     return payload
 
@@ -5608,6 +5874,47 @@ def run_snapshot(root: Path, message: str, include_tools: bool = False) -> None:
         print("No ctxgit changes to commit.")
         return
     subprocess.run(["git", "commit", "-m", message], cwd=root, check=True)
+
+
+def context_chat_payload(store: ContextStore) -> dict[str, Any]:
+    store.require_initialized()
+    history_path = store.context_history_path()
+    if not history_path.exists():
+        write_text(history_path, "")
+    return {
+        "meta": {
+            "id": "contexts",
+            "title": "Contexts",
+            "scope": "contexts",
+        },
+        "archived": False,
+        "topLevel": True,
+        "paths": {
+            "root": relpath(store.root, store.contexts),
+            "history": relpath(store.root, history_path),
+            "index": relpath(store.root, store.contexts / "index.md") if (store.contexts / "index.md").exists() else "",
+        },
+        "context": read_text(store.contexts / "index.md") or read_text(store.contexts / "README.md"),
+        "history": list(store.iter_context_history()),
+        "approvalStatuses": {},
+        "notes": [],
+        "research": [],
+        "artifacts": [],
+        "sources": [],
+        "compactions": [],
+        "archives": [],
+        "git": {
+            "historyLog": run_git(store.root, ["log", "--oneline", "--", relpath(store.root, history_path)]),
+            "historyDiff": run_git(store.root, ["diff", "--", relpath(store.root, history_path)]),
+            "contextDiff": "",
+            "status": run_git(store.root, ["status", "--short", "--", relpath(store.root, history_path)]),
+            "internal": {
+                "ref": ctxgit_action_ref(),
+                "head": internal_git_rev_parse(store.root, ctxgit_action_ref()),
+                "log": internal_git_log(store.root, ctxgit_action_ref(), max_count=12),
+            },
+        },
+    }
 
 
 def branch_payload(store: ContextStore, branch_id: str) -> dict[str, Any]:
@@ -6909,6 +7216,9 @@ def make_handler(
             except SystemExit as exc:
                 self.send_json({"error": "project_not_initialized", "project": project_state.payload()}, status=int(exc.code or 409))
                 return True
+            if parsed.path == "/api/context-chat":
+                self.send_json(context_chat_payload(store))
+                return True
             if parsed.path == "/api/branches":
                 self.send_json(
                     {
@@ -7715,6 +8025,34 @@ def make_handler(
 
                 self.send_json(jobs.create("info-chat", work), status=202)
                 return
+            if parsed.path == "/api/context-chat/start":
+                text = str(body.get("text") or "").strip()
+                provider = str(body.get("provider") or "") or None
+                if not text:
+                    self.send_json({"error": "message_required"}, status=400)
+                    return
+                if jobs.prefer_worker or provider == "codex-worker":
+                    self.send_json(
+                        jobs.create_worker(
+                            "context-chat",
+                            {
+                                "kind": "context-chat",
+                                "mode": "context-chat",
+                                "branch": "__contexts__",
+                                "text": text,
+                                "provider": provider,
+                            },
+                            root=root,
+                        ),
+                        status=202,
+                    )
+                    return
+
+                def work(progress: ProgressCallback) -> dict[str, Any]:
+                    return run_context_chat_turn(root, store, text, provider=provider, progress=progress)
+
+                self.send_json(jobs.create("context-chat", work), status=202)
+                return
             if parsed.path == "/api/chat":
                 branch_id = str(body.get("branch") or "")
                 text = str(body.get("text") or "").strip()
@@ -7899,6 +8237,14 @@ def run_worker_claimed_job(
                 provider=provider,
                 progress=progress,
             )
+        elif kind == "context-chat":
+            payload = run_context_chat_turn(
+                project_root,
+                store,
+                str(request_payload.get("text") or ""),
+                provider=provider,
+                progress=progress,
+            )
         elif kind == "merge":
             payload = run_merge_branches(
                 project_root,
@@ -7974,7 +8320,7 @@ def run_worker(
     cache_dir = cache_dir.expanduser().resolve()
     cache_dir.mkdir(parents=True, exist_ok=True)
     worker_id = worker_id or f"{os.uname().nodename if hasattr(os, 'uname') else 'ctxgit'}-{uuid.uuid4().hex[:8]}"
-    capabilities = ["chat", "info-chat", "merge", "research"]
+    capabilities = ["chat", "info-chat", "context-chat", "merge", "research"]
     print(f"ctxgit worker {worker_id} polling {server}", flush=True)
     while True:
         claim = worker_json_request(

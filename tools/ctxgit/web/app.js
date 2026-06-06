@@ -2,6 +2,7 @@ const state = {
   project: null,
   activeBranch: null,
   activeGlobalized: null,
+  activeContextChat: false,
   branches: [],
   archived: [],
   views: [],
@@ -22,6 +23,7 @@ const state = {
   startingBranches: {},
 };
 
+const CONTEXT_CHAT_KEY = "__contexts__";
 const UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024;
 
 const els = {
@@ -51,6 +53,7 @@ const els = {
   openServerProjectButton: document.querySelector("#openServerProjectButton"),
   serverProjectStatus: document.querySelector("#serverProjectStatus"),
   branchList: document.querySelector("#branchList"),
+  contextChatButton: document.querySelector("#contextChatButton"),
   branchGraphButton: document.querySelector("#branchGraphButton"),
   viewList: document.querySelector("#viewList"),
   globalizedList: document.querySelector("#globalizedList"),
@@ -628,6 +631,7 @@ function setProjectStatus(message, kind = "") {
 function clearWorkspace(message = "Select or initialize a ctxgit project.") {
   state.activeBranch = null;
   state.activeGlobalized = null;
+  state.activeContextChat = false;
   state.branches = [];
   state.archived = [];
   state.views = [];
@@ -659,6 +663,10 @@ function clearWorkspace(message = "Select or initialize a ctxgit project.") {
   els.mergeStatus.textContent = "";
   hideProgress();
   hideEventPanel();
+}
+
+function activeChatKey() {
+  return state.activeContextChat ? CONTEXT_CHAT_KEY : state.activeBranch || "";
 }
 
 function renderProject(project) {
@@ -928,6 +936,9 @@ async function createFolderFromPrompt() {
 }
 
 function renderBranches() {
+  if (els.contextChatButton) {
+    els.contextChatButton.classList.toggle("active", state.activeContextChat === true);
+  }
   els.branchList.innerHTML = orderedBranches()
     .map((branch) => {
       const job = branchJob(branch.id);
@@ -1598,7 +1609,7 @@ function hideProgressSoon() {
 }
 
 function appendPendingUserMessage({ branch, text, mode }) {
-  if (state.activeBranch !== branch) return "";
+  if (activeChatKey() !== branch) return "";
   const pendingId = `pending-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   const historyCount = Array.isArray(state.payload?.history) ? state.payload.history.length : 0;
   const number = historyCount + els.messageList.querySelectorAll(".message.pending-message").length + 1;
@@ -1613,7 +1624,7 @@ function appendPendingUserMessage({ branch, text, mode }) {
           <span class="message-meta-actions">
             <span class="message-number">${number}</span>
             <span>${escapeHtml(new Date().toISOString())}</span>
-            <span class="pending-label">${escapeHtml(mode === "research" ? "research queued" : mode === "info-chat" ? "info queued" : "sending")}</span>
+            <span class="pending-label">${escapeHtml(mode === "research" ? "research queued" : mode === "info-chat" ? "info queued" : mode === "context-chat" ? "context queued" : "sending")}</span>
           </span>
         </div>
         <div class="message-text">${renderMessageText(text)}</div>
@@ -1650,12 +1661,12 @@ function rememberJob(job, meta = {}) {
   return remembered;
 }
 
-function branchJob(branch = state.activeBranch) {
+function branchJob(branch = activeChatKey()) {
   const jobId = branch ? state.branchJobs[branch] : "";
   return jobId ? state.jobs[jobId] : null;
 }
 
-function activeBranchRunningJob(branch = state.activeBranch) {
+function activeBranchRunningJob(branch = activeChatKey()) {
   const job = branchJob(branch);
   return job?.status === "running" ? job : null;
 }
@@ -1672,17 +1683,22 @@ function resizeMessageInput() {
 }
 
 function updateComposerState() {
-  const running = activeBranchRunningJob();
-  const startingMode = state.activeBranch ? state.startingBranches[state.activeBranch] : "";
+  const activeKey = activeChatKey();
+  const running = activeBranchRunningJob(activeKey);
+  const startingMode = activeKey ? state.startingBranches[activeKey] : "";
   const archived = state.payload?.archived === true;
-  const disabled = !state.activeBranch || archived || Boolean(running) || Boolean(startingMode);
+  const disabled = !activeKey || archived || Boolean(running) || Boolean(startingMode);
   els.sendButton.disabled = disabled;
-  els.researchButton.disabled = disabled;
+  els.researchButton.disabled = disabled || state.activeContextChat === true;
   els.historyChatButton.disabled = disabled;
   const busyMode = running?.mode || startingMode;
-  els.sendButton.textContent = archived ? "Archived" : busyMode === "chat" ? "생각 중" : "Send";
+  els.sendButton.textContent = archived ? "Archived" : busyMode === "chat" || busyMode === "context-chat" ? "생각 중" : "Send";
   els.researchButton.textContent = archived ? "Archived" : busyMode === "research" ? "리서치 중" : "Research";
-  els.historyChatButton.textContent = archived ? "Archived" : busyMode === "info-chat" ? "Info..." : "Info chat";
+  els.historyChatButton.textContent = archived
+    ? "Archived"
+    : busyMode === "info-chat" || busyMode === "context-chat"
+      ? "Info..."
+      : "Info chat";
 }
 
 function renderActiveBranchJob() {
@@ -1718,7 +1734,7 @@ async function startTrackedJob(endpoint, body, { branch, mode, title }) {
     body: JSON.stringify(body),
   });
   const remembered = rememberJob(started, { branch, mode });
-  if (state.activeBranch === branch) {
+  if (activeChatKey() === branch) {
     showProgress(title);
     updateProgress(remembered);
     renderEventPanel(remembered);
@@ -1750,7 +1766,7 @@ function handleMonitorError(job, error) {
     },
     { branch: job.branch, mode: job.mode },
   );
-  if (state.activeBranch === failed.branch) {
+  if (activeChatKey() === failed.branch) {
     renderEventPanel(failed);
     showChatError(`작업 모니터링 실패: ${failed.message}`);
     hideProgress();
@@ -1800,7 +1816,7 @@ async function monitorTrackedJob(jobId) {
           },
           { branch, mode: tracked.mode },
         );
-        if (state.activeBranch === branch) {
+        if (activeChatKey() === branch) {
           updateProgress(reconnecting);
           renderEventPanel(reconnecting);
           updateComposerState();
@@ -1831,19 +1847,23 @@ async function monitorTrackedJob(jobId) {
       }
     }
     const remembered = rememberJob(job, { branch, mode: tracked.mode });
-    const isActiveBranch = state.activeBranch === branch;
-    if (state.activeBranch === branch) {
+    const isActiveChat = activeChatKey() === branch;
+    if (isActiveChat) {
       updateProgress(remembered);
       renderEventPanel(remembered);
       updateComposerState();
     }
     if (remembered.status === "done") {
-      if (isActiveBranch) {
+      if (isActiveChat) {
         acknowledgeBranchJob(branch);
       }
       await refreshBranchNavigation().catch(() => {});
-      if (state.activeBranch === branch) {
-        renderBranch(remembered.payload);
+      if (activeChatKey() === branch) {
+        if (remembered.mode === "context-chat" || remembered.payload?.topLevel === true) {
+          renderContextChat(remembered.payload);
+        } else {
+          renderBranch(remembered.payload);
+        }
         if (remembered.mode === "merge") {
           selectTab("archives");
         }
@@ -1857,8 +1877,19 @@ async function monitorTrackedJob(jobId) {
     }
     if (remembered.status === "failed") {
       renderBranches();
-      if (state.activeBranch === branch) {
-        const prefix = remembered.error === "timeout" ? "시간 초과" : remembered.error === "job_not_found" ? "중단됨" : remembered.mode === "research" ? "리서치 실패" : remembered.mode === "merge" ? "머지 실패" : "채팅 실패";
+      if (activeChatKey() === branch) {
+        const prefix =
+          remembered.error === "timeout"
+            ? "시간 초과"
+            : remembered.error === "job_not_found"
+              ? "중단됨"
+              : remembered.mode === "research"
+                ? "리서치 실패"
+                : remembered.mode === "merge"
+                  ? "머지 실패"
+                  : remembered.mode === "context-chat"
+                    ? "컨텍스트 챗 실패"
+                    : "채팅 실패";
         showChatError(`${prefix}: ${remembered.message || "작업 실패"}`);
         hideProgress();
       }
@@ -2015,6 +2046,53 @@ function renderBranch(payload) {
   updateComposerState();
 }
 
+function renderContextChat(payload) {
+  hideChatError();
+  state.payload = payload;
+  const meta = payload.meta || {};
+  els.activeTitle.textContent = meta.title || "Contexts";
+  els.activeMeta.textContent = `${meta.id || "contexts"} · top-level contexts chat`;
+
+  replaceMessageListHtml(
+    (payload.history || [])
+      .map(
+        (message, index) => `
+          <article class="message">
+            <div class="message-header">
+              <span class="message-role">${escapeHtml(message.role)}</span>
+              <span class="message-meta-actions">
+                <span class="message-number">${index + 1}</span>
+                <span>${escapeHtml(message.createdAt)}</span>
+              </span>
+            </div>
+            <div class="message-text">${renderMessageText(message.text)}</div>
+          </article>
+        `,
+      )
+      .join("") || '<div class="muted">No top-level context messages yet.</div>',
+  );
+  scrollChatToBottom();
+
+  els.reportView.innerHTML = renderMarkdown(payload.context || "");
+  els.trackedFiles.innerHTML = `
+    <dt>contexts</dt><dd>${escapeHtml(payload.paths?.root || "contexts")}</dd>
+    <dt>history</dt><dd>${escapeHtml(payload.paths?.history || "contexts/history.jsonl")}</dd>
+    <dt>ctxgit ref</dt><dd>${escapeHtml(payload.git?.internal?.ref || "")}</dd>
+    <dt>ctxgit head</dt><dd>${escapeHtml(payload.git?.internal?.head || "")}</dd>
+  `;
+  els.historyLog.textContent =
+    payload.git?.internal?.log || payload.git?.historyLog || "No internal ctxgit commits for contexts chat yet.";
+  els.currentDiff.textContent =
+    [payload.git?.status, payload.git?.historyDiff].filter(Boolean).join("\n\n") ||
+    "No uncommitted contexts chat diff.";
+  if (els.internalGitLog) {
+    els.internalGitLog.textContent = payload.git?.internal?.log || "No internal ctxgit commits for contexts chat yet.";
+  }
+  els.researchList.innerHTML = '<div class="muted">Top-level context chat has no branch documents.</div>';
+  renderArchives([]);
+  updateComposerState();
+}
+
 function renderArchives(archives) {
   if (!archives.length) {
     els.archiveList.innerHTML = '<div class="muted">No merged source archives.</div>';
@@ -2043,11 +2121,13 @@ async function loadBranches() {
   state.archived = data.archived || [];
   state.views = data.views || [];
   state.globalized = data.globalized || [];
-  if (!state.activeBranch && !state.activeGlobalized && state.branches.length) {
+  if (!state.activeContextChat && !state.activeBranch && !state.activeGlobalized && state.branches.length) {
     state.activeBranch = state.branches[0].id;
   }
   renderBranches();
-  if (state.activeBranch) {
+  if (state.activeContextChat) {
+    await loadContextChat();
+  } else if (state.activeBranch) {
     await loadBranch(state.activeBranch);
   } else {
     els.activeTitle.textContent = "No branch selected";
@@ -2101,6 +2181,8 @@ async function openProject(path, { init }) {
     });
     renderProject(project);
     state.activeBranch = null;
+    state.activeGlobalized = null;
+    state.activeContextChat = false;
     state.fileBrowser = { path: "", parent: "", entries: [] };
     await loadBranches();
     await loadProjectFiles("");
@@ -2133,6 +2215,7 @@ async function openServerProject() {
     renderProject(project);
     state.activeBranch = null;
     state.activeGlobalized = null;
+    state.activeContextChat = false;
     state.fileBrowser = { path: "", parent: "", entries: [] };
     await loadServerProjects();
     await loadBranches();
@@ -2179,6 +2262,7 @@ async function projectPathForAction() {
 async function loadBranch(branch) {
   state.activeBranch = branch;
   state.activeGlobalized = null;
+  state.activeContextChat = false;
   acknowledgeBranchJob(branch);
   selectTab("chat");
   renderBranches();
@@ -2190,6 +2274,22 @@ async function loadBranch(branch) {
   renderGit(git);
   renderProvider(await api("/api/provider/status"));
   if (state.activeBranch !== branch) return;
+  renderActiveBranchJob();
+}
+
+async function loadContextChat() {
+  state.activeBranch = null;
+  state.activeGlobalized = null;
+  state.activeContextChat = true;
+  acknowledgeBranchJob(CONTEXT_CHAT_KEY);
+  selectTab("chat");
+  renderBranches();
+  const payload = await api("/api/context-chat");
+  if (!state.activeContextChat) return;
+  renderContextChat(payload);
+  renderGit(await api("/api/git/status"));
+  renderProvider(await api("/api/provider/status"));
+  if (!state.activeContextChat) return;
   renderActiveBranchJob();
 }
 
@@ -2451,6 +2551,7 @@ async function loadGlobalizedArchive(archiveId) {
   const payload = await api(`/api/globalized?id=${encodeURIComponent(archiveId)}`);
   state.activeBranch = null;
   state.activeGlobalized = archiveId;
+  state.activeContextChat = false;
   renderBranches();
   const meta = payload.meta || {};
   const range = `${meta.rangeStart || "?"}-${meta.rangeEnd || "?"}`;
@@ -2494,6 +2595,7 @@ async function loadView(view) {
   const payload = await api(`/api/view?id=${encodeURIComponent(view)}`);
   state.activeBranch = null;
   state.activeGlobalized = null;
+  state.activeContextChat = false;
   renderBranches();
   els.activeTitle.textContent = payload.id;
   els.activeMeta.textContent = payload.path;
@@ -2580,6 +2682,12 @@ els.browseProjectButton.addEventListener("click", async () => {
 
 els.openServerProjectButton.addEventListener("click", openServerProject);
 
+els.contextChatButton.addEventListener("click", () => {
+  loadContextChat().catch((error) => {
+    showChatError(`Contexts chat failed: ${error.message}`);
+  });
+});
+
 els.filePathForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   await loadProjectFiles(els.filePathInput.value.trim());
@@ -2640,12 +2748,17 @@ els.mergeForm.addEventListener("submit", async (event) => {
 });
 
 async function sendComposerMessage({ mode }) {
-  if (!state.activeBranch) return;
-  if (state.payload?.archived === true) {
+  const isContextChat = state.activeContextChat === true;
+  if (!state.activeBranch && !isContextChat) return;
+  if (isContextChat && mode === "research") {
+    window.alert("Contexts chat은 전체 맥락을 보는 읽기 전용 챗이라 research 작업은 브랜치에서 실행해주세요.");
+    return;
+  }
+  if (!isContextChat && state.payload?.archived === true) {
     window.alert("Archived branches are read-only. Fork or clone it before continuing work.");
     return;
   }
-  const branch = state.activeBranch;
+  const branch = isContextChat ? CONTEXT_CHAT_KEY : state.activeBranch;
   const text = els.messageInput.value.trim();
   if (!text) return;
   hideChatError();
@@ -2653,16 +2766,31 @@ async function sendComposerMessage({ mode }) {
   const isResearch = mode === "research";
   const isInfoChat = mode === "info-chat";
   if (activeBranchRunningJob(branch) || state.startingBranches[branch]) {
-    window.alert("이 브랜치에는 이미 실행 중인 작업이 있습니다. 다른 브랜치로 이동하면 별도 작업을 시작할 수 있습니다.");
+    window.alert(
+      isContextChat
+        ? "Contexts chat에는 이미 실행 중인 작업이 있습니다."
+        : "이 브랜치에는 이미 실행 중인 작업이 있습니다. 다른 브랜치로 이동하면 별도 작업을 시작할 수 있습니다.",
+    );
     return;
   }
-  const requestedMode = isResearch ? "research" : isInfoChat ? "info-chat" : "chat";
+  const requestedMode = isContextChat ? "context-chat" : isResearch ? "research" : isInfoChat ? "info-chat" : "chat";
   state.startingBranches[branch] = requestedMode;
   markBranchActivity(branch);
   updateComposerState();
   renderBranches();
   const pendingMessageId = appendPendingUserMessage({ branch, text, mode: requestedMode });
   try {
+    if (isContextChat) {
+      const provider = state.worker?.preferWorker ? "codex-worker" : "codex";
+      await startTrackedJob(
+        "/api/context-chat/start",
+        { text, provider },
+        { branch, mode: "context-chat", title: "전체 컨텍스트 챗 시작 중" },
+      );
+      els.messageInput.value = "";
+      resizeMessageInput();
+      return;
+    }
     if (isResearch) {
       await startTrackedJob(
         "/api/research/start",
@@ -2699,8 +2827,16 @@ async function sendComposerMessage({ mode }) {
     removePendingUserMessage(pendingMessageId);
     const isTimeout = error instanceof ApiError && error.payload?.error === "timeout";
     const isMissingJob = error instanceof ApiError && error.payload?.error === "job_not_found";
-    const prefix = isTimeout ? "시간 초과" : isMissingJob ? "중단됨" : isResearch ? "리서치 실패" : "채팅 실패";
-    if (state.activeBranch === branch) {
+    const prefix = isTimeout
+      ? "시간 초과"
+      : isMissingJob
+        ? "중단됨"
+        : isContextChat
+          ? "컨텍스트 챗 실패"
+          : isResearch
+            ? "리서치 실패"
+            : "채팅 실패";
+    if (activeChatKey() === branch) {
       showChatError(`${prefix}: ${error.message}`);
       hideProgress();
     } else {

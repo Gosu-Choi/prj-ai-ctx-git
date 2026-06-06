@@ -1373,6 +1373,56 @@ class CtxgitTest(unittest.TestCase):
             self.assertEqual(payload["history"][-1]["artifacts"], [])
             self.assertEqual(payload["history"][-1]["approvalRequests"], [])
 
+    def test_context_chat_payload_uses_top_level_contexts_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.init()
+            store.create_branch("AItrust", title="AI trust")
+            ctxgit.write_text(root / "contexts" / "index.md", "# Context index\n\nOverall map.")
+            store.append_context_history("user", "What is the overall context?")
+
+            payload = ctxgit.context_chat_payload(store)
+            prompt = ctxgit.build_context_chat_prompt(store, "Summarize.")
+
+            self.assertTrue((root / "contexts" / "history.jsonl").exists())
+            self.assertEqual(payload["meta"]["id"], "contexts")
+            self.assertTrue(payload["topLevel"])
+            self.assertFalse(payload["archived"])
+            self.assertEqual(payload["paths"]["root"], "contexts")
+            self.assertEqual(payload["paths"]["history"], "contexts/history.jsonl")
+            self.assertEqual(payload["history"][-1]["scope"], "contexts")
+            self.assertIn("Overall map", payload["context"])
+            self.assertIn("scoped to the `contexts/` directory", prompt)
+            self.assertIn("AItrust", prompt)
+            self.assertIn("Do not fork branches", prompt)
+
+    def test_context_chat_turn_records_assistant_without_branch_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.init()
+            original = ctxgit.call_codex_context_chat
+            try:
+                ctxgit.call_codex_context_chat = lambda *_args, **_kwargs: {
+                    "assistant": "Overall context answer.",
+                    "artifacts": [{"kind": "ignored", "title": "ignored", "body": "ignored"}],
+                    "approvalRequests": [{"path": "ignored", "operation": "ignored", "reason": "ignored"}],
+                }
+                payload = ctxgit.run_context_chat_turn(root, store, "Use all contexts.")
+            finally:
+                ctxgit.call_codex_context_chat = original
+
+            self.assertTrue(payload["topLevel"])
+            self.assertEqual(payload["history"][-2]["role"], "user")
+            self.assertEqual(payload["history"][-2]["scope"], "contexts")
+            self.assertEqual(payload["history"][-1]["role"], "assistant")
+            self.assertEqual(payload["history"][-1]["mode"], "context-chat")
+            self.assertEqual(payload["history"][-1]["artifacts"], [])
+            self.assertEqual(payload["history"][-1]["approvalRequests"], [])
+            self.assertEqual(payload["turnCommit"]["ref"], ctxgit.ctxgit_action_ref())
+            self.assertIn("ctxgit: context-chat", ctxgit.internal_git_log(root, ctxgit.ctxgit_action_ref()))
+
     def test_chat_turn_records_user_before_provider_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

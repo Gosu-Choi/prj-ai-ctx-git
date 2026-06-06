@@ -371,7 +371,8 @@ textarea {
   color: #842828;
 }
 
-.nav-item.active {
+.nav-item.active,
+.wide-button.active {
   border-color: var(--accent);
   background: var(--accent-soft);
 }
