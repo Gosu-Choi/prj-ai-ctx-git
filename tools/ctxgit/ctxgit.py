@@ -8005,7 +8005,7 @@ def run_server(
     projects_root: Path | None = None,
     worker_token: str = "",
     prefer_worker: bool = False,
-    auth_required: bool = True,
+    auth_required: bool = False,
 ) -> None:
     project_state = ProjectState(root)
     project_registry = ServerProjectRegistry(root, projects_root)
@@ -8124,7 +8124,9 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--projects-root", help="Directory containing server-hosted ctxgit projects")
     serve.add_argument("--worker-token", default="", help="Token local workers must send")
     serve.add_argument("--codex-worker", action="store_true", help="Queue Codex-backed jobs for a local worker")
-    serve.add_argument("--no-auth", action="store_true", help="Disable web login gate; use only for local/private access")
+    serve.add_argument("--auth", dest="auth_required", action="store_true", help="Enable the web login gate")
+    serve.add_argument("--no-auth", dest="auth_required", action="store_false", help="Disable the web login gate")
+    serve.set_defaults(auth_required=False)
 
     worker = sub.add_parser("worker", help="Run a local Codex worker for a ctxgit server")
     worker.add_argument("--server", required=True, help="ctxgit server URL, for example http://127.0.0.1:8765")
@@ -8339,7 +8341,7 @@ def main(argv: list[str] | None = None) -> int:
             projects_root=Path(args.projects_root).expanduser().resolve() if args.projects_root else None,
             worker_token=args.worker_token,
             prefer_worker=args.codex_worker,
-            auth_required=not args.no_auth,
+            auth_required=args.auth_required,
         )
         return 0
 

@@ -389,6 +389,17 @@ class CtxgitTest(unittest.TestCase):
             self.assertEqual(project_status, 200)
             self.assertEqual(project["path"], str(root.resolve()))
 
+    def test_serve_defaults_to_no_auth_with_auth_opt_in(self) -> None:
+        parser = ctxgit.build_parser()
+
+        default_args = parser.parse_args(["serve"])
+        auth_args = parser.parse_args(["serve", "--auth"])
+        no_auth_args = parser.parse_args(["serve", "--no-auth"])
+
+        self.assertFalse(default_args.auth_required)
+        self.assertTrue(auth_args.auth_required)
+        self.assertFalse(no_auth_args.auth_required)
+
     def test_internal_git_commits_turn_to_branch_ref(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
