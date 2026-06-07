@@ -761,6 +761,21 @@ textarea {
   border-radius: 6px;
 }
 
+.composer button[hidden] {
+  display: none;
+}
+
+.composer button.danger-button {
+  border-color: #a72e2e;
+  background: #a72e2e;
+  color: #fff;
+}
+
+.composer button.danger-button:hover:not([disabled]) {
+  border-color: #842828;
+  background: #842828;
+}
+
 .composer button[disabled] {
   cursor: wait;
   opacity: 0.65;

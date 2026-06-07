@@ -1423,6 +1423,22 @@ class CtxgitTest(unittest.TestCase):
             self.assertEqual(payload["turnCommit"]["ref"], ctxgit.ctxgit_action_ref())
             self.assertIn("ctxgit: context-chat", ctxgit.internal_git_log(root, ctxgit.ctxgit_action_ref()))
 
+    def test_context_chat_reset_clears_history_and_commits_action(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.init()
+            store.append_context_history("user", "first")
+            store.append_context_history("assistant", "second")
+
+            payload = ctxgit.reset_context_chat_history(store)
+
+            self.assertEqual(payload["history"], [])
+            self.assertEqual(payload["reset"]["removedMessages"], 2)
+            self.assertEqual((root / "contexts" / "history.jsonl").read_text(encoding="utf-8"), "")
+            self.assertEqual(payload["turnCommit"]["ref"], ctxgit.ctxgit_action_ref())
+            self.assertIn("ctxgit: context-chat-reset", ctxgit.internal_git_log(root, ctxgit.ctxgit_action_ref()))
+
     def test_chat_turn_records_user_before_provider_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

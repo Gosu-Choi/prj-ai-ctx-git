@@ -21,6 +21,7 @@ const state = {
   branchActivityAt: {},
   acknowledgedBranchJobs: {},
   startingBranches: {},
+  messageDrafts: {},
 };
 
 const CONTEXT_CHAT_KEY = "__contexts__";
@@ -111,6 +112,7 @@ const els = {
   messageInput: document.querySelector("#messageInput"),
   sendButton: document.querySelector("#sendButton"),
   researchButton: document.querySelector("#researchButton"),
+  contextResetButton: document.querySelector("#contextResetButton"),
   historyChatButton: document.querySelector("#historyChatButton"),
   refreshButton: document.querySelector("#refreshButton"),
 };
@@ -639,6 +641,7 @@ function clearWorkspace(message = "Select or initialize a ctxgit project.") {
   state.graph = null;
   state.payload = null;
   state.fileBrowser = { path: "", parent: "", entries: [] };
+  state.messageDrafts = {};
   renderBranches();
   hideChatError();
   els.activeTitle.textContent = "No project selected";
@@ -661,12 +664,44 @@ function clearWorkspace(message = "Select or initialize a ctxgit project.") {
   els.gitSummary.innerHTML = "";
   els.providerSummary.innerHTML = "";
   els.mergeStatus.textContent = "";
+  if (els.messageInput) {
+    els.messageInput.value = "";
+    resizeMessageInput();
+  }
   hideProgress();
   hideEventPanel();
+  updateComposerState();
 }
 
 function activeChatKey() {
   return state.activeContextChat ? CONTEXT_CHAT_KEY : state.activeBranch || "";
+}
+
+function saveActiveDraft() {
+  const key = activeChatKey();
+  if (!key || !els.messageInput) return;
+  const value = els.messageInput.value;
+  if (value) {
+    state.messageDrafts[key] = value;
+  } else {
+    delete state.messageDrafts[key];
+  }
+}
+
+function restoreActiveDraft() {
+  if (!els.messageInput) return;
+  const key = activeChatKey();
+  els.messageInput.value = key ? state.messageDrafts[key] || "" : "";
+  resizeMessageInput();
+}
+
+function clearDraft(key) {
+  if (!key) return;
+  delete state.messageDrafts[key];
+  if (activeChatKey() === key && els.messageInput) {
+    els.messageInput.value = "";
+    resizeMessageInput();
+  }
 }
 
 function renderProject(project) {
@@ -1687,13 +1722,19 @@ function updateComposerState() {
   const running = activeBranchRunningJob(activeKey);
   const startingMode = activeKey ? state.startingBranches[activeKey] : "";
   const archived = state.payload?.archived === true;
+  const contextMode = state.activeContextChat === true;
   const disabled = !activeKey || archived || Boolean(running) || Boolean(startingMode);
+  els.researchButton.hidden = contextMode;
+  els.contextResetButton.hidden = !contextMode;
+  els.historyChatButton.hidden = contextMode;
   els.sendButton.disabled = disabled;
-  els.researchButton.disabled = disabled || state.activeContextChat === true;
+  els.researchButton.disabled = disabled;
+  els.contextResetButton.disabled = !contextMode || !activeKey || Boolean(running) || Boolean(startingMode);
   els.historyChatButton.disabled = disabled;
   const busyMode = running?.mode || startingMode;
   els.sendButton.textContent = archived ? "Archived" : busyMode === "chat" || busyMode === "context-chat" ? "생각 중" : "Send";
   els.researchButton.textContent = archived ? "Archived" : busyMode === "research" ? "리서치 중" : "Research";
+  els.contextResetButton.textContent = busyMode === "context-chat" ? "Busy" : "Reset";
   els.historyChatButton.textContent = archived
     ? "Archived"
     : busyMode === "info-chat" || busyMode === "context-chat"
@@ -2043,6 +2084,7 @@ function renderBranch(payload) {
       )
       .join("") || '<div class="muted">No research notes yet.</div>';
   renderArchives(payload.archives || []);
+  restoreActiveDraft();
   updateComposerState();
 }
 
@@ -2090,6 +2132,7 @@ function renderContextChat(payload) {
   }
   els.researchList.innerHTML = '<div class="muted">Top-level context chat has no branch documents.</div>';
   renderArchives([]);
+  restoreActiveDraft();
   updateComposerState();
 }
 
@@ -2133,6 +2176,8 @@ async function loadBranches() {
     els.activeTitle.textContent = "No branch selected";
     els.activeMeta.textContent = "Create a branch from the terminal with ctxgit branch <id>.";
     replaceMessageListHtml('<div class="muted">No messages yet.</div>');
+    restoreActiveDraft();
+    updateComposerState();
   }
 }
 
@@ -2170,6 +2215,7 @@ async function loadProject() {
 
 async function openProject(path, { init }) {
   if (!path) return;
+  saveActiveDraft();
   els.openProjectButton.disabled = true;
   els.initProjectButton.disabled = true;
   els.browseProjectButton.disabled = true;
@@ -2183,6 +2229,7 @@ async function openProject(path, { init }) {
     state.activeBranch = null;
     state.activeGlobalized = null;
     state.activeContextChat = false;
+    state.messageDrafts = {};
     state.fileBrowser = { path: "", parent: "", entries: [] };
     await loadBranches();
     await loadProjectFiles("");
@@ -2205,6 +2252,7 @@ async function openProject(path, { init }) {
 async function openServerProject() {
   const id = els.serverProjectSelect.value;
   if (!id) return;
+  saveActiveDraft();
   els.openServerProjectButton.disabled = true;
   setServerProjectStatus("Opening server project...");
   try {
@@ -2216,6 +2264,7 @@ async function openServerProject() {
     state.activeBranch = null;
     state.activeGlobalized = null;
     state.activeContextChat = false;
+    state.messageDrafts = {};
     state.fileBrowser = { path: "", parent: "", entries: [] };
     await loadServerProjects();
     await loadBranches();
@@ -2260,6 +2309,7 @@ async function projectPathForAction() {
 }
 
 async function loadBranch(branch) {
+  saveActiveDraft();
   state.activeBranch = branch;
   state.activeGlobalized = null;
   state.activeContextChat = false;
@@ -2278,6 +2328,7 @@ async function loadBranch(branch) {
 }
 
 async function loadContextChat() {
+  saveActiveDraft();
   state.activeBranch = null;
   state.activeGlobalized = null;
   state.activeContextChat = true;
@@ -2412,7 +2463,10 @@ async function forkHistoryMessage(button) {
         role: button.dataset.historyRole || "",
       }),
     });
+    saveActiveDraft();
     state.activeBranch = targetId;
+    state.activeGlobalized = null;
+    state.activeContextChat = false;
     await loadBranches();
     renderBranch(payload);
     renderGit(await api("/api/git/status"));
@@ -2433,7 +2487,10 @@ async function cloneBranch(source, title) {
       method: "POST",
       body: JSON.stringify({ source, target, title: targetTitle }),
     });
+    saveActiveDraft();
     state.activeBranch = target;
+    state.activeGlobalized = null;
+    state.activeContextChat = false;
     await loadBranches();
     renderBranch(payload);
   } catch (error) {
@@ -2448,7 +2505,10 @@ async function renameBranch(branch, title) {
       method: "POST",
       body: JSON.stringify({ branch, title }),
     });
+    saveActiveDraft();
     state.activeBranch = branch;
+    state.activeGlobalized = null;
+    state.activeContextChat = false;
     await loadBranches();
     renderBranch(payload);
   } catch (error) {
@@ -2462,9 +2522,11 @@ async function removeBranch(branch) {
       method: "POST",
       body: JSON.stringify({ branch }),
     });
+    delete state.messageDrafts[branch];
     if (state.activeBranch === branch) {
       state.activeBranch = null;
       state.payload = null;
+      restoreActiveDraft();
     }
     await loadBranches();
   } catch (error) {
@@ -2499,9 +2561,11 @@ async function archiveBranch(branch) {
     state.archived = payload.archived || state.archived;
     state.views = payload.views || state.views;
     state.globalized = payload.globalized || state.globalized;
+    delete state.messageDrafts[branch];
     if (state.activeBranch === branch) {
       state.activeBranch = null;
       state.payload = null;
+      restoreActiveDraft();
     }
     await refreshBranchNavigation();
     if (payload.archive?.id) {
@@ -2548,10 +2612,13 @@ async function loadArchive(archiveId) {
 
 async function loadGlobalizedArchive(archiveId) {
   if (!archiveId) return;
+  saveActiveDraft();
   const payload = await api(`/api/globalized?id=${encodeURIComponent(archiveId)}`);
   state.activeBranch = null;
   state.activeGlobalized = archiveId;
   state.activeContextChat = false;
+  restoreActiveDraft();
+  updateComposerState();
   renderBranches();
   const meta = payload.meta || {};
   const range = `${meta.rangeStart || "?"}-${meta.rangeEnd || "?"}`;
@@ -2592,10 +2659,13 @@ async function loadGlobalizedArchive(archiveId) {
 }
 
 async function loadView(view) {
+  saveActiveDraft();
   const payload = await api(`/api/view?id=${encodeURIComponent(view)}`);
   state.activeBranch = null;
   state.activeGlobalized = null;
   state.activeContextChat = false;
+  restoreActiveDraft();
+  updateComposerState();
   renderBranches();
   els.activeTitle.textContent = payload.id;
   els.activeMeta.textContent = payload.path;
@@ -2727,7 +2797,10 @@ els.mergeForm.addEventListener("submit", async (event) => {
   els.mergeStatus.textContent = "Starting merge...";
   els.mergeStatus.className = "settings-status";
   try {
+    saveActiveDraft();
     state.activeBranch = name;
+    state.activeGlobalized = null;
+    state.activeContextChat = false;
     markBranchActivity(name);
     renderBranches();
     await startTrackedJob(
@@ -2787,8 +2860,7 @@ async function sendComposerMessage({ mode }) {
         { text, provider },
         { branch, mode: "context-chat", title: "전체 컨텍스트 챗 시작 중" },
       );
-      els.messageInput.value = "";
-      resizeMessageInput();
+      clearDraft(branch);
       return;
     }
     if (isResearch) {
@@ -2797,8 +2869,7 @@ async function sendComposerMessage({ mode }) {
         { branch, text, provider: "hybrid" },
         { branch, mode: "research", title: "리서치 시작 중" },
       );
-      els.messageInput.value = "";
-      resizeMessageInput();
+      clearDraft(branch);
       return;
     }
     if (isChat) {
@@ -2808,8 +2879,7 @@ async function sendComposerMessage({ mode }) {
         { branch, text, provider },
         { branch, mode: "chat", title: "채팅 턴 시작 중" },
       );
-      els.messageInput.value = "";
-      resizeMessageInput();
+      clearDraft(branch);
       return;
     }
     if (isInfoChat) {
@@ -2819,8 +2889,7 @@ async function sendComposerMessage({ mode }) {
         { branch, text, provider },
         { branch, mode: "info-chat", title: "정보 챗 시작 중" },
       );
-      els.messageInput.value = "";
-      resizeMessageInput();
+      clearDraft(branch);
       return;
     }
   } catch (error) {
@@ -2848,6 +2917,36 @@ async function sendComposerMessage({ mode }) {
   }
 }
 
+async function resetContextChatHistory() {
+  const key = CONTEXT_CHAT_KEY;
+  if (!state.activeContextChat) return;
+  if (activeBranchRunningJob(key) || state.startingBranches[key]) {
+    window.alert("Contexts chat 작업이 실행 중이라 지금은 reset할 수 없습니다.");
+    return;
+  }
+  if (!window.confirm("Reset overall chat history?\n\ncontexts/history.jsonl이 비워집니다.")) {
+    return;
+  }
+  hideChatError();
+  els.contextResetButton.disabled = true;
+  try {
+    const payload = await api("/api/context-chat/reset", {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    clearDraft(key);
+    if (state.activeContextChat) {
+      renderContextChat(payload);
+      renderGit(await api("/api/git/status"));
+      renderProvider(await api("/api/provider/status"));
+    }
+  } catch (error) {
+    showChatError(`Reset failed: ${error.message}`);
+  } finally {
+    updateComposerState();
+  }
+}
+
 els.composer.addEventListener("submit", async (event) => {
   event.preventDefault();
   await sendComposerMessage({ mode: "chat" });
@@ -2859,7 +2958,10 @@ els.messageInput.addEventListener("keydown", async (event) => {
   await sendComposerMessage({ mode: "info-chat" });
 });
 
-els.messageInput.addEventListener("input", resizeMessageInput);
+els.messageInput.addEventListener("input", () => {
+  saveActiveDraft();
+  resizeMessageInput();
+});
 resizeMessageInput();
 
 els.copyEventLogButton.addEventListener("click", copyEventLog);
@@ -2904,6 +3006,8 @@ els.historyChatButton.addEventListener("click", async () => {
 els.researchButton.addEventListener("click", async () => {
   await sendComposerMessage({ mode: "research" });
 });
+
+els.contextResetButton.addEventListener("click", resetContextChatHistory);
 
 els.refreshButton.addEventListener("click", async () => {
   await loadProject();

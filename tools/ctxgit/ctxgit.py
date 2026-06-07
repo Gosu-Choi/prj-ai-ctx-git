@@ -1848,6 +1848,12 @@ class ContextStore:
             handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
         return record
 
+    def reset_context_history(self) -> int:
+        self.require_initialized()
+        records = list(self.iter_context_history())
+        write_text(self.context_history_path(), "")
+        return len(records)
+
     def add_note(self, branch_id: str, title: str, body: str, kind: str = "note") -> Path:
         paths = self.branch_paths(branch_id)
         if not paths.root.exists():
@@ -5324,6 +5330,23 @@ def run_context_chat_turn(
     return payload
 
 
+def reset_context_chat_history(store: ContextStore) -> dict[str, Any]:
+    removed_count = store.reset_context_history()
+    turn_id = new_turn_id()
+    turn_commit = internal_git_commit_turn(
+        store,
+        kind="context-chat-reset",
+        actor="user",
+        summary="Reset top-level contexts chat history",
+        turn_id=turn_id,
+        metadata={"scope": "contexts", "removedMessages": removed_count},
+    )
+    payload = context_chat_payload(store)
+    payload["reset"] = {"removedMessages": removed_count}
+    payload["turnCommit"] = turn_commit
+    return payload
+
+
 def format_merge_prompt_records(records: list[dict[str, Any]]) -> str:
     if not records:
         return "(none)"
@@ -8052,6 +8075,14 @@ def make_handler(
                     return run_context_chat_turn(root, store, text, provider=provider, progress=progress)
 
                 self.send_json(jobs.create("context-chat", work), status=202)
+                return
+            if parsed.path == "/api/context-chat/reset":
+                try:
+                    self.send_json(reset_context_chat_history(store))
+                except SystemExit as exc:
+                    self.send_json({"error": "context_chat_reset_failed"}, status=int(exc.code or 400))
+                except Exception as exc:
+                    self.send_json({"error": "context_chat_reset_failed", "message": str(exc)}, status=500)
                 return
             if parsed.path == "/api/chat":
                 branch_id = str(body.get("branch") or "")
