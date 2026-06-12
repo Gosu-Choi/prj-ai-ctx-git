@@ -759,6 +759,27 @@ textarea {
   color: inherit;
 }
 
+.message-resources {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.message-resources-label {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0;
+}
+
+.message-resources code {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
 .resource-stage {
   display: grid;
   gap: 8px;

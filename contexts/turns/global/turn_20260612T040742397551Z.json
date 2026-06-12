@@ -1,0 +1,12 @@
+{
+  "actor": "system",
+  "branch": "",
+  "createdAt": "2026-06-12T04:07:42Z",
+  "id": "turn_20260612T040742397551Z",
+  "kind": "baseline",
+  "metadata": {
+    "reason": "bootstrap internal ctxgit git repository"
+  },
+  "schemaVersion": 1,
+  "summary": "Initial ctxgit internal snapshot"
+}

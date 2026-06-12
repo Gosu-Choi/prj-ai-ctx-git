@@ -324,7 +324,7 @@ class CtxgitTest(unittest.TestCase):
             self.assertTrue(result["complete"])
             self.assertEqual(target.read_text(encoding="utf-8"), "new")
 
-    def test_branch_source_chunk_upload_ingests_resource(self) -> None:
+    def test_branch_resource_chunk_upload_stores_file_without_ingest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             store = ctxgit.ContextStore(root)
@@ -351,17 +351,39 @@ class CtxgitTest(unittest.TestCase):
 
             self.assertFalse(first["complete"])
             self.assertTrue(second["complete"])
-            self.assertEqual(payload["uploadedSources"][0]["status"], "extracted")
+            self.assertEqual(payload["uploadedResources"][0]["path"], "contexts/branches/source/resources/paper.txt")
             self.assertEqual(payload["turnCommit"]["ref"], ctxgit.ctxgit_branch_ref("source"))
-            self.assertTrue((root / "contexts/branches/source/sources/paper.txt").exists())
-            self.assertTrue((root / "contexts/branches/source/sources/paper.txt.meta.json").exists())
+            self.assertTrue((root / "contexts/branches/source/resources/paper.txt").exists())
+            self.assertFalse((root / "contexts/branches/source/resources/paper.txt.meta.json").exists())
             self.assertEqual(
-                (root / "contexts/branches/source/sources/paper.txt.txt").read_text(encoding="utf-8"),
+                (root / "contexts/branches/source/resources/paper.txt").read_text(encoding="utf-8"),
                 "Important source text.",
             )
-            self.assertEqual(len(ctxgit.branch_payload(store, "source")["sources"]), 1)
+            branch_payload = ctxgit.branch_payload(store, "source")
+            self.assertEqual(len(branch_payload["resources"]), 1)
+            self.assertEqual(branch_payload["sources"], [])
 
-    def test_branch_source_upload_rejects_unsupported_resource(self) -> None:
+    def test_branch_resource_upload_accepts_image_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("source")
+
+            ctxgit.upload_branch_source_file_chunk(
+                store,
+                "source",
+                "image.png",
+                base64.b64encode(b"png").decode("ascii"),
+                0,
+                3,
+                last_chunk=True,
+            )
+            payload = ctxgit.finish_branch_source_upload(store, "source", ["image.png"])
+
+            self.assertEqual(payload["uploadedResources"][0]["path"], "contexts/branches/source/resources/image.png")
+            self.assertTrue((root / "contexts/branches/source/resources/image.png").exists())
+
+    def test_branch_resource_upload_rejects_unsupported_resource(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             store = ctxgit.ContextStore(root)
@@ -371,8 +393,8 @@ class CtxgitTest(unittest.TestCase):
                 ctxgit.upload_branch_source_file_chunk(
                     store,
                     "source",
-                    "image.png",
-                    base64.b64encode(b"png").decode("ascii"),
+                    "program.exe",
+                    base64.b64encode(b"exe").decode("ascii"),
                     0,
                     3,
                     last_chunk=True,
@@ -1404,6 +1426,53 @@ class CtxgitTest(unittest.TestCase):
             self.assertIn("BRANCH_CONTEXT_FACT", prompt)
             self.assertIn("Live web search", prompt)
             self.assertIn("Do not edit files", prompt)
+
+    def test_prompts_include_branch_resources_and_current_turn_attachments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("AItrust")
+            resources = root / "contexts/branches/AItrust/resources"
+            resources.mkdir(parents=True, exist_ok=True)
+            image = resources / "slide.png"
+            image.write_bytes(b"fake png")
+            rel = "contexts/branches/AItrust/resources/slide.png"
+
+            chat_prompt = ctxgit.build_chat_prompt(store, "AItrust", "Explain the photo.", resource_paths=[rel])
+            info_prompt = ctxgit.build_history_chat_prompt(store, "AItrust", "Explain the photo.", resource_paths=[rel])
+            research_prompt = ctxgit.build_research_prompt(store, "AItrust", "Research around this slide.")
+
+            for prompt in (chat_prompt, info_prompt):
+                self.assertIn("Current turn attachments", prompt)
+                self.assertIn("photos or files they just sent", prompt)
+                self.assertIn(rel, prompt)
+            self.assertIn("Branch resource files stored as direct attachments", research_prompt)
+            self.assertIn(rel, research_prompt)
+
+    def test_chat_turn_records_and_passes_current_turn_resources(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("AItrust")
+            resources = root / "contexts/branches/AItrust/resources"
+            resources.mkdir(parents=True, exist_ok=True)
+            (resources / "slide.png").write_bytes(b"fake png")
+            rel = "contexts/branches/AItrust/resources/slide.png"
+            original = ctxgit.call_codex_chat
+            captured: dict[str, object] = {}
+            try:
+                def fake_chat(*_args, **kwargs):
+                    captured.update(kwargs)
+                    return {"assistant": "I can see the attachment path.", "artifacts": [], "approvalRequests": []}
+
+                ctxgit.call_codex_chat = fake_chat
+                payload = ctxgit.run_chat_turn(root, store, "AItrust", "Use the photo.", resource_paths=[rel])
+            finally:
+                ctxgit.call_codex_chat = original
+
+            self.assertEqual(captured["resource_paths"], [rel])
+            self.assertEqual(payload["history"][-2]["resources"], [rel])
+            self.assertIn(rel, ctxgit.format_history_record(payload["history"][-2]))
 
     def test_history_chat_turn_records_assistant_without_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

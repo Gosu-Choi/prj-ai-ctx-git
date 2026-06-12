@@ -116,6 +116,20 @@ WORKSPACE_IMPORT_MARKERS = (
 )
 WORKSPACE_IMPORT_EXTENSIONS = {".md", ".txt", ".json", ".jsonl"}
 INGEST_EXTENSIONS = {".md", ".txt", ".json", ".jsonl", ".pdf"}
+IMAGE_RESOURCE_EXTENSIONS = {
+    ".bmp",
+    ".gif",
+    ".heic",
+    ".heif",
+    ".jpeg",
+    ".jpg",
+    ".png",
+    ".svg",
+    ".tif",
+    ".tiff",
+    ".webp",
+}
+BRANCH_RESOURCE_EXTENSIONS = INGEST_EXTENSIONS | IMAGE_RESOURCE_EXTENSIONS
 ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _PROJECT_ENV_LOCK = threading.RLock()
 _PROJECT_ENV_ORIGINAL: dict[str, str | None] = {}
@@ -2955,6 +2969,30 @@ class ContextStore:
             items.append(meta)
         return items
 
+    def list_resources(self, branch_id: str) -> list[dict[str, Any]]:
+        paths = self.branch_paths_for_read(branch_id)
+        resources = paths.root / "resources"
+        if not resources.exists():
+            return []
+        items = []
+        for path in sorted(resources.iterdir(), key=lambda item: item.name.lower()):
+            if not path.is_file() or path.name.startswith("."):
+                continue
+            items.append(
+                {
+                    "title": path.name,
+                    "path": relpath(self.root, path),
+                    "kind": path.suffix.lower().lstrip(".") or "file",
+                    "status": "resource",
+                    "bytes": path.stat().st_size,
+                    "updatedAt": datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
+                    .replace(microsecond=0)
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                }
+            )
+        return items
+
     def list_compactions(self, branch_id: str) -> list[dict[str, str]]:
         paths = self.branch_paths_for_read(branch_id)
         if not paths.compactions.exists():
@@ -4167,6 +4205,101 @@ def source_context_sections(store: ContextStore, branch_id: str, budget_chars: i
     return "\n\n".join(sections).strip() or "(none)"
 
 
+def resource_kind_for_path(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix in IMAGE_RESOURCE_EXTENSIONS:
+        return "image"
+    if suffix == ".pdf":
+        return "pdf"
+    if suffix in {".md", ".txt", ".json", ".jsonl"}:
+        return "text"
+    return suffix.lstrip(".") or "file"
+
+
+def normalize_branch_resource_paths(
+    store: ContextStore,
+    branch_id: str,
+    resource_paths: list[str] | None,
+) -> list[str]:
+    if not resource_paths:
+        return []
+    paths = store.branch_paths_for_read(branch_id)
+    resources_dir = (paths.root / "resources").resolve(strict=False)
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in resource_paths:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        target = resolve_project_path(store.root, text)
+        try:
+            target.relative_to(resources_dir)
+        except ValueError as exc:
+            raise ValueError("branch resource attachment must stay inside this branch resources directory") from exc
+        if not target.exists() or not target.is_file():
+            raise ValueError(f"branch resource attachment is missing: {text}")
+        rel = relpath(store.root, target)
+        if rel in seen:
+            continue
+        seen.add(rel)
+        normalized.append(rel)
+    return normalized
+
+
+def resource_context_sections(store: ContextStore, branch_id: str, budget_chars: int) -> str:
+    if budget_chars <= 0:
+        return "(none)"
+    resources = store.list_resources(branch_id)
+    if not resources:
+        return "(none)"
+    lines = [
+        "These files are stored directly in this branch's resources directory.",
+        "They are not automatically transformed or extracted in this section.",
+        "When a file matters, inspect it by path.",
+        "",
+    ]
+    for item in resources:
+        path_text = str(item.get("path") or "")
+        if not path_text:
+            continue
+        path = store.root / path_text
+        kind = str(item.get("kind") or resource_kind_for_path(path))
+        size = item.get("bytes")
+        if not isinstance(size, int):
+            try:
+                size = path.stat().st_size
+            except OSError:
+                size = 0
+        updated = str(item.get("updatedAt") or "")
+        suffix = f" ({kind}, {size} bytes" + (f", updated {updated}" if updated else "") + ")"
+        lines.append(f"- `{path_text}`{suffix}")
+    return truncate_middle("\n".join(lines).strip(), budget_chars) or "(none)"
+
+
+def current_turn_attachment_section(
+    store: ContextStore,
+    branch_id: str,
+    resource_paths: list[str] | None,
+) -> str:
+    normalized = normalize_branch_resource_paths(store, branch_id, resource_paths)
+    if not normalized:
+        return "(none)"
+    lines = [
+        "These are the branch resource files the user attached with the current message.",
+        "Treat references like 'the photo', 'this file', or 'what I sent' as referring to these paths.",
+        "Do not claim to have inspected binary/image contents unless you actually inspect the file.",
+        "",
+    ]
+    for rel in normalized:
+        path = store.root / rel
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+        lines.append(f"- `{rel}` ({resource_kind_for_path(path)}, {size} bytes)")
+    return "\n".join(lines).strip()
+
+
 def compaction_context_sections(store: ContextStore, branch_id: str, budget_chars: int) -> str:
     if budget_chars <= 0:
         return "(none)"
@@ -4219,7 +4352,13 @@ def format_history_record(record: dict[str, Any]) -> str:
     role = record.get("role", "unknown")
     created = record.get("createdAt", "")
     text = str(record.get("text", "")).strip()
-    return f"- {created} {role}: {text}".strip()
+    line = f"- {created} {role}: {text}".strip()
+    resources = record.get("resources")
+    if isinstance(resources, list):
+        resource_lines = [f"  - `{str(item).strip()}`" for item in resources if str(item or "").strip()]
+        if resource_lines:
+            line += "\n  resources:\n" + "\n".join(resource_lines)
+    return line
 
 
 def select_history_for_budget(records: list[dict[str, Any]], budget_chars: int) -> list[dict[str, Any]]:
@@ -4246,11 +4385,16 @@ def build_context_bundle(store: ContextStore, branch_id: str) -> dict[str, str]:
     project_budget = max(4000, budget // 5)
     branch_budget = max(12000, budget // 4)
     source_budget = max(10000, budget // 5)
+    resource_budget = max(4000, budget // 12)
     compaction_budget = max(8000, budget // 6)
-    history_budget = max(12000, budget - project_budget - branch_budget - source_budget - compaction_budget)
+    history_budget = max(
+        12000,
+        budget - project_budget - branch_budget - source_budget - resource_budget - compaction_budget,
+    )
     project_context = "\n\n".join(project_context_sections(store, project_budget)).strip()
     branch_context = truncate_middle(store.context_excerpt(branch_id), branch_budget).strip()
     source_context = source_context_sections(store, branch_id, source_budget)
+    resource_context = resource_context_sections(store, branch_id, resource_budget)
     compaction_context = compaction_context_sections(store, branch_id, compaction_budget)
     records = list(store.iter_history(branch_id))
     history_records = select_history_for_budget(records, history_budget)
@@ -4262,6 +4406,7 @@ def build_context_bundle(store: ContextStore, branch_id: str) -> dict[str, str]:
         "project": project_context or "(none)",
         "branch": branch_context or "(none)",
         "sources": source_context,
+        "resources": resource_context,
         "compactions": compaction_context,
         "archives": archive_reference_section(store, branch_id),
         "history": "\n".join(history_lines) or "(none)",
@@ -4273,9 +4418,11 @@ def build_chat_prompt(
     branch_id: str,
     user_message: str,
     approved_external_paths: list[str] | None = None,
+    resource_paths: list[str] | None = None,
 ) -> str:
     context = build_context_bundle(store, branch_id)
     approved_paths = "\n".join(f"- {path}" for path in approved_external_paths or []) or "(none)"
+    current_attachments = current_turn_attachment_section(store, branch_id, resource_paths)
     parts = [
         "You are the assistant inside ctxgit, a git-managed research conversation system.",
         "",
@@ -4288,6 +4435,8 @@ def build_chat_prompt(
         "If an outside-workspace write is needed and not approved, do not attempt it.",
         "Instead, ask for permission by returning approvalRequests with the target path,",
         "operation, and reason.",
+        "When the user refers to photos or files they just sent, use the current turn",
+        "attachments section as the authoritative list of those files and paths.",
         "",
         "Approved external write targets for this turn:",
         "<approved_external_paths>",
@@ -4311,6 +4460,11 @@ def build_chat_prompt(
         context["sources"],
         "</sources>",
         "",
+        "Branch resource files stored as direct attachments:",
+        "<resources>",
+        context["resources"],
+        "</resources>",
+        "",
         "Long-history compactions:",
         "<compactions>",
         context["compactions"],
@@ -4333,6 +4487,11 @@ def build_chat_prompt(
             "<history>",
             context["history"],
             "</history>",
+            "",
+            "Current turn attachments:",
+            "<attachments>",
+            current_attachments,
+            "</attachments>",
             "",
             "User message:",
             "<user_message>",
@@ -4362,7 +4521,12 @@ def build_chat_prompt(
     return "\n".join(parts)
 
 
-def build_history_chat_prompt(store: ContextStore, branch_id: str, user_message: str) -> str:
+def build_history_chat_prompt(
+    store: ContextStore,
+    branch_id: str,
+    user_message: str,
+    resource_paths: list[str] | None = None,
+) -> str:
     llm = read_llm_config(store.root)
     codex_config = llm.get("codex") if isinstance(llm.get("codex"), dict) else {}
     budget = coerce_positive_int(
@@ -4371,9 +4535,12 @@ def build_history_chat_prompt(store: ContextStore, branch_id: str, user_message:
     )
     project_budget = max(10000, budget // 3)
     branch_budget = max(10000, budget // 3)
-    history_budget = max(12000, budget - project_budget - branch_budget)
+    resource_budget = max(4000, budget // 10)
+    history_budget = max(12000, budget - project_budget - branch_budget - resource_budget)
     project_context = "\n\n".join(project_context_sections(store, project_budget)).strip()
     branch_context = truncate_middle(store.context_excerpt(branch_id), branch_budget).strip()
+    resource_context = resource_context_sections(store, branch_id, resource_budget)
+    current_attachments = current_turn_attachment_section(store, branch_id, resource_paths)
     records = list(store.iter_history(branch_id))
     history_records = select_history_for_budget(records, history_budget)
     omitted = max(0, len(records) - len(history_records))
@@ -4388,13 +4555,16 @@ def build_history_chat_prompt(store: ContextStore, branch_id: str, user_message:
         "Use only these information sources:",
         "1. Project memory/instructions supplied below.",
         "2. Branch context and conversation history supplied below.",
-        "3. Live web search, only when it is useful for the user's question.",
+        "3. Branch resources and current turn attachments supplied below.",
+        "4. Live web search, only when it is useful for the user's question.",
         "",
         "You may read additional project files when needed, including source, research,",
-        "artifact, archive, and branch context files inside the opened project.",
+        "artifact, resource, archive, and branch context files inside the opened project.",
         "Do not edit files. Do not create artifacts. Answer directly and concisely.",
         "If the history is insufficient, say what is missing instead of guessing.",
         "Reply in the user's language unless the user asks otherwise.",
+        "When the user refers to photos or files they just sent, use the current turn",
+        "attachments section as the authoritative list of those files and paths.",
         "",
         f"Branch: {branch_id}",
         "",
@@ -4407,6 +4577,11 @@ def build_history_chat_prompt(store: ContextStore, branch_id: str, user_message:
         "<branch_context>",
         branch_context or "(none)",
         "</branch_context>",
+        "",
+        "Branch resource files stored as direct attachments:",
+        "<resources>",
+        resource_context,
+        "</resources>",
         "",
     ]
     if archive_references:
@@ -4425,6 +4600,11 @@ def build_history_chat_prompt(store: ContextStore, branch_id: str, user_message:
             "<history>",
             "\n".join(history_lines) or "(none)",
             "</history>",
+            "",
+            "Current turn attachments:",
+            "<attachments>",
+            current_attachments,
+            "</attachments>",
             "",
             "Current user message:",
             "<user_message>",
@@ -4930,6 +5110,7 @@ def call_codex_chat(
     branch_id: str,
     user_message: str,
     approved_external_paths: list[str] | None = None,
+    resource_paths: list[str] | None = None,
     progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     emit_progress(progress, "Checking Codex login")
@@ -4940,7 +5121,13 @@ def call_codex_chat(
     codex_config = llm.get("codex") if isinstance(llm.get("codex"), dict) else {}
     timeout_seconds = coerce_positive_int(codex_config.get("timeoutSeconds"), 900)
     emit_progress(progress, "Building context prompt")
-    prompt = build_chat_prompt(store, branch_id, user_message, approved_external_paths=approved_external_paths)
+    prompt = build_chat_prompt(
+        store,
+        branch_id,
+        user_message,
+        approved_external_paths=approved_external_paths,
+        resource_paths=resource_paths,
+    )
     writable_dirs = external_writable_dirs(root, approved_external_paths or [])
     with tempfile.TemporaryDirectory(prefix="ctxgit-codex-") as tmp:
         tmp_path = Path(tmp)
@@ -5013,6 +5200,7 @@ def call_codex_history_chat(
     store: ContextStore,
     branch_id: str,
     user_message: str,
+    resource_paths: list[str] | None = None,
     progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     emit_progress(progress, "Checking Codex login")
@@ -5023,7 +5211,7 @@ def call_codex_history_chat(
     codex_config = llm.get("codex") if isinstance(llm.get("codex"), dict) else {}
     timeout_seconds = coerce_positive_int(codex_config.get("timeoutSeconds"), 900)
     emit_progress(progress, "Building context prompt")
-    prompt = build_history_chat_prompt(store, branch_id, user_message)
+    prompt = build_history_chat_prompt(store, branch_id, user_message, resource_paths=resource_paths)
     with tempfile.TemporaryDirectory(prefix="ctxgit-history-chat-") as tmp:
         tmp_path = Path(tmp)
         schema_path = tmp_path / "chat-output.schema.json"
@@ -5171,6 +5359,7 @@ def run_chat_turn(
     provider: str | None = None,
     record_user: bool = True,
     approved_external_paths: list[str] | None = None,
+    resource_paths: list[str] | None = None,
     progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     selected_provider = provider or str(read_llm_config(root).get("provider") or "codex")
@@ -5178,9 +5367,13 @@ def run_chat_turn(
     emit_progress(progress, "Preparing branch context")
     store.auto_ingest_branch_sources(branch_id)
     store.maybe_compact_history(branch_id)
+    normalized_resources = normalize_branch_resource_paths(store, branch_id, resource_paths)
     if record_user:
         emit_progress(progress, "Recording user message")
-        store.append_history(branch_id, "user", user_message, extra={"turnId": turn_id})
+        user_extra: dict[str, Any] = {"turnId": turn_id}
+        if normalized_resources:
+            user_extra["resources"] = normalized_resources
+        store.append_history(branch_id, "user", user_message, extra=user_extra)
     if selected_provider != "codex":
         raise RuntimeError(f"Unsupported chat provider: {selected_provider}")
     result = call_codex_chat(
@@ -5189,6 +5382,7 @@ def run_chat_turn(
         branch_id,
         user_message,
         approved_external_paths=approved_external_paths,
+        resource_paths=normalized_resources,
         progress=progress,
     )
     artifact_refs = []
@@ -5233,6 +5427,7 @@ def run_chat_turn(
         metadata={
             "provider": selected_provider,
             "recordUser": record_user,
+            "resourcePaths": normalized_resources,
             "artifactCount": len(artifact_refs),
             "approvalRequestCount": len(approval_requests),
         },
@@ -5249,6 +5444,7 @@ def run_history_chat_turn(
     branch_id: str,
     user_message: str,
     provider: str | None = None,
+    resource_paths: list[str] | None = None,
     progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     selected_provider = provider or str(read_llm_config(root).get("provider") or "codex")
@@ -5256,9 +5452,20 @@ def run_history_chat_turn(
     emit_progress(progress, "Preparing branch context")
     if selected_provider != "codex":
         raise RuntimeError(f"Unsupported chat provider: {selected_provider}")
+    normalized_resources = normalize_branch_resource_paths(store, branch_id, resource_paths)
     emit_progress(progress, "Recording user message")
-    store.append_history(branch_id, "user", user_message, extra={"turnId": turn_id, "mode": "info-chat"})
-    result = call_codex_history_chat(root, store, branch_id, user_message, progress=progress)
+    user_extra: dict[str, Any] = {"turnId": turn_id, "mode": "info-chat"}
+    if normalized_resources:
+        user_extra["resources"] = normalized_resources
+    store.append_history(branch_id, "user", user_message, extra=user_extra)
+    result = call_codex_history_chat(
+        root,
+        store,
+        branch_id,
+        user_message,
+        resource_paths=normalized_resources,
+        progress=progress,
+    )
     assistant = str(result.get("assistant") or "").strip() or "(No assistant message returned.)"
     emit_progress(progress, "Saving assistant output")
     store.append_history(
@@ -5280,7 +5487,7 @@ def run_history_chat_turn(
         summary=f"Info chat turn on {branch_id}",
         branch_id=branch_id,
         turn_id=turn_id,
-        metadata={"provider": selected_provider},
+        metadata={"provider": selected_provider, "resourcePaths": normalized_resources},
     )
     emit_progress(progress, "Refreshing branch view")
     payload = branch_payload(store, branch_id)
@@ -5596,6 +5803,11 @@ def build_research_prompt(store: ContextStore, branch_id: str, query: str) -> st
             context["sources"],
             "</sources>",
             "",
+            "Branch resource files stored as direct attachments:",
+            "<resources>",
+            context["resources"],
+            "</resources>",
+            "",
             "Long-history compactions:",
             "<compactions>",
             context["compactions"],
@@ -5758,6 +5970,7 @@ def run_research_turn(
     provider: str = "hybrid",
     args: argparse.Namespace | None = None,
     title: str | None = None,
+    resource_paths: list[str] | None = None,
     progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     turn_id = new_turn_id()
@@ -5782,12 +5995,16 @@ def run_research_turn(
 
     store.auto_ingest_branch_sources(branch_id)
     store.maybe_compact_history(branch_id)
+    normalized_resources = normalize_branch_resource_paths(store, branch_id, resource_paths)
     emit_progress(progress, "Recording research request")
+    user_extra: dict[str, Any] = {"mode": "research", "provider": selected_provider, "turnId": turn_id}
+    if normalized_resources:
+        user_extra["resources"] = normalized_resources
     store.append_history(
         branch_id,
         "user",
         query,
-        extra={"mode": "research", "provider": selected_provider, "turnId": turn_id},
+        extra=user_extra,
     )
     if selected_provider == "hybrid":
         emit_progress(progress, "Searching source providers")
@@ -5870,6 +6087,7 @@ def run_research_turn(
             "provider": selected_provider,
             "title": note_title,
             "artifact": artifact_ref,
+            "resourcePaths": normalized_resources,
         },
     )
     emit_progress(progress, "Refreshing branch view")
@@ -5962,6 +6180,7 @@ def branch_payload(store: ContextStore, branch_id: str) -> dict[str, Any]:
         "notes": store.list_branch_documents(branch_id, "notes"),
         "research": store.list_branch_documents(branch_id, "research"),
         "artifacts": store.list_branch_documents(branch_id, "artifacts"),
+        "resources": store.list_resources(branch_id),
         "sources": store.list_sources(branch_id),
         "compactions": [
             {"title": item["title"], "path": item["path"]} for item in store.list_compactions(branch_id)
@@ -6251,16 +6470,17 @@ def branch_source_upload_directory(store: ContextStore, branch_id: str) -> str:
     paths = store.branch_paths(branch_id)
     if not paths.root.exists():
         die(f"branch does not exist: {branch_id}")
-    paths.sources.mkdir(parents=True, exist_ok=True)
-    return relpath(store.root, paths.sources)
+    resources = paths.root / "resources"
+    resources.mkdir(parents=True, exist_ok=True)
+    return relpath(store.root, resources)
 
 
 def branch_source_upload_file_name(path_value: str) -> str:
     rel = safe_upload_relative_path(path_value)
     if len(rel.parts) != 1:
         raise ValueError("branch resource upload accepts files, not folders")
-    if rel.suffix.lower() not in INGEST_EXTENSIONS:
-        supported = ", ".join(sorted(INGEST_EXTENSIONS))
+    if rel.suffix.lower() not in BRANCH_RESOURCE_EXTENSIONS:
+        supported = ", ".join(sorted(BRANCH_RESOURCE_EXTENSIONS))
         raise ValueError(f"unsupported branch resource file type: {rel.suffix or '(none)'}; supported: {supported}")
     return rel.name
 
@@ -6296,24 +6516,39 @@ def finish_branch_source_upload(store: ContextStore, branch_id: str, uploaded_pa
     paths = store.branch_paths(branch_id)
     if not paths.root.exists():
         die(f"branch does not exist: {branch_id}")
-    sources = []
+    resources_dir = paths.root / "resources"
+    resources = []
     for path_value in uploaded_paths:
         file_name = branch_source_upload_file_name(path_value)
-        sources.append(store.ingest_source(branch_id, paths.sources / file_name))
+        path = (resources_dir / file_name).resolve(strict=False)
+        try:
+            path.relative_to(resources_dir.resolve())
+        except ValueError as exc:
+            raise ValueError("branch resource path must stay inside resources") from exc
+        if not path.exists() or not path.is_file():
+            raise ValueError(f"uploaded branch resource is missing: {file_name}")
+        resources.append(project_file_entry(store.root, path))
     payload = branch_payload(store, branch_id)
-    payload["uploadedSources"] = sources
+    payload["uploadedResources"] = resources
     payload["turnCommit"] = internal_git_commit_turn(
         store,
-        kind="source-drop-upload",
+        kind="resource-drop-upload",
         actor="user",
-        summary=f"Upload {len(sources)} source file(s) into {branch_id}",
+        summary=f"Upload {len(resources)} resource file(s) into {branch_id}",
         branch_id=branch_id,
         metadata={
             "branch": branch_id,
-            "files": [item.get("sourcePath") for item in sources],
+            "files": [item.get("path") for item in resources],
         },
     )
     return payload
+
+
+def request_resource_paths(body: dict[str, Any]) -> list[str]:
+    raw = body.get("resources")
+    if not isinstance(raw, list):
+        return []
+    return [str(item).strip() for item in raw if str(item or "").strip()]
 
 
 def project_registry_id(path: Path, used: set[str]) -> str:
@@ -8042,6 +8277,7 @@ def make_handler(
                 provider = str(body.get("provider") or "hybrid")
                 title = str(body.get("title") or "") or None
                 timeout = coerce_positive_int(body.get("timeout"), 180)
+                resources = request_resource_paths(body)
                 if not text:
                     self.send_json({"error": "message_required"}, status=400)
                     return
@@ -8057,6 +8293,7 @@ def make_handler(
                                 "provider": provider,
                                 "title": title,
                                 "timeout": timeout,
+                                "resources": resources,
                             },
                             root=root,
                         ),
@@ -8074,6 +8311,7 @@ def make_handler(
                         provider=provider,
                         args=args,
                         title=title,
+                        resource_paths=resources,
                         progress=progress,
                     )
 
@@ -8085,13 +8323,23 @@ def make_handler(
                 provider = str(body.get("provider") or "hybrid")
                 title = str(body.get("title") or "") or None
                 timeout = coerce_positive_int(body.get("timeout"), 180)
+                resources = request_resource_paths(body)
                 if not text:
                     self.send_json({"error": "message_required"}, status=400)
                     return
                 args = default_research_args(provider, title=title, timeout=timeout)
                 try:
                     self.send_json(
-                        run_research_turn(root, store, branch_id, text, provider=provider, args=args, title=title)
+                        run_research_turn(
+                            root,
+                            store,
+                            branch_id,
+                            text,
+                            provider=provider,
+                            args=args,
+                            title=title,
+                            resource_paths=resources,
+                        )
                     )
                 except ChatTimeoutError as exc:
                     self.send_json({"error": "timeout", "message": str(exc)}, status=504)
@@ -8106,6 +8354,7 @@ def make_handler(
                 branch_id = str(body.get("branch") or "")
                 text = str(body.get("text") or "").strip()
                 provider = str(body.get("provider") or "") or None
+                resources = request_resource_paths(body)
                 if not text:
                     self.send_json({"error": "message_required"}, status=400)
                     return
@@ -8119,6 +8368,7 @@ def make_handler(
                                 "branch": branch_id,
                                 "text": text,
                                 "provider": provider,
+                                "resources": resources,
                             },
                             root=root,
                         ),
@@ -8127,7 +8377,15 @@ def make_handler(
                     return
 
                 def work(progress: ProgressCallback) -> dict[str, Any]:
-                    return run_chat_turn(root, store, branch_id, text, provider=provider, progress=progress)
+                    return run_chat_turn(
+                        root,
+                        store,
+                        branch_id,
+                        text,
+                        provider=provider,
+                        resource_paths=resources,
+                        progress=progress,
+                    )
 
                 self.send_json(jobs.create("chat", work), status=202)
                 return
@@ -8135,6 +8393,7 @@ def make_handler(
                 branch_id = str(body.get("branch") or "")
                 text = str(body.get("text") or "").strip()
                 provider = str(body.get("provider") or "") or None
+                resources = request_resource_paths(body)
                 if not text:
                     self.send_json({"error": "message_required"}, status=400)
                     return
@@ -8148,6 +8407,7 @@ def make_handler(
                                 "branch": branch_id,
                                 "text": text,
                                 "provider": provider,
+                                "resources": resources,
                             },
                             root=root,
                         ),
@@ -8156,7 +8416,15 @@ def make_handler(
                     return
 
                 def work(progress: ProgressCallback) -> dict[str, Any]:
-                    return run_history_chat_turn(root, store, branch_id, text, provider=provider, progress=progress)
+                    return run_history_chat_turn(
+                        root,
+                        store,
+                        branch_id,
+                        text,
+                        provider=provider,
+                        resource_paths=resources,
+                        progress=progress,
+                    )
 
                 self.send_json(jobs.create("info-chat", work), status=202)
                 return
@@ -8200,11 +8468,12 @@ def make_handler(
                 branch_id = str(body.get("branch") or "")
                 text = str(body.get("text") or "").strip()
                 provider = str(body.get("provider") or "") or None
+                resources = request_resource_paths(body)
                 if not text:
                     self.send_json({"error": "message_required"}, status=400)
                     return
                 try:
-                    self.send_json(run_chat_turn(root, store, branch_id, text, provider=provider))
+                    self.send_json(run_chat_turn(root, store, branch_id, text, provider=provider, resource_paths=resources))
                 except ChatTimeoutError as exc:
                     self.send_json({"error": "timeout", "message": str(exc)}, status=504)
                 except RuntimeError as exc:
@@ -8218,11 +8487,14 @@ def make_handler(
                 branch_id = str(body.get("branch") or "")
                 text = str(body.get("text") or "").strip()
                 provider = str(body.get("provider") or "") or None
+                resources = request_resource_paths(body)
                 if not text:
                     self.send_json({"error": "message_required"}, status=400)
                     return
                 try:
-                    self.send_json(run_history_chat_turn(root, store, branch_id, text, provider=provider))
+                    self.send_json(
+                        run_history_chat_turn(root, store, branch_id, text, provider=provider, resource_paths=resources)
+                    )
                 except ChatTimeoutError as exc:
                     self.send_json({"error": "timeout", "message": str(exc)}, status=504)
                 except RuntimeError as exc:
@@ -8361,6 +8633,7 @@ def run_worker_claimed_job(
         provider = provider_override or str(request_payload.get("provider") or "codex")
         if provider == "codex-worker":
             provider = "codex"
+        resource_paths = request_resource_paths(request_payload)
         post_event(f"로컬 Codex worker 실행 중: {kind}")
         if kind == "chat":
             payload = run_chat_turn(
@@ -8369,6 +8642,7 @@ def run_worker_claimed_job(
                 str(request_payload.get("branch") or ""),
                 str(request_payload.get("text") or ""),
                 provider=provider,
+                resource_paths=resource_paths,
                 progress=progress,
             )
         elif kind == "info-chat":
@@ -8378,6 +8652,7 @@ def run_worker_claimed_job(
                 str(request_payload.get("branch") or ""),
                 str(request_payload.get("text") or ""),
                 provider=provider,
+                resource_paths=resource_paths,
                 progress=progress,
             )
         elif kind == "context-chat":
@@ -8415,6 +8690,7 @@ def run_worker_claimed_job(
                 provider=research_provider,
                 args=args,
                 title=str(request_payload.get("title") or "") or None,
+                resource_paths=resource_paths,
                 progress=progress,
             )
         else:
