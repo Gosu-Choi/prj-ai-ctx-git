@@ -22,10 +22,13 @@ const state = {
   acknowledgedBranchJobs: {},
   startingBranches: {},
   messageDrafts: {},
+  branchDropDepth: 0,
+  branchResourceStaged: {},
 };
 
 const CONTEXT_CHAT_KEY = "__contexts__";
 const UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024;
+const BRANCH_RESOURCE_EXTENSIONS = new Set([".md", ".txt", ".json", ".jsonl", ".pdf"]);
 
 const els = {
   authGate: document.querySelector("#authGate"),
@@ -75,11 +78,14 @@ const els = {
   activeTitle: document.querySelector("#activeTitle"),
   activeMeta: document.querySelector("#activeMeta"),
   chatTab: document.querySelector("#chatTab"),
+  chatMain: document.querySelector(".chat-main"),
   messageList: document.querySelector("#messageList"),
   progressPanel: document.querySelector("#progressPanel"),
   progressTitle: document.querySelector("#progressTitle"),
   progressEvents: document.querySelector("#progressEvents"),
   chatError: document.querySelector("#chatError"),
+  branchDropOverlay: document.querySelector("#branchDropOverlay"),
+  branchResourceStage: document.querySelector("#branchResourceStage"),
   eventPanel: document.querySelector("#eventPanel"),
   eventStatus: document.querySelector("#eventStatus"),
   copyEventLogButton: document.querySelector("#copyEventLogButton"),
@@ -642,6 +648,8 @@ function clearWorkspace(message = "Select or initialize a ctxgit project.") {
   state.payload = null;
   state.fileBrowser = { path: "", parent: "", entries: [] };
   state.messageDrafts = {};
+  state.branchResourceStaged = {};
+  state.branchDropDepth = 0;
   renderBranches();
   hideChatError();
   els.activeTitle.textContent = "No project selected";
@@ -664,6 +672,7 @@ function clearWorkspace(message = "Select or initialize a ctxgit project.") {
   els.gitSummary.innerHTML = "";
   els.providerSummary.innerHTML = "";
   els.mergeStatus.textContent = "";
+  renderBranchResourceStage();
   if (els.messageInput) {
     els.messageInput.value = "";
     resizeMessageInput();
@@ -949,6 +958,260 @@ async function uploadFiles(fileList) {
   } finally {
     els.fileUploadInput.value = "";
     els.folderUploadInput.value = "";
+  }
+}
+
+function hasDraggedFiles(event) {
+  return Array.from(event.dataTransfer?.types || []).includes("Files");
+}
+
+function canDropBranchResources() {
+  if (!state.activeBranch || state.activeContextChat || state.activeGlobalized) return false;
+  if (state.payload?.archived === true) return false;
+  if (activeBranchRunningJob(state.activeBranch) || state.startingBranches[state.activeBranch]) return false;
+  return true;
+}
+
+function fileExtension(name) {
+  const index = String(name || "").lastIndexOf(".");
+  return index >= 0 ? String(name).slice(index).toLowerCase() : "";
+}
+
+function stagedBranchResources(branch = state.activeBranch) {
+  return branch ? state.branchResourceStaged[branch] || [] : [];
+}
+
+function clearStagedBranchResources(branch = state.activeBranch) {
+  if (!branch) return;
+  delete state.branchResourceStaged[branch];
+  renderBranchResourceStage();
+}
+
+function removeStagedBranchResource(branch, index) {
+  const files = stagedBranchResources(branch);
+  if (!files.length || index < 0 || index >= files.length) return;
+  files.splice(index, 1);
+  if (files.length) {
+    state.branchResourceStaged[branch] = files;
+  } else {
+    delete state.branchResourceStaged[branch];
+  }
+  renderBranchResourceStage();
+}
+
+function renderBranchResourceStage() {
+  if (!els.branchResourceStage) return;
+  const branch = state.activeBranch;
+  const files = stagedBranchResources(branch);
+  if (!branch || state.activeContextChat || state.activeGlobalized || state.payload?.archived === true || !files.length) {
+    els.branchResourceStage.hidden = true;
+    els.branchResourceStage.innerHTML = "";
+    return;
+  }
+  const totalBytes = files.reduce((total, file) => total + (Number(file.size) || 0), 0);
+  els.branchResourceStage.hidden = false;
+  els.branchResourceStage.innerHTML = `
+    <div class="resource-stage-header">
+      <strong>${files.length} resource file${files.length === 1 ? "" : "s"} staged</strong>
+      <span class="resource-stage-meta">${escapeHtml(branch)} · ${formatBytes(totalBytes)} · send to add</span>
+      <button class="resource-stage-clear" type="button" aria-label="Clear staged resources">x</button>
+    </div>
+    <div class="resource-stage-list">
+      ${files
+        .map(
+          (file, index) => `
+            <span class="resource-stage-chip">
+              <span title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</span>
+              <button data-staged-resource-remove="${index}" type="button" aria-label="Remove ${escapeHtml(file.name)}">x</button>
+            </span>
+          `,
+        )
+        .join("")}
+    </div>
+  `;
+  els.branchResourceStage.querySelector(".resource-stage-clear")?.addEventListener("click", () => {
+    clearStagedBranchResources(branch);
+  });
+  els.branchResourceStage.querySelectorAll("[data-staged-resource-remove]").forEach((button) => {
+    button.addEventListener("click", () => {
+      removeStagedBranchResource(branch, Number.parseInt(button.dataset.stagedResourceRemove || "", 10));
+    });
+  });
+}
+
+function stageBranchResourceFiles(fileList) {
+  const branch = state.activeBranch;
+  const files = Array.from(fileList || []).filter((file) => file && file.name);
+  if (!files.length) return;
+  if (!canDropBranchResources()) {
+    showChatError("Select an active writable branch before staging resource files.");
+    return;
+  }
+  const supported = [];
+  const unsupported = [];
+  for (const file of files) {
+    if (BRANCH_RESOURCE_EXTENSIONS.has(fileExtension(file.name))) {
+      supported.push(file);
+    } else {
+      unsupported.push(file.name);
+    }
+  }
+  if (unsupported.length) {
+    showChatError(`Unsupported resource file type: ${unsupported.slice(0, 4).join(", ")}${unsupported.length > 4 ? ", ..." : ""}`);
+  } else {
+    hideChatError();
+  }
+  if (!supported.length) return;
+  const existing = stagedBranchResources(branch);
+  state.branchResourceStaged[branch] = [...existing, ...supported];
+  renderBranchResourceStage();
+}
+
+function setBranchDropActive(active) {
+  const visible = Boolean(active && canDropBranchResources());
+  els.chatMain?.classList.toggle("drop-active", visible);
+  if (els.branchDropOverlay) {
+    els.branchDropOverlay.hidden = !visible;
+  }
+}
+
+function updateBranchUploadProgress(message) {
+  attachProgressPanel();
+  els.progressPanel.hidden = false;
+  els.progressTitle.textContent = "Branch resource upload";
+  els.progressEvents.innerHTML = `<div>${escapeHtml(message)}</div>`;
+}
+
+async function uploadBranchResourceFileInChunks(file, { branch, overwrite, index, total }) {
+  const path = file.name;
+  const chunkCount = Math.max(1, Math.ceil(file.size / UPLOAD_CHUNK_BYTES));
+  let lastPayload = null;
+  if (file.size === 0) {
+    updateBranchUploadProgress(`Uploading ${index}/${total}: ${path}`);
+    lastPayload = await api("/api/branch/source/upload-chunk", {
+      method: "POST",
+      body: JSON.stringify({
+        branch,
+        path,
+        contentBase64: "",
+        offset: 0,
+        totalSize: 0,
+        overwrite,
+        lastChunk: true,
+      }),
+    });
+    return lastPayload;
+  }
+  for (let offset = 0, chunkIndex = 1; offset < file.size; offset += UPLOAD_CHUNK_BYTES, chunkIndex += 1) {
+    const blob = file.slice(offset, Math.min(file.size, offset + UPLOAD_CHUNK_BYTES));
+    updateBranchUploadProgress(`Uploading ${index}/${total}: ${path} (${chunkIndex}/${chunkCount}, ${formatBytes(offset)} of ${formatBytes(file.size)})`);
+    const contentBase64 = await readBlobAsBase64(blob);
+    lastPayload = await api("/api/branch/source/upload-chunk", {
+      method: "POST",
+      body: JSON.stringify({
+        branch,
+        path,
+        contentBase64,
+        offset,
+        totalSize: file.size,
+        overwrite: overwrite && offset === 0,
+        lastChunk: offset + blob.size >= file.size,
+      }),
+    });
+  }
+  return lastPayload;
+}
+
+async function finishBranchResourceUpload(branch, uploadedPaths, options = {}) {
+  const payload = await api("/api/branch/source/upload-finish", {
+    method: "POST",
+    body: JSON.stringify({ branch, files: uploadedPaths }),
+  });
+  if (options.render !== false && state.activeBranch === branch && !state.activeContextChat) {
+    renderBranch(payload);
+    renderGit(await api("/api/git/status"));
+    renderProvider(await api("/api/provider/status"));
+  }
+  await refreshBranchNavigation();
+  return payload;
+}
+
+async function uploadBranchResourceFiles(fileList, options = {}) {
+  const branch = options.branch || state.activeBranch;
+  const files = Array.from(fileList || []).filter((file) => file && file.name);
+  if (!files.length) return;
+  const blocked =
+    !branch ||
+    branch !== state.activeBranch ||
+    state.activeContextChat ||
+    state.activeGlobalized ||
+    state.payload?.archived === true ||
+    Boolean(activeBranchRunningJob(branch)) ||
+    Boolean(state.startingBranches[branch] && !options.allowStarting);
+  if (blocked) {
+    throw new Error("Select an active writable branch before uploading resource files.");
+  }
+  hideChatError();
+  const uploadedPaths = [];
+  let overwriteAll = false;
+  if (options.showProgress !== false) {
+    showProgress("Branch resource upload");
+  }
+  try {
+    for (let index = 0; index < files.length; index += 1) {
+      const file = files[index];
+      try {
+        const result = await uploadBranchResourceFileInChunks(file, {
+          branch,
+          overwrite: overwriteAll,
+          index: index + 1,
+          total: files.length,
+        });
+        uploadedPaths.push(result?.entry?.name || file.name);
+      } catch (error) {
+        if (!(error instanceof ApiError) || error.payload?.error !== "file_exists") throw error;
+        if (!window.confirm(`${error.message}\n\nOverwrite existing branch resource file(s) for the rest of this upload?`)) {
+          if (uploadedPaths.length) {
+            await finishBranchResourceUpload(branch, uploadedPaths, { render: options.render !== false });
+            els.progressTitle.textContent = "완료됨";
+            els.progressEvents.innerHTML = `<div>Added ${uploadedPaths.length} branch resource file(s).</div>`;
+            hideProgressSoon();
+          } else {
+            hideProgress();
+          }
+          return;
+        }
+        overwriteAll = true;
+        const result = await uploadBranchResourceFileInChunks(file, {
+          branch,
+          overwrite: true,
+          index: index + 1,
+          total: files.length,
+        });
+        uploadedPaths.push(result?.entry?.name || file.name);
+      }
+    }
+    const payload = await finishBranchResourceUpload(branch, uploadedPaths, { render: options.render !== false });
+    const added = payload.uploadedSources?.length || uploadedPaths.length;
+    if (options.clearStage !== false) {
+      clearStagedBranchResources(branch);
+    }
+    if (options.showProgress !== false) {
+      els.progressTitle.textContent = "완료됨";
+      els.progressEvents.innerHTML = `<div>Added ${added} file(s) to ${escapeHtml(branch)} resources.</div>`;
+      hideProgressSoon();
+    }
+    return payload;
+  } catch (error) {
+    if (uploadedPaths.length) {
+      try {
+        await finishBranchResourceUpload(branch, uploadedPaths, { render: options.render !== false });
+      } catch {
+        // Keep the original upload error visible.
+      }
+    }
+    showChatError(`Resource upload failed: ${error.message}`);
+    hideProgress();
   }
 }
 
@@ -1724,6 +1987,7 @@ function updateComposerState() {
   const archived = state.payload?.archived === true;
   const contextMode = state.activeContextChat === true;
   const disabled = !activeKey || archived || Boolean(running) || Boolean(startingMode);
+  els.composer.classList.toggle("context-mode", contextMode);
   els.researchButton.hidden = contextMode;
   els.contextResetButton.hidden = !contextMode;
   els.historyChatButton.hidden = contextMode;
@@ -2084,6 +2348,7 @@ function renderBranch(payload) {
       )
       .join("") || '<div class="muted">No research notes yet.</div>';
   renderArchives(payload.archives || []);
+  renderBranchResourceStage();
   restoreActiveDraft();
   updateComposerState();
 }
@@ -2132,6 +2397,7 @@ function renderContextChat(payload) {
   }
   els.researchList.innerHTML = '<div class="muted">Top-level context chat has no branch documents.</div>';
   renderArchives([]);
+  renderBranchResourceStage();
   restoreActiveDraft();
   updateComposerState();
 }
@@ -2176,6 +2442,7 @@ async function loadBranches() {
     els.activeTitle.textContent = "No branch selected";
     els.activeMeta.textContent = "Create a branch from the terminal with ctxgit branch <id>.";
     replaceMessageListHtml('<div class="muted">No messages yet.</div>');
+    renderBranchResourceStage();
     restoreActiveDraft();
     updateComposerState();
   }
@@ -2230,6 +2497,7 @@ async function openProject(path, { init }) {
     state.activeGlobalized = null;
     state.activeContextChat = false;
     state.messageDrafts = {};
+    state.branchResourceStaged = {};
     state.fileBrowser = { path: "", parent: "", entries: [] };
     await loadBranches();
     await loadProjectFiles("");
@@ -2265,6 +2533,7 @@ async function openServerProject() {
     state.activeGlobalized = null;
     state.activeContextChat = false;
     state.messageDrafts = {};
+    state.branchResourceStaged = {};
     state.fileBrowser = { path: "", parent: "", entries: [] };
     await loadServerProjects();
     await loadBranches();
@@ -2523,10 +2792,12 @@ async function removeBranch(branch) {
       body: JSON.stringify({ branch }),
     });
     delete state.messageDrafts[branch];
+    delete state.branchResourceStaged[branch];
     if (state.activeBranch === branch) {
       state.activeBranch = null;
       state.payload = null;
       restoreActiveDraft();
+      renderBranchResourceStage();
     }
     await loadBranches();
   } catch (error) {
@@ -2562,10 +2833,12 @@ async function archiveBranch(branch) {
     state.views = payload.views || state.views;
     state.globalized = payload.globalized || state.globalized;
     delete state.messageDrafts[branch];
+    delete state.branchResourceStaged[branch];
     if (state.activeBranch === branch) {
       state.activeBranch = null;
       state.payload = null;
       restoreActiveDraft();
+      renderBranchResourceStage();
     }
     await refreshBranchNavigation();
     if (payload.archive?.id) {
@@ -2617,6 +2890,7 @@ async function loadGlobalizedArchive(archiveId) {
   state.activeBranch = null;
   state.activeGlobalized = archiveId;
   state.activeContextChat = false;
+  renderBranchResourceStage();
   restoreActiveDraft();
   updateComposerState();
   renderBranches();
@@ -2664,6 +2938,7 @@ async function loadView(view) {
   state.activeBranch = null;
   state.activeGlobalized = null;
   state.activeContextChat = false;
+  renderBranchResourceStage();
   restoreActiveDraft();
   updateComposerState();
   renderBranches();
@@ -2758,6 +3033,36 @@ els.contextChatButton.addEventListener("click", () => {
   });
 });
 
+els.chatTab.addEventListener("dragenter", (event) => {
+  if (!hasDraggedFiles(event)) return;
+  event.preventDefault();
+  state.branchDropDepth += 1;
+  setBranchDropActive(true);
+});
+
+els.chatTab.addEventListener("dragover", (event) => {
+  if (!hasDraggedFiles(event)) return;
+  event.preventDefault();
+  event.dataTransfer.dropEffect = canDropBranchResources() ? "copy" : "none";
+  setBranchDropActive(true);
+});
+
+els.chatTab.addEventListener("dragleave", (event) => {
+  if (!hasDraggedFiles(event)) return;
+  state.branchDropDepth = Math.max(0, state.branchDropDepth - 1);
+  if (state.branchDropDepth === 0) {
+    setBranchDropActive(false);
+  }
+});
+
+els.chatTab.addEventListener("drop", async (event) => {
+  if (!hasDraggedFiles(event)) return;
+  event.preventDefault();
+  state.branchDropDepth = 0;
+  setBranchDropActive(false);
+  stageBranchResourceFiles(event.dataTransfer.files);
+});
+
 els.filePathForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   await loadProjectFiles(els.filePathInput.value.trim());
@@ -2833,7 +3138,8 @@ async function sendComposerMessage({ mode }) {
   }
   const branch = isContextChat ? CONTEXT_CHAT_KEY : state.activeBranch;
   const text = els.messageInput.value.trim();
-  if (!text) return;
+  const stagedFiles = isContextChat ? [] : stagedBranchResources(branch);
+  if (!text && !stagedFiles.length) return;
   hideChatError();
   const isChat = mode === "chat";
   const isResearch = mode === "research";
@@ -2851,8 +3157,23 @@ async function sendComposerMessage({ mode }) {
   markBranchActivity(branch);
   updateComposerState();
   renderBranches();
-  const pendingMessageId = appendPendingUserMessage({ branch, text, mode: requestedMode });
+  const pendingMessageId = text ? appendPendingUserMessage({ branch, text, mode: requestedMode }) : "";
   try {
+    if (stagedFiles.length) {
+      await uploadBranchResourceFiles(stagedFiles, {
+        branch,
+        allowStarting: true,
+        clearStage: true,
+        render: !text,
+        showProgress: !text,
+      });
+      if (!text) {
+        els.progressTitle.textContent = "완료됨";
+        els.progressEvents.innerHTML = `<div>Staged resource files added to ${escapeHtml(branch)}.</div>`;
+        hideProgressSoon();
+        return;
+      }
+    }
     if (isContextChat) {
       const provider = state.worker?.preferWorker ? "codex-worker" : "codex";
       await startTrackedJob(

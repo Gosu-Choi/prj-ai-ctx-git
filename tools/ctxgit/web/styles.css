@@ -498,12 +498,14 @@ textarea {
 #chatTab.active.event-visible .message-list,
 #chatTab.active.event-visible .composer,
 #chatTab.active.event-visible .progress-panel,
-#chatTab.active.event-visible .chat-error {
+#chatTab.active.event-visible .chat-error,
+#chatTab.active.event-visible .resource-stage {
   width: 100%;
   max-width: none;
 }
 
 .chat-main {
+  position: relative;
   display: grid;
   grid-template-rows: minmax(0, 1fr) auto auto;
   gap: 12px;
@@ -511,6 +513,31 @@ textarea {
   min-width: 0;
   min-height: 0;
   height: 100%;
+}
+
+.drop-overlay {
+  position: absolute;
+  inset: 12px;
+  z-index: 30;
+  display: grid;
+  place-items: center;
+  border: 2px dashed var(--accent);
+  border-radius: 8px;
+  background: rgb(247 251 249 / 88%);
+  color: var(--accent);
+  font-weight: 750;
+  pointer-events: none;
+}
+
+.drop-overlay[hidden] {
+  display: none;
+}
+
+.chat-main.drop-active .message-list,
+.chat-main.drop-active .composer,
+.chat-main.drop-active .progress-panel,
+.chat-main.drop-active .chat-error {
+  filter: saturate(0.85);
 }
 
 .message-list {
@@ -732,6 +759,83 @@ textarea {
   color: inherit;
 }
 
+.resource-stage {
+  display: grid;
+  gap: 8px;
+  width: 100%;
+  max-width: 980px;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid #d6b36a;
+  border-radius: 6px;
+  background: #fff8e8;
+  color: var(--text);
+}
+
+.resource-stage[hidden] {
+  display: none;
+}
+
+.resource-stage-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.resource-stage-meta {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.resource-stage-clear,
+.resource-stage-chip button {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  border: 1px solid #d6b36a;
+  border-radius: 999px;
+  background: #fffdf6;
+  color: #842828;
+  cursor: pointer;
+  line-height: 1;
+}
+
+.resource-stage-clear {
+  margin-left: auto;
+}
+
+.resource-stage-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.resource-stage-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: min(100%, 320px);
+  padding: 4px 5px 4px 8px;
+  border: 1px solid #e4cca0;
+  border-radius: 999px;
+  background: #fffdf6;
+  font-size: 12px;
+}
+
+.resource-stage-chip span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .composer {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 90px 100px 120px;
@@ -744,6 +848,10 @@ textarea {
   background: var(--panel);
   border-radius: 6px;
   box-shadow: 0 12px 28px rgb(0 0 0 / 10%);
+}
+
+.composer.context-mode {
+  grid-template-columns: minmax(0, 1fr) 90px 100px;
 }
 
 .composer textarea {

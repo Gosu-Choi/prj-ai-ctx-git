@@ -6247,6 +6247,75 @@ def upload_project_file_chunk(
     }
 
 
+def branch_source_upload_directory(store: ContextStore, branch_id: str) -> str:
+    paths = store.branch_paths(branch_id)
+    if not paths.root.exists():
+        die(f"branch does not exist: {branch_id}")
+    paths.sources.mkdir(parents=True, exist_ok=True)
+    return relpath(store.root, paths.sources)
+
+
+def branch_source_upload_file_name(path_value: str) -> str:
+    rel = safe_upload_relative_path(path_value)
+    if len(rel.parts) != 1:
+        raise ValueError("branch resource upload accepts files, not folders")
+    if rel.suffix.lower() not in INGEST_EXTENSIONS:
+        supported = ", ".join(sorted(INGEST_EXTENSIONS))
+        raise ValueError(f"unsupported branch resource file type: {rel.suffix or '(none)'}; supported: {supported}")
+    return rel.name
+
+
+def upload_branch_source_file_chunk(
+    store: ContextStore,
+    branch_id: str,
+    path_value: str,
+    content_base64: str,
+    offset: int,
+    total_size: int,
+    *,
+    overwrite: bool = False,
+    last_chunk: bool = False,
+) -> dict[str, Any]:
+    file_name = branch_source_upload_file_name(path_value)
+    directory = branch_source_upload_directory(store, branch_id)
+    return upload_project_file_chunk(
+        store.root,
+        directory,
+        file_name,
+        content_base64,
+        offset,
+        total_size,
+        overwrite=overwrite,
+        last_chunk=last_chunk,
+    )
+
+
+def finish_branch_source_upload(store: ContextStore, branch_id: str, uploaded_paths: list[str]) -> dict[str, Any]:
+    if not uploaded_paths:
+        raise ValueError("uploaded branch resource files are required")
+    paths = store.branch_paths(branch_id)
+    if not paths.root.exists():
+        die(f"branch does not exist: {branch_id}")
+    sources = []
+    for path_value in uploaded_paths:
+        file_name = branch_source_upload_file_name(path_value)
+        sources.append(store.ingest_source(branch_id, paths.sources / file_name))
+    payload = branch_payload(store, branch_id)
+    payload["uploadedSources"] = sources
+    payload["turnCommit"] = internal_git_commit_turn(
+        store,
+        kind="source-drop-upload",
+        actor="user",
+        summary=f"Upload {len(sources)} source file(s) into {branch_id}",
+        branch_id=branch_id,
+        metadata={
+            "branch": branch_id,
+            "files": [item.get("sourcePath") for item in sources],
+        },
+    )
+    return payload
+
+
 def project_registry_id(path: Path, used: set[str]) -> str:
     base = slugify(path.name or "project", fallback="project").lower()
     base = re.sub(r"[^a-z0-9._-]+", "-", base).strip("-._") or "project"
@@ -7614,6 +7683,49 @@ def make_handler(
                     )
                 except ValueError as exc:
                     self.send_json({"error": "upload_finish_failed", "message": str(exc)}, status=400)
+                return
+            if parsed.path == "/api/branch/source/upload-chunk":
+                branch_id = str(body.get("branch") or "")
+                path_value = str(body.get("path") or "")
+                content_base64 = str(body.get("contentBase64") or "")
+                overwrite = body.get("overwrite") is True
+                last_chunk = body.get("lastChunk") is True
+                try:
+                    offset = int(body.get("offset") or 0)
+                    total_size = int(body.get("totalSize") or 0)
+                except (TypeError, ValueError):
+                    self.send_json({"error": "invalid_chunk", "message": "offset and totalSize are required"}, status=400)
+                    return
+                try:
+                    self.send_json(
+                        upload_branch_source_file_chunk(
+                            store,
+                            branch_id,
+                            path_value,
+                            content_base64,
+                            offset,
+                            total_size,
+                            overwrite=overwrite,
+                            last_chunk=last_chunk,
+                        )
+                    )
+                except FileExistsError as exc:
+                    self.send_json({"error": "file_exists", "message": f"Branch resource already exists: {exc}"}, status=409)
+                except ValueError as exc:
+                    self.send_json({"error": "upload_failed", "message": str(exc)}, status=400)
+                except SystemExit as exc:
+                    self.send_json({"error": "upload_failed"}, status=int(exc.code or 400))
+                return
+            if parsed.path == "/api/branch/source/upload-finish":
+                branch_id = str(body.get("branch") or "")
+                uploaded_paths = body.get("files") if isinstance(body.get("files"), list) else []
+                uploaded_paths = [str(item) for item in uploaded_paths if str(item).strip()]
+                try:
+                    self.send_json(finish_branch_source_upload(store, branch_id, uploaded_paths))
+                except ValueError as exc:
+                    self.send_json({"error": "upload_finish_failed", "message": str(exc)}, status=400)
+                except SystemExit as exc:
+                    self.send_json({"error": "upload_finish_failed"}, status=int(exc.code or 400))
                 return
             if parsed.path in {"/api/merge", "/api/merge/start"}:
                 raw_branches = body.get("branches")

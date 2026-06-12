@@ -324,6 +324,60 @@ class CtxgitTest(unittest.TestCase):
             self.assertTrue(result["complete"])
             self.assertEqual(target.read_text(encoding="utf-8"), "new")
 
+    def test_branch_source_chunk_upload_ingests_resource(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("source")
+
+            first = ctxgit.upload_branch_source_file_chunk(
+                store,
+                "source",
+                "paper.txt",
+                base64.b64encode(b"Important ").decode("ascii"),
+                0,
+                22,
+            )
+            second = ctxgit.upload_branch_source_file_chunk(
+                store,
+                "source",
+                "paper.txt",
+                base64.b64encode(b"source text.").decode("ascii"),
+                10,
+                22,
+                last_chunk=True,
+            )
+            payload = ctxgit.finish_branch_source_upload(store, "source", ["paper.txt"])
+
+            self.assertFalse(first["complete"])
+            self.assertTrue(second["complete"])
+            self.assertEqual(payload["uploadedSources"][0]["status"], "extracted")
+            self.assertEqual(payload["turnCommit"]["ref"], ctxgit.ctxgit_branch_ref("source"))
+            self.assertTrue((root / "contexts/branches/source/sources/paper.txt").exists())
+            self.assertTrue((root / "contexts/branches/source/sources/paper.txt.meta.json").exists())
+            self.assertEqual(
+                (root / "contexts/branches/source/sources/paper.txt.txt").read_text(encoding="utf-8"),
+                "Important source text.",
+            )
+            self.assertEqual(len(ctxgit.branch_payload(store, "source")["sources"]), 1)
+
+    def test_branch_source_upload_rejects_unsupported_resource(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("source")
+
+            with self.assertRaises(ValueError):
+                ctxgit.upload_branch_source_file_chunk(
+                    store,
+                    "source",
+                    "image.png",
+                    base64.b64encode(b"png").decode("ascii"),
+                    0,
+                    3,
+                    last_chunk=True,
+                )
+
     def test_auth_store_first_signup_login_and_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

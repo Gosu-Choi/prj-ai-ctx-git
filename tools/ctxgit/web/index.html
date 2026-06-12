@@ -140,12 +140,14 @@
 
         <section id="chatTab" class="tab-panel active event-visible">
           <div class="chat-main">
+            <div id="branchDropOverlay" class="drop-overlay" hidden>Drop to stage branch resources</div>
             <div id="messageList" class="message-list"></div>
             <div id="progressPanel" class="progress-panel" hidden>
               <div id="progressTitle" class="progress-title"></div>
               <div id="progressEvents" class="progress-events"></div>
             </div>
             <div id="chatError" class="error-banner chat-error" hidden></div>
+            <div id="branchResourceStage" class="resource-stage" hidden></div>
             <form id="composer" class="composer">
               <textarea id="messageInput" rows="3" placeholder="Ask the branch-aware AI"></textarea>
               <button id="sendButton" type="submit">Send</button>
