@@ -28,6 +28,7 @@ const state = {
 
 const CONTEXT_CHAT_KEY = "__contexts__";
 const UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024;
+const PROJECT_SESSION_KEY = "ctxgit.activeProjectPath";
 const BRANCH_RESOURCE_EXTENSIONS = new Set([
   ".bmp",
   ".gif",
@@ -157,10 +158,40 @@ function escapeHtml(value) {
     .replaceAll('"', "&quot;");
 }
 
+function storedProjectPath() {
+  try {
+    return sessionStorage.getItem(PROJECT_SESSION_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+function rememberProjectPath(path) {
+  const value = String(path || "").trim();
+  try {
+    if (value) {
+      sessionStorage.setItem(PROJECT_SESSION_KEY, value);
+    } else {
+      sessionStorage.removeItem(PROJECT_SESSION_KEY);
+    }
+  } catch {
+    // Browsers may deny storage in private or locked-down contexts.
+  }
+}
+
+function activeProjectPathForRequest() {
+  return state.project?.path || storedProjectPath();
+}
+
 async function api(path, options = {}) {
+  const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
+  const projectPath = activeProjectPathForRequest();
+  if (projectPath && String(path).startsWith("/api/") && !String(path).startsWith("/api/auth/")) {
+    headers["X-Ctxgit-Project"] = encodeURIComponent(projectPath);
+  }
   const response = await fetch(path, {
-    headers: { "Content-Type": "application/json" },
     ...options,
+    headers,
   });
   const text = await response.text();
   let payload = {};
@@ -737,6 +768,7 @@ function clearDraft(key) {
 function renderProject(project) {
   state.project = project;
   const path = project?.path || "";
+  rememberProjectPath(path);
   const initialized = project?.initialized === true;
   const gitInitialized = project?.gitInitialized === true;
   els.projectPathInput.value = path;

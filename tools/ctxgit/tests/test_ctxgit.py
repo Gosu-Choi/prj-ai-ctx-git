@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import urllib.request
 import unittest
 from pathlib import Path
@@ -464,6 +465,51 @@ class CtxgitTest(unittest.TestCase):
             self.assertTrue(auth["authenticated"])
             self.assertEqual(project_status, 200)
             self.assertEqual(project["path"], str(root.resolve()))
+
+    def test_handler_uses_project_header_for_tab_scoped_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            first = base / "first"
+            second = base / "second"
+            first.mkdir()
+            second.mkdir()
+            first_store = ctxgit.ContextStore(first)
+            second_store = ctxgit.ContextStore(second)
+            first_store.init()
+            second_store.init()
+            second_store.create_branch("second_only")
+            project_state = ctxgit.ProjectState(first)
+            handler = ctxgit.make_handler(project_state, auth_required=False)
+
+            with ctxgit.ReusableThreadingHTTPServer(("127.0.0.1", 0), handler) as server:
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                base_url = f"http://127.0.0.1:{server.server_port}"
+                encoded_second = urllib.parse.quote(str(second.resolve()), safe="")
+                try:
+                    request = urllib.request.Request(
+                        f"{base_url}/api/project",
+                        headers={"X-Ctxgit-Project": encoded_second},
+                    )
+                    with urllib.request.urlopen(request, timeout=5) as response:
+                        project = json.loads(response.read().decode("utf-8"))
+
+                    request = urllib.request.Request(
+                        f"{base_url}/api/branches",
+                        headers={"X-Ctxgit-Project": encoded_second},
+                    )
+                    with urllib.request.urlopen(request, timeout=5) as response:
+                        branches = json.loads(response.read().decode("utf-8"))
+
+                    with urllib.request.urlopen(f"{base_url}/api/project", timeout=5) as response:
+                        default_project = json.loads(response.read().decode("utf-8"))
+                finally:
+                    server.shutdown()
+                    thread.join(timeout=5)
+
+            self.assertEqual(project["path"], str(second.resolve()))
+            self.assertEqual(default_project["path"], str(first.resolve()))
+            self.assertIn("second_only", [branch["id"] for branch in branches["branches"]])
 
     def test_serve_defaults_to_no_auth_with_auth_opt_in(self) -> None:
         parser = ctxgit.build_parser()

@@ -6951,9 +6951,10 @@ class ProjectState:
         with self._lock:
             return self._root
 
-    def context(self, require_initialized: bool = True) -> tuple[Path, ContextStore]:
+    def context(self, require_initialized: bool = True, root: Path | None = None) -> tuple[Path, ContextStore]:
         with self._lock:
-            root = self._root
+            selected_root = (root or self._root).resolve()
+        root = selected_root
         store = ContextStore(root)
         if require_initialized:
             store.require_initialized()
@@ -6961,8 +6962,8 @@ class ProjectState:
             load_project_env(root)
         return root, store
 
-    def payload(self) -> dict[str, Any]:
-        return project_payload(self.root())
+    def payload(self, root: Path | None = None) -> dict[str, Any]:
+        return project_payload((root or self.root()).resolve())
 
     def open(self, path_value: str, init: bool = False, init_git: bool = False) -> dict[str, Any]:
         if not path_value.strip():
@@ -7026,9 +7027,9 @@ class JobStore:
         }
         return job
 
-    def create(self, kind: str, work: Callable[[ProgressCallback], dict[str, Any]]) -> dict[str, Any]:
+    def create(self, kind: str, work: Callable[[ProgressCallback], dict[str, Any]], root: Path | None = None) -> dict[str, Any]:
         job_id = self.new_job_id()
-        job = self.base_job(job_id, kind)
+        job = self.base_job(job_id, kind, root=root)
         with self._lock:
             self._jobs[job_id] = job
             self.persist_locked(job)
@@ -7193,9 +7194,12 @@ class JobStore:
             job.setdefault("events", []).append({"message": f"실패: {message}", "createdAt": job["updatedAt"]})
             self.persist_locked(job)
 
-    def snapshot(self, job_id: str) -> dict[str, Any]:
+    def snapshot(self, job_id: str, root: Path | None = None) -> dict[str, Any]:
         with self._lock:
-            job = self._jobs.get(job_id) or self.load_locked(job_id)
+            job = self._jobs.get(job_id)
+            if job and root and Path(str(job.get("projectPath") or "")).expanduser().resolve() != root.resolve():
+                job = None
+            job = job or self.load_locked(job_id, root=root)
             if not job:
                 return {"error": "job_not_found", "message": f"job not found: {job_id}"}
             snapshot = json.loads(json.dumps(self.public_job(job), ensure_ascii=False))
@@ -7215,10 +7219,10 @@ class JobStore:
             return
         dump_json(path, self.public_job(job))
 
-    def load_locked(self, job_id: str) -> dict[str, Any] | None:
+    def load_locked(self, job_id: str, root: Path | None = None) -> dict[str, Any] | None:
         if not SAFE_ID_RE.match(job_id):
             return None
-        path = self.job_path(job_id)
+        path = self.job_path(job_id, root=root)
         if not path.exists():
             return None
         try:
@@ -7414,6 +7418,22 @@ def make_handler(
                 }
             return auth_store.session_user(self.auth_token())
 
+        def request_project_root(self) -> Path:
+            raw = self.headers.get("X-Ctxgit-Project", "").strip()
+            if not raw:
+                return project_state.root()
+            value = urllib.parse.unquote(raw).strip()
+            root = Path(value).expanduser().resolve()
+            if not root.exists() or not root.is_dir():
+                raise ValueError(f"project directory does not exist: {root}")
+            return root
+
+        def request_project_payload(self) -> dict[str, Any]:
+            return project_state.payload(root=self.request_project_root())
+
+        def request_context(self, require_initialized: bool = True) -> tuple[Path, ContextStore]:
+            return project_state.context(require_initialized=require_initialized, root=self.request_project_root())
+
         def require_authenticated(self, *, json_response: bool = True) -> bool:
             if not auth_required:
                 return True
@@ -7504,10 +7524,16 @@ def make_handler(
             if self.handle_auth_get(parsed):
                 return True
             if parsed.path == "/api/project":
-                self.send_json(project_state.payload())
+                try:
+                    self.send_json(self.request_project_payload())
+                except ValueError as exc:
+                    self.send_json({"error": "project_invalid", "message": str(exc)}, status=400)
                 return True
             if parsed.path == "/api/server/projects":
-                self.send_json(registry.payload(project_state.root()))
+                try:
+                    self.send_json(registry.payload(self.request_project_root()))
+                except ValueError as exc:
+                    self.send_json({"error": "project_invalid", "message": str(exc)}, status=400)
                 return True
             if parsed.path == "/api/worker/status":
                 self.send_json(jobs.worker_status())
@@ -7535,13 +7561,24 @@ def make_handler(
                 return True
             if parsed.path == "/api/job":
                 job_id = (query.get("id") or [""])[0]
-                snapshot = jobs.snapshot(job_id)
+                try:
+                    project_root = self.request_project_root()
+                except ValueError:
+                    project_root = None
+                snapshot = jobs.snapshot(job_id, root=project_root)
                 self.send_json(snapshot, status=404 if snapshot.get("error") == "job_not_found" else 200)
                 return True
             try:
-                root, store = project_state.context(require_initialized=True)
+                root, store = self.request_context(require_initialized=True)
             except SystemExit as exc:
-                self.send_json({"error": "project_not_initialized", "project": project_state.payload()}, status=int(exc.code or 409))
+                try:
+                    project = self.request_project_payload()
+                except ValueError:
+                    project = project_state.payload()
+                self.send_json({"error": "project_not_initialized", "project": project}, status=int(exc.code or 409))
+                return True
+            except ValueError as exc:
+                self.send_json({"error": "project_invalid", "message": str(exc)}, status=400)
                 return True
             if parsed.path == "/api/context-chat":
                 self.send_json(context_chat_payload(store))
@@ -7620,7 +7657,7 @@ def make_handler(
         def handle_file_get(self, parsed: urllib.parse.ParseResult) -> None:
             query = urllib.parse.parse_qs(parsed.query)
             try:
-                root, _store = project_state.context(require_initialized=True)
+                root, _store = self.request_context(require_initialized=True)
                 target = resolve_project_file(root, (query.get("path") or [""])[0])
             except FileNotFoundError:
                 self.send_text("File not found.", content_type="text/plain; charset=utf-8", status=404)
@@ -7709,7 +7746,11 @@ def make_handler(
                 project_id = str(body.get("id") or "")
                 init = body.get("init") is True
                 try:
-                    root = registry.resolve(project_id, project_state.root())
+                    try:
+                        active_root = self.request_project_root()
+                    except ValueError:
+                        active_root = project_state.root()
+                    root = registry.resolve(project_id, active_root)
                     self.send_json(project_state.open(str(root), init=init, init_git=body.get("gitInit") is True))
                 except SystemExit as exc:
                     self.send_json({"error": "project_not_initialized", "message": "Project is not initialized for ctxgit."}, status=int(exc.code or 409))
@@ -7815,9 +7856,16 @@ def make_handler(
                     self.send_json({"error": "git_init_failed", "message": detail or str(exc)}, status=500)
                 return
             try:
-                root, store = project_state.context(require_initialized=True)
+                root, store = self.request_context(require_initialized=True)
             except SystemExit as exc:
-                self.send_json({"error": "project_not_initialized", "project": project_state.payload()}, status=int(exc.code or 409))
+                try:
+                    project = self.request_project_payload()
+                except ValueError:
+                    project = project_state.payload()
+                self.send_json({"error": "project_not_initialized", "project": project}, status=int(exc.code or 409))
+                return
+            except ValueError as exc:
+                self.send_json({"error": "project_invalid", "message": str(exc)}, status=400)
                 return
             if parsed.path == "/api/project/directory/create":
                 path_value = str(body.get("path") or "")
@@ -8005,7 +8053,7 @@ def make_handler(
                             progress=progress,
                         )
 
-                    self.send_json(jobs.create("merge", work), status=202)
+                    self.send_json(jobs.create("merge", work, root=root), status=202)
                     return
                 try:
                     self.send_json(
@@ -8315,7 +8363,7 @@ def make_handler(
                         progress=progress,
                     )
 
-                self.send_json(jobs.create("research", work), status=202)
+                self.send_json(jobs.create("research", work, root=root), status=202)
                 return
             if parsed.path == "/api/research":
                 branch_id = str(body.get("branch") or "")
@@ -8387,7 +8435,7 @@ def make_handler(
                         progress=progress,
                     )
 
-                self.send_json(jobs.create("chat", work), status=202)
+                self.send_json(jobs.create("chat", work, root=root), status=202)
                 return
             if parsed.path in {"/api/history-chat/start", "/api/info-chat/start"}:
                 branch_id = str(body.get("branch") or "")
@@ -8426,7 +8474,7 @@ def make_handler(
                         progress=progress,
                     )
 
-                self.send_json(jobs.create("info-chat", work), status=202)
+                self.send_json(jobs.create("info-chat", work, root=root), status=202)
                 return
             if parsed.path == "/api/context-chat/start":
                 text = str(body.get("text") or "").strip()
@@ -8454,7 +8502,7 @@ def make_handler(
                 def work(progress: ProgressCallback) -> dict[str, Any]:
                     return run_context_chat_turn(root, store, text, provider=provider, progress=progress)
 
-                self.send_json(jobs.create("context-chat", work), status=202)
+                self.send_json(jobs.create("context-chat", work, root=root), status=202)
                 return
             if parsed.path == "/api/context-chat/reset":
                 try:
