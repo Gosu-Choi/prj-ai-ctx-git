@@ -1495,6 +1495,38 @@ class CtxgitTest(unittest.TestCase):
             self.assertIn("Branch resource files stored as direct attachments", research_prompt)
             self.assertIn(rel, research_prompt)
 
+    def test_chat_prompt_uses_character_budget_without_default_record_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("AItrust")
+            for index in range(250):
+                store.append_history("AItrust", "user", f"MSG-{index:03d}-unique")
+
+            prompt = ctxgit.build_chat_prompt(store, "AItrust", "Continue.")
+
+            self.assertIn("MSG-000-unique", prompt)
+            self.assertIn("MSG-249-unique", prompt)
+            self.assertNotIn("ctxgit omitted", prompt)
+
+    def test_chat_prompt_respects_history_character_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("AItrust")
+            config = ctxgit.load_json(root / ".ctxgit/config.json")
+            config["llm"]["codex"]["historyBudgetCharacters"] = 1200
+            config["llm"]["codex"]["historyRecordLimit"] = 0
+            ctxgit.dump_json(root / ".ctxgit/config.json", config)
+            for index in range(50):
+                store.append_history("AItrust", "user", f"MSG-{index:03d}-unique " + ("x" * 80))
+
+            prompt = ctxgit.build_chat_prompt(store, "AItrust", "Continue.")
+
+            self.assertIn("MSG-049-unique", prompt)
+            self.assertNotIn("MSG-000-unique", prompt)
+            self.assertIn("ctxgit omitted", prompt)
+
     def test_chat_turn_records_and_passes_current_turn_resources(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

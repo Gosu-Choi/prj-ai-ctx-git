@@ -65,6 +65,8 @@ TOOL_REPO_ROOT = Path(__file__).resolve().parents[2]
 INITIAL_BRANCH_ID = "initial"
 INITIAL_BRANCH_TITLE = "Initial branch"
 DEFAULT_CONTEXT_BUDGET_CHARS = 60000
+DEFAULT_HISTORY_CONTEXT_BUDGET_CHARS = 120000
+DEFAULT_HISTORY_CONTEXT_RECORD_LIMIT = 0
 DEFAULT_COMPACTION_THRESHOLD = 80
 DEFAULT_COMPACTION_KEEP_TAIL = 40
 DEFAULT_RESEARCH_MIN_SOURCES = 6
@@ -921,6 +923,9 @@ class ContextStore:
                             "sandbox": DEFAULT_CODEX_SANDBOX,
                             "timeoutSeconds": 900,
                             "contextBudgetCharacters": DEFAULT_CONTEXT_BUDGET_CHARS,
+                            "historyBudgetCharacters": DEFAULT_HISTORY_CONTEXT_BUDGET_CHARS,
+                            "infoChatHistoryBudgetCharacters": DEFAULT_HISTORY_CONTEXT_BUDGET_CHARS,
+                            "historyRecordLimit": DEFAULT_HISTORY_CONTEXT_RECORD_LIMIT,
                         },
                     },
                     "createdAt": utc_now(),
@@ -3902,6 +3907,9 @@ def default_llm_config() -> dict[str, Any]:
             "sandbox": DEFAULT_CODEX_SANDBOX,
             "timeoutSeconds": 900,
             "contextBudgetCharacters": DEFAULT_CONTEXT_BUDGET_CHARS,
+            "historyBudgetCharacters": DEFAULT_HISTORY_CONTEXT_BUDGET_CHARS,
+            "infoChatHistoryBudgetCharacters": DEFAULT_HISTORY_CONTEXT_BUDGET_CHARS,
+            "historyRecordLimit": DEFAULT_HISTORY_CONTEXT_RECORD_LIMIT,
         },
     }
 
@@ -4135,6 +4143,14 @@ def coerce_positive_int(value: Any, default: int) -> int:
     return parsed if parsed > 0 else default
 
 
+def coerce_nonnegative_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
 def truncate_middle(text: str, max_chars: int) -> str:
     if max_chars <= 0 or len(text) <= max_chars:
         return text
@@ -4361,10 +4377,16 @@ def format_history_record(record: dict[str, Any]) -> str:
     return line
 
 
-def select_history_for_budget(records: list[dict[str, Any]], budget_chars: int) -> list[dict[str, Any]]:
+def select_history_for_budget(
+    records: list[dict[str, Any]],
+    budget_chars: int,
+    max_records: int | None = None,
+) -> list[dict[str, Any]]:
     selected: list[dict[str, Any]] = []
     used = 0
     for record in reversed(records):
+        if max_records is not None and max_records > 0 and len(selected) >= max_records:
+            break
         size = len(format_history_record(record)) + 1
         if selected and used + size > budget_chars:
             break
@@ -4373,6 +4395,21 @@ def select_history_for_budget(records: list[dict[str, Any]], budget_chars: int) 
         if used >= budget_chars:
             break
     return list(reversed(selected))
+
+
+def history_record_limit_from_config(codex_config: dict[str, Any]) -> int | None:
+    limit = coerce_nonnegative_int(
+        codex_config.get("historyRecordLimit"),
+        DEFAULT_HISTORY_CONTEXT_RECORD_LIMIT,
+    )
+    return None if limit == 0 else limit
+
+
+def history_budget_from_config(codex_config: dict[str, Any], *keys: str) -> int:
+    for key in keys:
+        if key in codex_config:
+            return coerce_positive_int(codex_config.get(key), DEFAULT_HISTORY_CONTEXT_BUDGET_CHARS)
+    return DEFAULT_HISTORY_CONTEXT_BUDGET_CHARS
 
 
 def build_context_bundle(store: ContextStore, branch_id: str) -> dict[str, str]:
@@ -4387,17 +4424,15 @@ def build_context_bundle(store: ContextStore, branch_id: str) -> dict[str, str]:
     source_budget = max(10000, budget // 5)
     resource_budget = max(4000, budget // 12)
     compaction_budget = max(8000, budget // 6)
-    history_budget = max(
-        12000,
-        budget - project_budget - branch_budget - source_budget - resource_budget - compaction_budget,
-    )
+    history_budget = history_budget_from_config(codex_config, "historyBudgetCharacters")
+    history_record_limit = history_record_limit_from_config(codex_config)
     project_context = "\n\n".join(project_context_sections(store, project_budget)).strip()
     branch_context = truncate_middle(store.context_excerpt(branch_id), branch_budget).strip()
     source_context = source_context_sections(store, branch_id, source_budget)
     resource_context = resource_context_sections(store, branch_id, resource_budget)
     compaction_context = compaction_context_sections(store, branch_id, compaction_budget)
     records = list(store.iter_history(branch_id))
-    history_records = select_history_for_budget(records, history_budget)
+    history_records = select_history_for_budget(records, history_budget, max_records=history_record_limit)
     omitted = max(0, len(records) - len(history_records))
     history_lines = [format_history_record(item) for item in history_records]
     if omitted:
@@ -4536,13 +4571,18 @@ def build_history_chat_prompt(
     project_budget = max(10000, budget // 3)
     branch_budget = max(10000, budget // 3)
     resource_budget = max(4000, budget // 10)
-    history_budget = max(12000, budget - project_budget - branch_budget - resource_budget)
+    history_budget = history_budget_from_config(
+        codex_config,
+        "infoChatHistoryBudgetCharacters",
+        "historyBudgetCharacters",
+    )
+    history_record_limit = history_record_limit_from_config(codex_config)
     project_context = "\n\n".join(project_context_sections(store, project_budget)).strip()
     branch_context = truncate_middle(store.context_excerpt(branch_id), branch_budget).strip()
     resource_context = resource_context_sections(store, branch_id, resource_budget)
     current_attachments = current_turn_attachment_section(store, branch_id, resource_paths)
     records = list(store.iter_history(branch_id))
-    history_records = select_history_for_budget(records, history_budget)
+    history_records = select_history_for_budget(records, history_budget, max_records=history_record_limit)
     omitted = max(0, len(records) - len(history_records))
     history_lines = [format_history_record(item) for item in history_records]
     if omitted:
@@ -4678,12 +4718,17 @@ def build_context_chat_prompt(store: ContextStore, user_message: str) -> str:
     )
     project_budget = max(10000, budget // 4)
     overview_budget = max(10000, budget // 4)
-    history_budget = max(12000, budget - project_budget - overview_budget)
+    history_budget = history_budget_from_config(
+        codex_config,
+        "infoChatHistoryBudgetCharacters",
+        "historyBudgetCharacters",
+    )
+    history_record_limit = history_record_limit_from_config(codex_config)
     project_context = "\n\n".join(project_context_sections(store, project_budget)).strip()
     file_overview = contexts_file_overview(store, overview_budget // 2)
     branch_overview = contexts_branch_overview(store, overview_budget // 2)
     records = list(store.iter_context_history())
-    history_records = select_history_for_budget(records, history_budget)
+    history_records = select_history_for_budget(records, history_budget, max_records=history_record_limit)
     omitted = max(0, len(records) - len(history_records))
     history_lines = [format_history_record(item) for item in history_records]
     if omitted:
