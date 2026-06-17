@@ -180,7 +180,7 @@ function rememberProjectPath(path) {
 }
 
 function activeProjectPathForRequest() {
-  return state.project?.path || storedProjectPath();
+  return state.project?.path || "";
 }
 
 async function api(path, options = {}) {
@@ -772,10 +772,28 @@ function renderProject(project) {
   const initialized = project?.initialized === true;
   const gitInitialized = project?.gitInitialized === true;
   els.projectPathInput.value = path;
+  const status = path
+    ? `ctxgit: ${initialized ? "ready" : "not initialized"} · git: ${gitInitialized ? "ready" : "not initialized"}`
+    : "No project selected";
+  const displayStatus = path
+    ? `ctxgit: ${initialized ? "ready" : "not initialized"} | git: ${gitInitialized ? "ready" : "not initialized"}`
+    : "No project selected";
+  if (!path) {
+    els.projectSummary.innerHTML = `
+      <div><strong>${escapeHtml(project?.name || "No project")}</strong></div>
+      <div class="muted">${escapeHtml(displayStatus)}</div>
+    `;
+    return;
+  }
   els.projectSummary.innerHTML = `
     <div><strong>${escapeHtml(project?.name || "No project")}</strong></div>
     <div class="muted">${escapeHtml(path)}</div>
     <div class="muted">ctxgit: ${initialized ? "ready" : "not initialized"} · git: ${gitInitialized ? "ready" : "not initialized"}</div>
+  `;
+  els.projectSummary.innerHTML = `
+    <div><strong>${escapeHtml(project?.name || "No project")}</strong></div>
+    <div class="muted">${escapeHtml(path)}</div>
+    <div class="muted">${escapeHtml(displayStatus)}</div>
   `;
 }
 
@@ -2588,6 +2606,8 @@ async function loadProject() {
     renderGit(await api("/api/git/status"));
     renderProvider(await api("/api/provider/status"));
     await loadWorkerStatus();
+  } else if (!project.path) {
+    clearWorkspace("Select or initialize a ctxgit project.");
   } else {
     clearWorkspace("This directory is not initialized for ctxgit yet.");
   }

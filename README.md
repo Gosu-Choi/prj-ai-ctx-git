@@ -60,10 +60,11 @@ The installer adds this repo's `bin\` folder to the user `PATH`. Windows uses
 
 ## Local Server Scripts
 
-The repository includes double-click launchers at the repository root. Set
-`CTXGIT_ROOT` in this repository's local `.env` file for a fixed project root,
-or pass a project root to the scripts under `scripts/`. The default server URL
-is `http://127.0.0.1:8766/`.
+The repository includes double-click launchers at the repository root. By
+default they start the server with no project selected; open or initialize a
+project from the browser UI. Set `CTXGIT_ROOT` in this repository's local
+`.env` file only when you want the launchers to open one fixed project
+automatically. The default server URL is `http://127.0.0.1:8766/`.
 
 Root launchers:
 
@@ -82,6 +83,7 @@ chmod +x start-ctxgit-macos.command stop-ctxgit-macos.command
 Windows PowerShell:
 
 ```powershell
+.\scripts\windows\start-ctxgit.ps1
 .\scripts\windows\start-ctxgit.ps1 "C:\path\to\your\project"
 .\scripts\windows\stop-ctxgit.ps1
 ```
@@ -89,6 +91,7 @@ Windows PowerShell:
 macOS:
 
 ```bash
+bash scripts/macos/start-ctxgit.sh
 bash scripts/macos/start-ctxgit.sh "/path/to/your/project"
 bash scripts/macos/stop-ctxgit.sh
 ```
@@ -96,7 +99,8 @@ bash scripts/macos/stop-ctxgit.sh
 Optional `.env` defaults:
 
 ```dotenv
-CTXGIT_ROOT=/absolute/path/to/your/ctxgit/project
+# Leave CTXGIT_ROOT unset to start with no project selected.
+# CTXGIT_ROOT=/absolute/path/to/your/ctxgit/project
 CTXGIT_HOST=127.0.0.1
 CTXGIT_PORT=8766
 ```

@@ -3,7 +3,8 @@ param(
   [string]$Root = "",
   [string]$HostAddress = "",
   [int]$Port = 0,
-  [switch]$Foreground
+  [switch]$Foreground,
+  [switch]$RequireRoot
 )
 
 $ErrorActionPreference = "Stop"
@@ -74,6 +75,11 @@ function Quote-Arg {
   return '"' + ($Value -replace '"', '\"') + '"'
 }
 
+function Normalize-PathValue {
+  param([string]$Value)
+  return ("" + $Value).Trim().Trim('"').Trim("'")
+}
+
 function Get-CtxgitServerProcess {
   param([int]$ListenPort)
   $connections = Get-NetTCPConnection -LocalPort $ListenPort -State Listen -ErrorAction SilentlyContinue
@@ -92,9 +98,17 @@ Import-DotEnv (Join-Path $RepoRoot ".env")
 if (-not $HostAddress) { $HostAddress = if ($env:CTXGIT_HOST) { $env:CTXGIT_HOST } else { "127.0.0.1" } }
 if (-not $Port) { $Port = if ($env:CTXGIT_PORT) { [int]$env:CTXGIT_PORT } else { 8766 } }
 if (-not $Root) { $Root = $env:CTXGIT_ROOT }
-if (-not $Root) { $Root = (Get-Location).Path }
-
-$Root = (Resolve-Path -LiteralPath $Root).Path
+$Root = Normalize-PathValue $Root
+if (-not $Root -and $RequireRoot) {
+  throw "CTXGIT_ROOT is not set. Set CTXGIT_ROOT in this repository's .env file, or run scripts\windows\start-ctxgit.ps1 with a project root argument."
+}
+if ($Root) {
+  try {
+    $Root = (Resolve-Path -LiteralPath $Root).Path
+  } catch {
+    throw "Project root does not exist or is invalid: $Root"
+  }
+}
 
 $existing = @(Get-CtxgitServerProcess -ListenPort $Port)
 if ($existing.Count) {
@@ -104,7 +118,11 @@ if ($existing.Count) {
 }
 
 $python = Resolve-PythonCommand
-$argumentList = @($python.Prefix + @($CtxgitPy, "--root", $Root, "serve", "--host", $HostAddress, "--port", [string]$Port))
+$argumentList = @($python.Prefix + @($CtxgitPy))
+if ($Root) {
+  $argumentList += @("--root", $Root)
+}
+$argumentList += @("serve", "--host", $HostAddress, "--port", [string]$Port)
 
 if ($Foreground) {
   & $python.File @argumentList
@@ -153,5 +171,5 @@ if (-not $started) {
 
 Write-Host "ctxgit server started: http://${HostAddress}:$Port/"
 Write-Host "PID: $($process.Id)"
-Write-Host "Root: $Root"
+Write-Host "Root: $(if ($Root) { $Root } else { '(none; open a project in the browser)' })"
 Write-Host "Logs: $stdoutPath ; $stderrPath"

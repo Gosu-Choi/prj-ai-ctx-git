@@ -37,14 +37,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$root" ]]; then
-  root="$PWD"
-fi
-if [[ ! -d "$root" ]]; then
+if [[ -n "$root" && ! -d "$root" ]]; then
   echo "ctxgit: project root does not exist: $root" >&2
   exit 1
 fi
-root="$(cd "$root" >/dev/null 2>&1 && pwd)"
+if [[ -n "$root" ]]; then
+  root="$(cd "$root" >/dev/null 2>&1 && pwd)"
+fi
 
 python_cmd="${PYTHON:-python3}"
 if ! command -v "$python_cmd" >/dev/null 2>&1; then
@@ -74,7 +73,11 @@ if [[ -n "$existing_pids" ]]; then
 fi
 
 ctxgit_py="$repo_root/tools/ctxgit/ctxgit.py"
-args=("$ctxgit_py" "--root" "$root" "serve" "--host" "$host" "--port" "$port")
+args=("$ctxgit_py")
+if [[ -n "$root" ]]; then
+  args+=("--root" "$root")
+fi
+args+=("serve" "--host" "$host" "--port" "$port")
 
 if [[ "$foreground" == "1" ]]; then
   exec "$python_cmd" "${args[@]}"
@@ -113,5 +116,9 @@ fi
 
 echo "ctxgit server started: http://$host:$port/"
 echo "PID: $pid"
-echo "Root: $root"
+if [[ -n "$root" ]]; then
+  echo "Root: $root"
+else
+  echo "Root: (none; open a project in the browser)"
+fi
 echo "Logs: $stdout_path ; $stderr_path"

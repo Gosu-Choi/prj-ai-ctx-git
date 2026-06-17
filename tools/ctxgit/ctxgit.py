@@ -6287,6 +6287,20 @@ def project_payload(root: Path) -> dict[str, Any]:
     }
 
 
+def no_project_payload() -> dict[str, Any]:
+    return {
+        "path": "",
+        "name": "No project selected",
+        "exists": False,
+        "isDirectory": False,
+        "initialized": False,
+        "gitInitialized": False,
+        "gitRoot": "",
+        "selected": False,
+        "message": "Select or initialize a ctxgit project.",
+    }
+
+
 def browse_directories(path_value: str | None) -> dict[str, Any]:
     base = Path(path_value).expanduser() if path_value else Path.home()
     if not base.exists() or not base.is_dir():
@@ -6791,37 +6805,39 @@ class AuthStore:
 
 
 class ServerProjectRegistry:
-    def __init__(self, initial_root: Path, projects_root: Path | None = None) -> None:
-        self.initial_root = initial_root.resolve()
+    def __init__(self, initial_root: Path | None, projects_root: Path | None = None) -> None:
+        self.initial_root = initial_root.resolve() if initial_root else None
         self.projects_root = projects_root.expanduser().resolve() if projects_root else None
         if self.projects_root:
             self.projects_root.mkdir(parents=True, exist_ok=True)
 
-    def payload(self, active_root: Path) -> dict[str, Any]:
+    def payload(self, active_root: Path | None = None) -> dict[str, Any]:
         return {
             "enabled": self.projects_root is not None,
             "projectsRoot": str(self.projects_root) if self.projects_root else "",
-            "activeProject": project_payload(active_root),
+            "activeProject": project_payload(active_root) if active_root else no_project_payload(),
             "projects": self.list_projects(active_root),
         }
 
     def list_projects(self, active_root: Path | None = None) -> list[dict[str, Any]]:
-        active_root = (active_root or self.initial_root).resolve()
+        active_root = (active_root or self.initial_root)
+        if active_root:
+            active_root = active_root.resolve()
         candidates: list[Path] = []
         if self.projects_root:
             for child in sorted(self.projects_root.iterdir(), key=lambda item: item.name.lower()):
                 if child.is_dir() and not child.name.startswith("."):
                     candidates.append(child.resolve())
-        else:
+        elif active_root:
             candidates.append(active_root)
-        if active_root not in candidates:
+        if active_root and active_root not in candidates:
             candidates.insert(0, active_root)
         used: set[str] = set()
         projects = []
         for path in candidates:
             payload = project_payload(path)
             payload["id"] = project_registry_id(path, used)
-            payload["active"] = path == active_root
+            payload["active"] = active_root is not None and path == active_root
             payload["source"] = "server" if self.projects_root and path != active_root else "active"
             projects.append(payload)
         return projects
@@ -6841,7 +6857,8 @@ class ServerProjectRegistry:
                     try:
                         path.relative_to(self.projects_root)
                     except ValueError:
-                        if path != (active_root or self.initial_root).resolve():
+                        base_root = (active_root or self.initial_root)
+                        if not base_root or path != base_root.resolve():
                             raise ValueError("project is outside the server projects root")
                 return path
         raise ValueError(f"server project not found: {project_id}")
@@ -6988,17 +7005,22 @@ def choose_project_directory(path_value: str | None) -> Path:
 
 
 class ProjectState:
-    def __init__(self, initial_root: Path) -> None:
+    def __init__(self, initial_root: Path | None) -> None:
         self._lock = threading.RLock()
-        self._root = initial_root.resolve()
+        self._root = initial_root.resolve() if initial_root else None
 
     def root(self) -> Path:
         with self._lock:
+            if self._root is None:
+                raise ValueError("No project selected.")
             return self._root
 
     def context(self, require_initialized: bool = True, root: Path | None = None) -> tuple[Path, ContextStore]:
         with self._lock:
-            selected_root = (root or self._root).resolve()
+            selected_root = root or self._root
+            if selected_root is None:
+                raise ValueError("No project selected.")
+            selected_root = selected_root.resolve()
         root = selected_root
         store = ContextStore(root)
         if require_initialized:
@@ -7008,7 +7030,11 @@ class ProjectState:
         return root, store
 
     def payload(self, root: Path | None = None) -> dict[str, Any]:
-        return project_payload((root or self.root()).resolve())
+        with self._lock:
+            selected_root = root or self._root
+        if selected_root is None:
+            return no_project_payload()
+        return project_payload(selected_root.resolve())
 
     def open(self, path_value: str, init: bool = False, init_git: bool = False) -> dict[str, Any]:
         if not path_value.strip():
@@ -7244,6 +7270,11 @@ class JobStore:
             job = self._jobs.get(job_id)
             if job and root and Path(str(job.get("projectPath") or "")).expanduser().resolve() != root.resolve():
                 job = None
+            if not job and root is None:
+                try:
+                    root = self._project_state.root()
+                except ValueError:
+                    return {"error": "job_not_found", "message": f"job not found: {job_id}"}
             job = job or self.load_locked(job_id, root=root)
             if not job:
                 return {"error": "job_not_found", "message": f"job not found: {job_id}"}
@@ -7348,10 +7379,14 @@ def make_handler(
     auth_root: Path | None = None,
     auth_required: bool = True,
 ):
-    registry = project_registry or ServerProjectRegistry(project_state.root())
+    try:
+        active_root = project_state.root()
+    except ValueError:
+        active_root = None
+    registry = project_registry or ServerProjectRegistry(active_root)
     jobs = JobStore(project_state, prefer_worker=prefer_worker)
     worker_token = worker_token or os.environ.get("CTXGIT_WORKER_TOKEN", "")
-    auth_store = AuthStore(auth_root or project_state.root())
+    auth_store = AuthStore(auth_root or active_root or TOOL_REPO_ROOT)
 
     class CtxgitHandler(http.server.BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: Any) -> None:
@@ -7569,6 +7604,9 @@ def make_handler(
             if self.handle_auth_get(parsed):
                 return True
             if parsed.path == "/api/project":
+                if not self.headers.get("X-Ctxgit-Project", "").strip():
+                    self.send_json(project_state.payload())
+                    return True
                 try:
                     self.send_json(self.request_project_payload())
                 except ValueError as exc:
@@ -7576,9 +7614,10 @@ def make_handler(
                 return True
             if parsed.path == "/api/server/projects":
                 try:
-                    self.send_json(registry.payload(self.request_project_root()))
-                except ValueError as exc:
-                    self.send_json({"error": "project_invalid", "message": str(exc)}, status=400)
+                    active_root = self.request_project_root()
+                except ValueError:
+                    active_root = None
+                self.send_json(registry.payload(active_root))
                 return True
             if parsed.path == "/api/worker/status":
                 self.send_json(jobs.worker_status())
@@ -7592,7 +7631,14 @@ def make_handler(
                 if job.get("error"):
                     self.send_json(job, status=404)
                     return True
-                root_path = Path(str(job.get("projectPath") or project_state.root())).expanduser().resolve()
+                project_path = str(job.get("projectPath") or "")
+                if not project_path:
+                    try:
+                        project_path = str(project_state.root())
+                    except ValueError:
+                        self.send_json({"error": "project_invalid", "message": "No project selected."}, status=400)
+                        return True
+                root_path = Path(project_path).expanduser().resolve()
                 try:
                     self.send_bytes(make_project_snapshot_zip(root_path), content_type="application/zip")
                 except Exception as exc:
@@ -7794,7 +7840,7 @@ def make_handler(
                     try:
                         active_root = self.request_project_root()
                     except ValueError:
-                        active_root = project_state.root()
+                        active_root = None
                     root = registry.resolve(project_id, active_root)
                     self.send_json(project_state.open(str(root), init=init, init_git=body.get("gitInit") is True))
                 except SystemExit as exc:
@@ -7841,7 +7887,14 @@ def make_handler(
                             if job.get("error"):
                                 self.send_json(job, status=404)
                                 return
-                            root_path = Path(str(job.get("projectPath") or project_state.root())).expanduser().resolve()
+                            project_path = str(job.get("projectPath") or "")
+                            if not project_path:
+                                try:
+                                    project_path = str(project_state.root())
+                                except ValueError:
+                                    self.send_json({"error": "project_invalid", "message": "No project selected."}, status=400)
+                                    return
+                            root_path = Path(project_path).expanduser().resolve()
                             changed = apply_project_snapshot_zip(root_path, base64.b64decode(encoded_zip.encode("ascii")))
                             request_payload = job.get("request") if isinstance(job.get("request"), dict) else {}
                             branch_id = str(request_payload.get("branch") or request_payload.get("name") or "")
@@ -8856,7 +8909,7 @@ def run_worker(
 
 
 def run_server(
-    root: Path,
+    root: Path | None,
     host: str,
     port: int,
     *,
@@ -8872,13 +8925,16 @@ def run_server(
         project_registry=project_registry,
         worker_token=worker_token,
         prefer_worker=prefer_worker,
-        auth_root=projects_root or root,
+        auth_root=projects_root or root or TOOL_REPO_ROOT,
         auth_required=auth_required,
     )
     with ReusableThreadingHTTPServer((host, port), handler) as server:
         url = f"http://{host}:{server.server_port}"
         print(f"ctxgit chat interface: {url}", flush=True)
-        print(f"active project: {project_state.root()}", flush=True)
+        if root:
+            print(f"active project: {project_state.root()}", flush=True)
+        else:
+            print("active project: (none; open or initialize a project in the browser)", flush=True)
         if projects_root:
             print(f"server projects root: {projects_root}", flush=True)
         if prefer_worker:
@@ -9017,7 +9073,24 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
-    root = resolve_serve_root(args.root) if args.command == "serve" else resolve_workspace_root(args.root)
+    if args.command == "serve":
+        root = resolve_serve_root(args.root) if args.root else None
+        if root and is_ctxgit_project(root):
+            store = ContextStore(root)
+            load_project_env(root)
+            ensure_internal_git_baseline(store)
+        run_server(
+            root,
+            args.host,
+            args.port,
+            projects_root=Path(args.projects_root).expanduser().resolve() if args.projects_root else None,
+            worker_token=args.worker_token,
+            prefer_worker=args.codex_worker,
+            auth_required=args.auth_required,
+        )
+        return 0
+
+    root = resolve_workspace_root(args.root)
     store = ContextStore(root)
     load_project_env(root)
     if args.command != "init" and is_ctxgit_project(root):
@@ -9189,18 +9262,6 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "snapshot":
         run_snapshot(root, args.message, include_tools=args.include_tools)
-        return 0
-
-    if args.command == "serve":
-        run_server(
-            root,
-            args.host,
-            args.port,
-            projects_root=Path(args.projects_root).expanduser().resolve() if args.projects_root else None,
-            worker_token=args.worker_token,
-            prefer_worker=args.codex_worker,
-            auth_required=args.auth_required,
-        )
         return 0
 
     if args.command == "provider" and args.provider_command == "status":
