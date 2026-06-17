@@ -58,6 +58,49 @@ ctxgit provider status
 The installer adds this repo's `bin\` folder to the user `PATH`. Windows uses
 `bin\ctxgit.cmd`, which calls Python through `py -3` or `python`.
 
+## Local Server Scripts
+
+The repository includes double-click launchers at the repository root. Set
+`CTXGIT_ROOT` in this repository's local `.env` file for a fixed project root,
+or pass a project root to the scripts under `scripts/`. The default server URL
+is `http://127.0.0.1:8766/`.
+
+Root launchers:
+
+- `start-ctxgit-windows.cmd`
+- `stop-ctxgit-windows.cmd`
+- `start-ctxgit-macos.command`
+- `stop-ctxgit-macos.command`
+
+On macOS, if Finder refuses to run the `.command` files, set the executable bit
+once:
+
+```bash
+chmod +x start-ctxgit-macos.command stop-ctxgit-macos.command
+```
+
+Windows PowerShell:
+
+```powershell
+.\scripts\windows\start-ctxgit.ps1 "C:\path\to\your\project"
+.\scripts\windows\stop-ctxgit.ps1
+```
+
+macOS:
+
+```bash
+bash scripts/macos/start-ctxgit.sh "/path/to/your/project"
+bash scripts/macos/stop-ctxgit.sh
+```
+
+Optional `.env` defaults:
+
+```dotenv
+CTXGIT_ROOT=/absolute/path/to/your/ctxgit/project
+CTXGIT_HOST=127.0.0.1
+CTXGIT_PORT=8766
+```
+
 ## Research
 
 Hybrid research is the default:
