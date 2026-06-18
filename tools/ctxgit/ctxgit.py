@@ -1315,6 +1315,7 @@ class ContextStore:
             "forkedFromTurnId",
             "forkedFromCommit",
             "forkedSnapshot",
+            "forkedContextOnly",
             "clonedFrom",
         ):
             meta.pop(key, None)
@@ -1462,6 +1463,7 @@ class ContextStore:
         expected_created_at: str = "",
         expected_role: str = "",
         title: str | None = None,
+        include_history: bool = True,
     ) -> None:
         self.require_initialized()
         source_paths = self.branch_paths(source_id)
@@ -1496,12 +1498,34 @@ class ContextStore:
         meta["forkedFromTurnId"] = snapshot_turn_id
         meta["forkedFromCommit"] = snapshot_commit
         meta["forkedSnapshot"] = "internal-git" if restored_from_snapshot else "current-files"
+        if not include_history:
+            meta["forkedContextOnly"] = True
         meta["createdAt"] = now
         meta["updatedAt"] = now
         dump_json(target_paths.meta, meta)
-        text = "".join(json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n" for item in records[: index + 1])
+        copied_records = records[: index + 1] if include_history else []
+        text = "".join(json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n" for item in copied_records)
         write_text(target_paths.history, text)
         self.write_index()
+
+    def fork_context_at_history(
+        self,
+        source_id: str,
+        target_id: str,
+        index: int,
+        expected_created_at: str = "",
+        expected_role: str = "",
+        title: str | None = None,
+    ) -> None:
+        self.fork_branch_at_history(
+            source_id,
+            target_id,
+            index,
+            expected_created_at=expected_created_at,
+            expected_role=expected_role,
+            title=title,
+            include_history=False,
+        )
 
     def rename_branch(self, branch_id: str, title: str) -> None:
         self.require_initialized()
@@ -8416,6 +8440,41 @@ def make_handler(
                     self.send_json({"error": "fork_failed", "message": str(exc)}, status=409)
                 except SystemExit as exc:
                     self.send_json({"error": "fork_failed"}, status=int(exc.code or 400))
+                return
+            if parsed.path == "/api/history/fork-context":
+                branch_id = str(body.get("branch") or "")
+                target_id = str(body.get("target") or "")
+                title = str(body.get("title") or "") or None
+                try:
+                    index = int(body.get("index"))
+                except (TypeError, ValueError):
+                    self.send_json({"error": "invalid_history_index", "message": "history index is required"}, status=400)
+                    return
+                expected_created_at = str(body.get("createdAt") or "")
+                expected_role = str(body.get("role") or "")
+                try:
+                    store.fork_context_at_history(
+                        branch_id,
+                        target_id,
+                        index,
+                        expected_created_at=expected_created_at,
+                        expected_role=expected_role,
+                        title=title,
+                    )
+                    payload = branch_payload(store, target_id)
+                    payload["turnCommit"] = internal_git_commit_turn(
+                        store,
+                        kind="history-fork-context",
+                        actor="user",
+                        summary=f"Fork context from {branch_id} to {target_id} at message {index + 1}",
+                        branch_id=target_id,
+                        metadata={"source": branch_id, "target": target_id, "index": index, "title": title},
+                    )
+                    self.send_json(payload)
+                except ValueError as exc:
+                    self.send_json({"error": "fork_context_failed", "message": str(exc)}, status=409)
+                except SystemExit as exc:
+                    self.send_json({"error": "fork_context_failed"}, status=int(exc.code or 400))
                 return
             if parsed.path == "/api/research/start":
                 branch_id = str(body.get("branch") or "")

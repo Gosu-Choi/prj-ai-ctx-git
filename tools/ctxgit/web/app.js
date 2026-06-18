@@ -2370,6 +2370,12 @@ function renderBranch(payload) {
                               type="button"
                             >Fork here</button>
                             <button
+                              data-history-fork-context="${index}"
+                              data-history-created-at="${escapeHtml(message.createdAt || "")}"
+                              data-history-role="${escapeHtml(message.role || "")}"
+                              type="button"
+                            >Fork context</button>
+                            <button
                               class="danger"
                               data-history-cut="${index}"
                               data-history-created-at="${escapeHtml(message.createdAt || "")}"
@@ -2414,6 +2420,13 @@ function renderBranch(payload) {
       event.stopPropagation();
       closeMessageMenus();
       forkHistoryMessage(button);
+    });
+  });
+  els.messageList.querySelectorAll("[data-history-fork-context]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      closeMessageMenus();
+      forkHistoryMessage(button, { contextOnly: true });
     });
   });
   els.messageList.querySelectorAll("[data-history-cut]").forEach((button) => {
@@ -2842,19 +2855,27 @@ async function cutHistoryMessage(button) {
   }
 }
 
-async function forkHistoryMessage(button) {
+async function forkHistoryMessage(button, { contextOnly = false } = {}) {
   if (!state.activeBranch) return;
-  const index = Number.parseInt(button.dataset.historyFork || "", 10);
+  const index = Number.parseInt(
+    contextOnly ? button.dataset.historyForkContext || "" : button.dataset.historyFork || "",
+    10,
+  );
   if (!Number.isInteger(index)) return;
   const branch = state.activeBranch;
-  const title = window.prompt(`Fork ${branch} through this message with title:`, `${branchTitle(branch)} fork ${index + 1}`);
+  const title = window.prompt(
+    contextOnly
+      ? `Fork only the context from ${branch} at this message with title:`
+      : `Fork ${branch} through this message with title:`,
+    contextOnly ? `${branchTitle(branch)} context ${index + 1}` : `${branchTitle(branch)} fork ${index + 1}`,
+  );
   if (!title) return;
   const targetTitle = title.trim();
   if (!targetTitle) return;
   const targetId = uniqueBranchIdForTitle(targetTitle);
   button.disabled = true;
   try {
-    const payload = await api("/api/history/fork", {
+    const payload = await api(contextOnly ? "/api/history/fork-context" : "/api/history/fork", {
       method: "POST",
       body: JSON.stringify({
         branch,
@@ -2874,7 +2895,7 @@ async function forkHistoryMessage(button) {
     renderGit(await api("/api/git/status"));
     renderProvider(await api("/api/provider/status"));
   } catch (error) {
-    window.alert(`Fork failed: ${error.message}`);
+    window.alert(`${contextOnly ? "Fork context" : "Fork"} failed: ${error.message}`);
   } finally {
     button.disabled = false;
   }

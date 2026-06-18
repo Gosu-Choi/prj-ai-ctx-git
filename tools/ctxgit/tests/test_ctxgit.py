@@ -995,6 +995,58 @@ class CtxgitTest(unittest.TestCase):
             self.assertEqual(meta["forkedFromCommit"], first_commit["commit"])
             self.assertEqual(meta["forkedSnapshot"], "internal-git")
 
+    def test_fork_context_restores_branch_files_with_empty_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("source", title="Source")
+            first_turn = "turn_20260101T000000000000Z"
+            second_turn = "turn_20260101T000001000000Z"
+            first = store.append_history("source", "user", "First", extra={"turnId": first_turn})
+            ctxgit.write_text(root / "contexts" / "branches" / "source" / "context.md", "# Source\n\nAt first.\n")
+            store.add_note("source", "Old Note", "Old body")
+            first_commit = ctxgit.internal_git_commit_turn(
+                store,
+                kind="chat",
+                actor="user+agent",
+                summary="first turn",
+                branch_id="source",
+                turn_id=first_turn,
+            )
+
+            store.append_history("source", "assistant", "Second", extra={"turnId": second_turn})
+            ctxgit.write_text(root / "contexts" / "branches" / "source" / "context.md", "# Source\n\nLater context.\n")
+            store.add_note("source", "New Note", "New body")
+            ctxgit.internal_git_commit_turn(
+                store,
+                kind="chat",
+                actor="user+agent",
+                summary="second turn",
+                branch_id="source",
+                turn_id=second_turn,
+            )
+
+            store.fork_context_at_history(
+                "source",
+                "context-only",
+                0,
+                expected_created_at=first["createdAt"],
+                expected_role=first["role"],
+            )
+
+            fork_root = root / "contexts" / "branches" / "context-only"
+            self.assertEqual((fork_root / "context.md").read_text(encoding="utf-8"), "# Source\n\nAt first.\n")
+            note_text = "\n".join(path.read_text(encoding="utf-8") for path in (fork_root / "notes").glob("*.md"))
+            self.assertIn("Old body", note_text)
+            self.assertNotIn("New body", note_text)
+            self.assertEqual(list(store.iter_history("context-only")), [])
+            self.assertEqual((fork_root / "history.jsonl").read_text(encoding="utf-8"), "")
+            meta = ctxgit.load_json(fork_root / "branch.json")
+            self.assertEqual(meta["forkedFrom"], "source")
+            self.assertEqual(meta["forkedAtIndex"], 0)
+            self.assertEqual(meta["forkedFromCommit"], first_commit["commit"])
+            self.assertTrue(meta["forkedContextOnly"])
+
     def test_cut_branch_restores_history_and_context_to_turn_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
