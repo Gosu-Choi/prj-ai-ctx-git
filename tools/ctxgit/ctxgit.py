@@ -6328,11 +6328,23 @@ def internal_git_status_payload(root: Path) -> dict[str, Any]:
 
 
 def git_status_payload(root: Path) -> dict[str, Any]:
+    if not is_git_project(root):
+        return {
+            "initialized": False,
+            "branch": "",
+            "short": "",
+            "stagedCount": 0,
+            "unstagedCount": 0,
+            "untrackedCount": 0,
+            "log": "",
+            "internal": internal_git_status_payload(root),
+        }
     short = run_git(root, ["status", "--short"])
     staged_count = len([line for line in run_git(root, ["diff", "--cached", "--name-only"]).splitlines() if line])
     unstaged_count = len([line for line in run_git(root, ["diff", "--name-only"]).splitlines() if line])
     untracked_count = len([line for line in short.splitlines() if line.startswith("??")])
     return {
+        "initialized": True,
         "branch": run_git(root, ["branch", "--show-current"]),
         "short": short,
         "stagedCount": staged_count,
@@ -8011,7 +8023,7 @@ def make_handler(
                 return
             if parsed.path == "/api/project/init":
                 path_value = str(body.get("path") or "")
-                init_git = body.get("gitInit") is not False
+                init_git = body.get("gitInit") is True
                 try:
                     self.send_json(project_state.open(path_value, init=True, init_git=init_git))
                 except ValueError as exc:
@@ -9059,7 +9071,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     init = sub.add_parser("init", help="Initialize contexts/ and .ctxgit/")
-    init.add_argument("--no-git", action="store_true", help="Do not run git init when .git is missing")
+    init.add_argument("--git", action="store_true", help="Also run git init when .git is missing")
+    init.add_argument("--no-git", action="store_true", help="Deprecated no-op; ctxgit init no longer creates .git by default")
     init.add_argument("--import-workspace", help="Import an existing OpenClaw-style workspace directory after init")
     init.add_argument("--force-import", action="store_true", help="Overwrite existing workspace import metadata")
 
@@ -9199,7 +9212,7 @@ def main(argv: list[str] | None = None) -> int:
         ensure_internal_git_baseline(store)
 
     if args.command == "init":
-        if not args.no_git and not is_git_project(root):
+        if args.git and not args.no_git and not is_git_project(root):
             subprocess.run(["git", "init"], cwd=root, check=True, text=True, capture_output=True)
         store.init()
         internal_git_commit_turn(

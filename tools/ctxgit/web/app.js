@@ -1739,6 +1739,21 @@ function uniqueBranchIdForTitle(title) {
 
 function renderGit(status) {
   const internal = status.internal || {};
+  if (status.initialized === false) {
+    els.gitSummary.innerHTML = `
+      <div>Outer Git: <strong>not initialized</strong></div>
+      <div class="muted">ctxgit Git: ${escapeHtml(String(internal.dirtyCount || 0))} pending | ${escapeHtml(internal.gitDir || "")}</div>
+    `;
+    if (els.internalGitLog) {
+      const refs = (internal.refs || [])
+        .slice(0, 20)
+        .map((item) => `${item.short || ""} ${item.ref || ""} ${item.subject || ""}`.trim())
+        .join("\n");
+      els.internalGitLog.textContent =
+        [internal.log || "No internal ctxgit commits yet.", refs ? `\nRefs:\n${refs}` : ""].filter(Boolean).join("\n");
+    }
+    return;
+  }
   els.gitSummary.innerHTML = `
     <div>Branch: <strong>${escapeHtml(status.branch || "(none)")}</strong></div>
     <div>Staged: ${status.stagedCount} · Unstaged: ${status.unstagedCount} · Untracked: ${status.untrackedCount}</div>
@@ -2636,7 +2651,7 @@ async function openProject(path, { init }) {
   try {
     const project = await api(init ? "/api/project/init" : "/api/project/open", {
       method: "POST",
-      body: JSON.stringify({ path, gitInit: true }),
+      body: JSON.stringify({ path }),
     });
     renderProject(project);
     state.activeBranch = null;

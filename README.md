@@ -34,9 +34,9 @@ ctxgit merge-view AItrust AIdiscipline --name trust-discipline
 ctxgit merge AItrust AIdiscipline --name integrated-research
 ```
 
-`ctxgit init` creates `.ctxgit/` and `contexts/`; it also runs `git init` when
-the project is not already a Git repository. Use `ctxgit init --no-git` if you
-only want the ctxgit files.
+`ctxgit init` creates `.ctxgit/`, `.ctxgit/git/`, and `contexts/`. It does not
+create a root `.git/` repository by default. Use `ctxgit init --git` only when
+you also want the project folder itself to become a normal Git repository.
 
 ## Windows Install
 
