@@ -25,6 +25,8 @@ const state = {
   branchDropDepth: 0,
   branchResourceStaged: {},
   eventsVisible: false,
+  mergeSelectedBranches: [],
+  mergePickerOpen: false,
 };
 
 const CONTEXT_CHAT_KEY = "__contexts__";
@@ -85,7 +87,14 @@ const els = {
   providerSummary: document.querySelector("#providerSummary"),
   workerSummary: document.querySelector("#workerSummary"),
   mergeForm: document.querySelector("#mergeForm"),
-  mergeSourcesInput: document.querySelector("#mergeSourcesInput"),
+  mergeSourcePicker: document.querySelector("#mergeSourcePicker"),
+  mergeSourceToggle: document.querySelector("#mergeSourceToggle"),
+  mergeSourceToggleLabel: document.querySelector("#mergeSourceToggleLabel"),
+  mergeSourceCount: document.querySelector("#mergeSourceCount"),
+  mergeSourceDropdown: document.querySelector("#mergeSourceDropdown"),
+  mergeSourceFilter: document.querySelector("#mergeSourceFilter"),
+  mergeSelectedOrder: document.querySelector("#mergeSelectedOrder"),
+  mergeSourceOptions: document.querySelector("#mergeSourceOptions"),
   mergeNameInput: document.querySelector("#mergeNameInput"),
   mergeButton: document.querySelector("#mergeButton"),
   mergeStatus: document.querySelector("#mergeStatus"),
@@ -704,6 +713,8 @@ function clearWorkspace(message = "Select or initialize a ctxgit project.") {
   state.messageDrafts = {};
   state.branchResourceStaged = {};
   state.branchDropDepth = 0;
+  state.mergeSelectedBranches = [];
+  setMergePickerOpen(false);
   renderBranches();
   hideChatError();
   els.activeTitle.textContent = "No project selected";
@@ -1350,6 +1361,7 @@ function renderBranches() {
   if (els.contextChatButton) {
     els.contextChatButton.classList.toggle("active", state.activeContextChat === true);
   }
+  renderMergeSourcePicker();
   els.branchList.innerHTML = orderedBranches()
     .map((branch) => {
       const job = branchJob(branch.id);
@@ -1708,6 +1720,93 @@ function orderedBranches() {
       return left.index - right.index;
     })
     .map((item) => item.branch);
+}
+
+function setMergePickerOpen(open) {
+  state.mergePickerOpen = Boolean(open);
+  els.mergeSourceDropdown.hidden = !state.mergePickerOpen;
+  els.mergeSourceToggle.setAttribute("aria-expanded", String(state.mergePickerOpen));
+  if (state.mergePickerOpen) {
+    renderMergeSourcePicker();
+    window.requestAnimationFrame(() => {
+      const rect = els.mergeSourceToggle.getBoundingClientRect();
+      const below = Math.max(180, window.innerHeight - rect.bottom - 12);
+      const above = Math.max(180, rect.top - 12);
+      const openUpward = below < 300 && above > below;
+      const available = openUpward ? above : below;
+      els.mergeSourcePicker.classList.toggle("open-upward", openUpward);
+      els.mergeSourceDropdown.style.setProperty("--merge-dropdown-space", `${available}px`);
+      els.mergeSourceFilter.focus();
+    });
+  } else {
+    els.mergeSourcePicker.classList.remove("open-upward");
+  }
+}
+
+function toggleMergeBranch(branchId) {
+  const index = state.mergeSelectedBranches.indexOf(branchId);
+  if (index >= 0) {
+    state.mergeSelectedBranches.splice(index, 1);
+  } else {
+    state.mergeSelectedBranches.push(branchId);
+  }
+  renderMergeSourcePicker();
+}
+
+function renderMergeSourcePicker() {
+  const available = new Set(state.branches.map((branch) => branch.id));
+  state.mergeSelectedBranches = state.mergeSelectedBranches.filter((branchId) => available.has(branchId));
+  const selectedCount = state.mergeSelectedBranches.length;
+  els.mergeSourceCount.textContent = String(selectedCount);
+  els.mergeSourceToggleLabel.textContent =
+    selectedCount > 0 ? `${selectedCount} branch${selectedCount === 1 ? "" : "es"} selected` : "Select branches";
+
+  els.mergeSelectedOrder.innerHTML = state.mergeSelectedBranches
+    .map(
+      (branchId, index) => `
+        <div class="merge-selected-item">
+          <span class="merge-selected-number">${index + 1}</span>
+          <span title="${escapeHtml(`${branchTitle(branchId)} (${branchId})`)}">${escapeHtml(branchTitle(branchId))}</span>
+          <button class="merge-selected-remove" data-merge-remove="${escapeHtml(branchId)}" type="button" aria-label="Remove ${escapeHtml(branchTitle(branchId))}">×</button>
+        </div>
+      `,
+    )
+    .join("");
+
+  const filter = els.mergeSourceFilter.value.trim().toLowerCase();
+  const candidates = orderedBranches().filter((branch) => {
+    if (!filter) return true;
+    return branch.id.toLowerCase().includes(filter) || String(branch.title || "").toLowerCase().includes(filter);
+  });
+  els.mergeSourceOptions.innerHTML =
+    candidates
+      .map((branch) => {
+        const selectedIndex = state.mergeSelectedBranches.indexOf(branch.id);
+        const selected = selectedIndex >= 0;
+        return `
+          <button class="merge-source-option ${selected ? "selected" : ""}" data-merge-source="${escapeHtml(branch.id)}" type="button">
+            <span class="merge-option-order ${selected ? "" : "empty"}">${selected ? selectedIndex + 1 : "+"}</span>
+            <span class="merge-option-label">
+              <span class="merge-option-title">${escapeHtml(branch.title || branch.id)}</span>
+              <span class="merge-option-id">${escapeHtml(branch.id)}</span>
+            </span>
+          </button>
+        `;
+      })
+      .join("") || '<div class="muted">No matching branches.</div>';
+
+  els.mergeSelectedOrder.querySelectorAll("[data-merge-remove]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      toggleMergeBranch(button.dataset.mergeRemove);
+    });
+  });
+  els.mergeSourceOptions.querySelectorAll("[data-merge-source]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      toggleMergeBranch(button.dataset.mergeSource);
+    });
+  });
 }
 
 function branchTitle(branchId) {
@@ -3185,6 +3284,16 @@ document.addEventListener("click", (event) => {
   if (!event.target.closest(".message-options")) {
     closeMessageMenus();
   }
+  if (!event.target.closest("#mergeSourcePicker")) {
+    setMergePickerOpen(false);
+  }
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && state.mergePickerOpen) {
+    setMergePickerOpen(false);
+    els.mergeSourceToggle.focus();
+  }
 });
 
 els.loginForm.addEventListener("submit", submitLogin);
@@ -3277,15 +3386,22 @@ els.folderUploadInput.addEventListener("change", async () => {
   await uploadFiles(els.folderUploadInput.files);
 });
 
+els.mergeSourceToggle.addEventListener("click", () => {
+  setMergePickerOpen(!state.mergePickerOpen);
+});
+
+els.mergeSourceDropdown.addEventListener("click", (event) => {
+  event.stopPropagation();
+});
+
+els.mergeSourceFilter.addEventListener("input", renderMergeSourcePicker);
+
 els.mergeForm.addEventListener("submit", async (event) => {
   event.preventDefault();
-  const branches = els.mergeSourcesInput.value
-    .split(/[,\s]+/)
-    .map((item) => item.trim())
-    .filter(Boolean);
+  const branches = [...state.mergeSelectedBranches];
   const name = els.mergeNameInput.value.trim();
   if (branches.length < 2 || !name) {
-    els.mergeStatus.textContent = "Use two sources and a new branch id.";
+    els.mergeStatus.textContent = "Select at least two branches in merge order and enter a new branch id.";
     els.mergeStatus.className = "settings-status error";
     return;
   }
@@ -3304,7 +3420,10 @@ els.mergeForm.addEventListener("submit", async (event) => {
       { branches, name },
       { branch: name, mode: "merge", title: "머지 요약 생성 중" },
     );
-    els.mergeSourcesInput.value = "";
+    state.mergeSelectedBranches = [];
+    els.mergeSourceFilter.value = "";
+    setMergePickerOpen(false);
+    renderMergeSourcePicker();
     els.mergeNameInput.value = "";
     els.mergeStatus.textContent = "Merge started.";
     els.mergeStatus.classList.add("ok");

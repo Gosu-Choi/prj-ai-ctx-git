@@ -76,7 +76,18 @@
         <section class="sidebar-section">
           <div class="section-title">Merge</div>
           <form id="mergeForm" class="merge-form">
-            <input id="mergeSourcesInput" type="text" placeholder="source branches" />
+            <div id="mergeSourcePicker" class="merge-source-picker">
+              <button id="mergeSourceToggle" class="merge-source-toggle" type="button" aria-expanded="false">
+                <span id="mergeSourceToggleLabel">Select branches</span>
+                <span id="mergeSourceCount" class="merge-source-count">0</span>
+              </button>
+              <div id="mergeSourceDropdown" class="merge-source-dropdown" hidden>
+                <input id="mergeSourceFilter" type="search" placeholder="Filter branch name" autocomplete="off" />
+                <div class="merge-order-hint">Click branches in the order they should be merged.</div>
+                <div id="mergeSelectedOrder" class="merge-selected-order"></div>
+                <div id="mergeSourceOptions" class="merge-source-options"></div>
+              </div>
+            </div>
             <input id="mergeNameInput" type="text" placeholder="new branch id" />
             <button id="mergeButton" type="submit">Merge</button>
             <div id="mergeStatus" class="settings-status"></div>
