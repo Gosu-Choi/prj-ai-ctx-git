@@ -260,6 +260,11 @@ opened project, the assistant must request approval first; approving it reruns
 that turn with only the approved external directory added through Codex
 `--add-dir`.
 
+On Windows, ctxgit first tries `codex` from PATH and then falls back to the
+Codex binary bundled with the VS Code/Cursor ChatGPT extension. If your setup is
+elsewhere, set `CTXGIT_CODEX_BIN` in this repository's `.env` file to the full
+path of `codex.exe`.
+
 ```bash
 codex login status
 codex login --device-auth

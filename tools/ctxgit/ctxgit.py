@@ -3982,6 +3982,24 @@ def codex_sandbox_mode(codex_config: dict[str, Any]) -> str:
     return sandbox if sandbox in ALLOWED_CODEX_SANDBOXES else DEFAULT_CODEX_SANDBOX
 
 
+def bundled_codex_binary() -> Path | None:
+    if os.name != "nt":
+        return None
+    extension_roots = [
+        Path.home() / ".vscode" / "extensions",
+        Path.home() / ".cursor" / "extensions",
+    ]
+    candidates: list[Path] = []
+    for extensions_root in extension_roots:
+        if not extensions_root.exists() or not extensions_root.is_dir():
+            continue
+        for extension in sorted(extensions_root.glob("openai.chatgpt-*"), key=lambda item: item.name, reverse=True):
+            codex_path = extension / "bin" / "windows-x86_64" / "codex.exe"
+            if codex_path.exists() and codex_path.is_file():
+                candidates.append(codex_path.resolve())
+    return candidates[0] if candidates else None
+
+
 def resolve_codex_command(root: Path) -> list[str]:
     override = os.environ.get("CTXGIT_CODEX_BIN")
     if override:
@@ -3989,7 +4007,20 @@ def resolve_codex_command(root: Path) -> list[str]:
     llm = read_llm_config(root)
     codex_config = llm.get("codex") if isinstance(llm.get("codex"), dict) else {}
     configured = str(codex_config.get("bin") or "").strip()
+    if configured and configured.lower() not in {"codex", "codex.exe"}:
+        return shlex.split(configured)
+    executable = configured or "codex"
+    resolved = shutil.which(executable)
+    if resolved:
+        return [resolved]
+    bundled = bundled_codex_binary()
+    if bundled:
+        return [str(bundled)]
     return shlex.split(configured) if configured else ["codex"]
+
+
+def display_codex_command(root: Path) -> str:
+    return " ".join(shlex.quote(part) for part in resolve_codex_command(root))
 
 
 def codex_login_status(root: Path) -> dict[str, Any]:
@@ -4021,6 +4052,7 @@ def codex_login_status(root: Path) -> dict[str, Any]:
             "status": "missing",
             "message": "Codex CLI not found. Install Codex or set CTXGIT_CODEX_BIN.",
             "loginCommand": "codex login --device-auth",
+            "resolvedCommand": display_codex_command(root),
             "webSearch": codex_config.get("webSearch") is not False,
             "sandbox": codex_sandbox_mode(codex_config),
             "timeoutSeconds": timeout_seconds,
@@ -4035,6 +4067,7 @@ def codex_login_status(root: Path) -> dict[str, Any]:
         "status": "logged_in" if completed.returncode == 0 else "not_logged_in",
         "message": message,
         "loginCommand": "codex login --device-auth",
+        "resolvedCommand": display_codex_command(root),
         "webSearch": codex_config.get("webSearch") is not False,
         "sandbox": codex_sandbox_mode(codex_config),
         "timeoutSeconds": coerce_positive_int(codex_config.get("timeoutSeconds"), 900),
