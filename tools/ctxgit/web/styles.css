@@ -468,6 +468,21 @@ textarea {
   color: #ffffff;
 }
 
+.event-panel-toggle {
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.event-panel-toggle[aria-pressed="true"] {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
 .tab-panel {
   display: none;
   min-height: 0;
@@ -547,7 +562,7 @@ textarea {
   align-items: start;
   grid-auto-rows: max-content;
   width: 100%;
-  max-width: 980px;
+  max-width: none;
   min-width: 0;
   min-height: 0;
   overflow-x: hidden;
@@ -859,10 +874,10 @@ textarea {
 
 .composer {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 90px 100px 120px;
+  grid-template-columns: minmax(0, 1fr) 90px 120px;
   gap: 8px;
   width: 100%;
-  max-width: 980px;
+  max-width: none;
   min-width: 0;
   padding: 12px;
   border: 1px solid var(--line);
@@ -914,7 +929,7 @@ textarea {
   display: grid;
   gap: 5px;
   width: 100%;
-  max-width: 980px;
+  max-width: none;
   min-width: 0;
   border: 1px solid var(--line);
   border-radius: 6px;
@@ -941,7 +956,7 @@ textarea {
 
 .event-panel {
   align-self: stretch;
-  display: grid;
+  display: none;
   grid-template-rows: auto auto auto minmax(0, 1fr);
   max-width: 100%;
   min-width: 0;
@@ -950,6 +965,10 @@ textarea {
   border-left: 1px solid var(--line);
   background: var(--panel);
   overflow: hidden;
+}
+
+#chatTab.active.event-visible .event-panel {
+  display: grid;
 }
 
 .event-panel[hidden] {

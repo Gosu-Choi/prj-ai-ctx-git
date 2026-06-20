@@ -135,10 +135,11 @@
             <button class="tab" data-tab="archives" type="button">Archives</button>
             <button class="tab" data-tab="graph" type="button">Graph</button>
             <button class="tab" data-tab="version" type="button">Version</button>
+            <button id="eventPanelToggle" class="event-panel-toggle" type="button" aria-pressed="false">Events</button>
           </div>
         </header>
 
-        <section id="chatTab" class="tab-panel active event-visible">
+        <section id="chatTab" class="tab-panel active">
           <div class="chat-main">
             <div id="branchDropOverlay" class="drop-overlay" hidden>Drop to stage branch resources</div>
             <div id="messageList" class="message-list"></div>
@@ -151,7 +152,6 @@
             <form id="composer" class="composer">
               <textarea id="messageInput" rows="3" placeholder="Ask the branch-aware AI"></textarea>
               <button id="sendButton" type="submit">Send</button>
-              <button id="researchButton" type="button">Research</button>
               <button id="contextResetButton" class="danger-button" type="button" hidden>Reset</button>
               <button id="historyChatButton" type="button">Info chat</button>
             </form>

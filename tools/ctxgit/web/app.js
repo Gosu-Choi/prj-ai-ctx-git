@@ -24,11 +24,13 @@ const state = {
   messageDrafts: {},
   branchDropDepth: 0,
   branchResourceStaged: {},
+  eventsVisible: false,
 };
 
 const CONTEXT_CHAT_KEY = "__contexts__";
 const UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024;
 const PROJECT_SESSION_KEY = "ctxgit.activeProjectPath";
+const EVENT_PANEL_STORAGE_KEY = "ctxgit.eventsVisible";
 const BRANCH_RESOURCE_EXTENSIONS = new Set([
   ".bmp",
   ".gif",
@@ -105,6 +107,7 @@ const els = {
   branchDropOverlay: document.querySelector("#branchDropOverlay"),
   branchResourceStage: document.querySelector("#branchResourceStage"),
   eventPanel: document.querySelector("#eventPanel"),
+  eventPanelToggle: document.querySelector("#eventPanelToggle"),
   eventStatus: document.querySelector("#eventStatus"),
   copyEventLogButton: document.querySelector("#copyEventLogButton"),
   eventCopyStatus: document.querySelector("#eventCopyStatus"),
@@ -135,7 +138,6 @@ const els = {
   composer: document.querySelector("#composer"),
   messageInput: document.querySelector("#messageInput"),
   sendButton: document.querySelector("#sendButton"),
-  researchButton: document.querySelector("#researchButton"),
   contextResetButton: document.querySelector("#contextResetButton"),
   historyChatButton: document.querySelector("#historyChatButton"),
   refreshButton: document.querySelector("#refreshButton"),
@@ -1952,7 +1954,6 @@ function renderEventPanel(job) {
   const previousScrollTop = els.eventList.scrollTop;
   const shouldFollowEvents = isNewJob || isEventListNearBottom();
   state.currentJob = job;
-  els.chatTab.classList.add("event-visible");
   els.copyEventLogButton.disabled = false;
   const diagnostics = job.diagnostics || {};
   els.eventStatus.textContent = diagnostics.state || job.status || "";
@@ -1979,6 +1980,30 @@ function renderEventPanel(job) {
       )
       .join("") || '<div class="muted">아직 이벤트가 없습니다.</div>';
   setEventListScrollTop(shouldFollowEvents ? els.eventList.scrollHeight : previousScrollTop);
+}
+
+function setEventPanelVisible(visible, { persist = true } = {}) {
+  state.eventsVisible = Boolean(visible);
+  els.chatTab.classList.toggle("event-visible", state.eventsVisible);
+  els.eventPanelToggle.setAttribute("aria-pressed", String(state.eventsVisible));
+  els.eventPanelToggle.textContent = state.eventsVisible ? "Hide events" : "Events";
+  if (persist) {
+    try {
+      localStorage.setItem(EVENT_PANEL_STORAGE_KEY, state.eventsVisible ? "1" : "0");
+    } catch {
+      // Storage may be unavailable in private or locked-down contexts.
+    }
+  }
+}
+
+function restoreEventPanelVisibility() {
+  let visible = false;
+  try {
+    visible = localStorage.getItem(EVENT_PANEL_STORAGE_KEY) === "1";
+  } catch {
+    visible = false;
+  }
+  setEventPanelVisible(visible, { persist: false });
 }
 
 function hideEventPanel() {
@@ -2128,16 +2153,13 @@ function updateComposerState() {
   const contextMode = state.activeContextChat === true;
   const disabled = !activeKey || archived || Boolean(running) || Boolean(startingMode);
   els.composer.classList.toggle("context-mode", contextMode);
-  els.researchButton.hidden = contextMode;
   els.contextResetButton.hidden = !contextMode;
   els.historyChatButton.hidden = contextMode;
   els.sendButton.disabled = disabled;
-  els.researchButton.disabled = disabled;
   els.contextResetButton.disabled = !contextMode || !activeKey || Boolean(running) || Boolean(startingMode);
   els.historyChatButton.disabled = disabled;
   const busyMode = running?.mode || startingMode;
   els.sendButton.textContent = archived ? "Archived" : busyMode === "chat" || busyMode === "context-chat" ? "생각 중" : "Send";
-  els.researchButton.textContent = archived ? "Archived" : busyMode === "research" ? "리서치 중" : "Research";
   els.contextResetButton.textContent = busyMode === "context-chat" ? "Busy" : "Reset";
   els.historyChatButton.textContent = archived
     ? "Archived"
@@ -3507,8 +3529,8 @@ els.historyChatButton.addEventListener("click", async () => {
   await sendComposerMessage({ mode: "info-chat" });
 });
 
-els.researchButton.addEventListener("click", async () => {
-  await sendComposerMessage({ mode: "research" });
+els.eventPanelToggle.addEventListener("click", () => {
+  setEventPanelVisible(!state.eventsVisible);
 });
 
 els.contextResetButton.addEventListener("click", resetContextChatHistory);
@@ -3516,6 +3538,8 @@ els.contextResetButton.addEventListener("click", resetContextChatHistory);
 els.refreshButton.addEventListener("click", async () => {
   await loadProject();
 });
+
+restoreEventPanelVisibility();
 
 loadAuthStatus()
   .then((auth) => {
