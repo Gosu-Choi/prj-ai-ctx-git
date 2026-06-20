@@ -2481,7 +2481,7 @@ function renderBranch(payload) {
     payload.history
       .map(
         (message, index) => `
-          <article class="message">
+          <article class="message" data-history-message="${index}">
             <div class="message-header">
               <span class="message-role">${escapeHtml(message.role)}</span>
                 <span class="message-meta-actions">
@@ -2511,6 +2511,12 @@ function renderBranch(payload) {
                               data-history-role="${escapeHtml(message.role || "")}"
                               type="button"
                             >Fork context</button>
+                            <button
+                              data-history-revise="${index}"
+                              data-history-created-at="${escapeHtml(message.createdAt || "")}"
+                              data-history-role="${escapeHtml(message.role || "")}"
+                              type="button"
+                            >Revise message</button>
                             <button
                               class="danger"
                               data-history-cut="${index}"
@@ -2563,6 +2569,13 @@ function renderBranch(payload) {
       event.stopPropagation();
       closeMessageMenus();
       forkHistoryMessage(button, { contextOnly: true });
+    });
+  });
+  els.messageList.querySelectorAll("[data-history-revise]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      closeMessageMenus();
+      beginReviseHistoryMessage(button);
     });
   });
   els.messageList.querySelectorAll("[data-history-cut]").forEach((button) => {
@@ -2924,6 +2937,84 @@ async function decideApproval(button) {
     window.alert(`Approval failed: ${error.message}`);
   } finally {
     button.disabled = false;
+  }
+}
+
+function beginReviseHistoryMessage(button) {
+  if (!state.activeBranch) return;
+  const index = Number.parseInt(button.dataset.historyRevise || "", 10);
+  if (!Number.isInteger(index)) return;
+  const message = state.payload?.history?.[index];
+  const article = els.messageList.querySelector(`[data-history-message="${index}"]`);
+  const body = article?.querySelector(".message-text");
+  if (!message || !body || article.classList.contains("revising")) return;
+  article.classList.add("revising");
+  body.innerHTML = `
+    <textarea class="message-revise-input" rows="6" aria-label="Revised message">${escapeHtml(message.text || "")}</textarea>
+    <div class="message-revise-actions">
+      <button data-history-revise-save="${index}" type="button">Save revision</button>
+      <button data-history-revise-cancel="${index}" type="button">Cancel</button>
+    </div>
+    <div class="message-revise-status settings-status"></div>
+  `;
+  const input = body.querySelector(".message-revise-input");
+  const saveButton = body.querySelector("[data-history-revise-save]");
+  const cancelButton = body.querySelector("[data-history-revise-cancel]");
+  const resizeEditor = () => {
+    input.style.height = "0";
+    input.style.height = `${input.scrollHeight}px`;
+  };
+  resizeEditor();
+  input.addEventListener("input", resizeEditor);
+  input.focus();
+  input.setSelectionRange(input.value.length, input.value.length);
+  cancelButton.addEventListener("click", () => {
+    article.classList.remove("revising");
+    body.innerHTML = renderMessageText(message.text);
+  });
+  saveButton.addEventListener("click", () => {
+    reviseHistoryMessage({
+      article,
+      body,
+      input,
+      saveButton,
+      cancelButton,
+      index,
+      createdAt: button.dataset.historyCreatedAt || "",
+      role: button.dataset.historyRole || "",
+    });
+  });
+}
+
+async function reviseHistoryMessage({ article, body, input, saveButton, cancelButton, index, createdAt, role }) {
+  const branch = state.activeBranch;
+  const text = input.value.trim();
+  const status = body.querySelector(".message-revise-status");
+  if (!branch || !text) {
+    status.textContent = "Message text is required.";
+    status.className = "message-revise-status settings-status error";
+    return;
+  }
+  saveButton.disabled = true;
+  cancelButton.disabled = true;
+  status.textContent = "Saving revision...";
+  status.className = "message-revise-status settings-status";
+  try {
+    const payload = await api("/api/history/revise", {
+      method: "POST",
+      body: JSON.stringify({ branch, index, text, createdAt, role }),
+    });
+    if (state.activeBranch === branch) {
+      renderBranch(payload);
+      renderGit(await api("/api/git/status"));
+      await refreshBranchNavigation();
+    }
+  } catch (error) {
+    status.textContent = `Revise failed: ${error.message}`;
+    status.className = "message-revise-status settings-status error";
+    saveButton.disabled = false;
+    cancelButton.disabled = false;
+    article.classList.add("revising");
   }
 }
 

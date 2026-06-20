@@ -2,6 +2,9 @@
 
 An experiment in parallel AI conversations backed by plain markdown and Git.
 
+Before changing history, internal Git refs, Fork, Cut, Merge, or message
+revision behavior, read [`MAJOR_DESIGN_CONSIDERATIONS.md`](MAJOR_DESIGN_CONSIDERATIONS.md).
+
 The core idea is simple:
 
 - use `ctxgit` as a global tool, but keep data inside each selected project

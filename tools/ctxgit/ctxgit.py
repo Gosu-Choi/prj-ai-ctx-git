@@ -491,6 +491,95 @@ def internal_git_ref_summary(root: Path) -> list[dict[str, str]]:
     return refs
 
 
+def internal_git_commit_data(root: Path, commit: str) -> dict[str, Any]:
+    completed = subprocess.run(
+        ["git", f"--git-dir={internal_git_dir(root)}", "cat-file", "commit", commit],
+        cwd=root,
+        check=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+    )
+    header, _, message = completed.stdout.partition("\n\n")
+    data: dict[str, Any] = {"parents": [], "message": message}
+    for line in header.splitlines():
+        key, _, value = line.partition(" ")
+        if key == "tree":
+            data["tree"] = value
+        elif key == "parent":
+            data["parents"].append(value)
+        elif key in {"author", "committer"}:
+            match = re.fullmatch(r"(.*) <([^>]*)> (\d+) ([+-]\d{4})", value)
+            if not match:
+                raise ValueError(f"could not parse internal git {key} metadata for {commit}")
+            data[key] = {
+                "name": match.group(1),
+                "email": match.group(2),
+                "date": f"{match.group(3)} {match.group(4)}",
+            }
+    if not data.get("tree") or not data.get("author") or not data.get("committer"):
+        raise ValueError(f"incomplete internal git commit metadata for {commit}")
+    return data
+
+
+def internal_git_commit_tree(
+    root: Path,
+    tree: str,
+    parents: list[str],
+    message: str,
+    author: dict[str, str],
+    committer: dict[str, str],
+) -> str:
+    args = ["git", f"--git-dir={internal_git_dir(root)}", "commit-tree", tree]
+    for parent in parents:
+        args.extend(["-p", parent])
+    env = os.environ.copy()
+    env.update(
+        {
+            "GIT_AUTHOR_NAME": author["name"],
+            "GIT_AUTHOR_EMAIL": author["email"],
+            "GIT_AUTHOR_DATE": author["date"],
+            "GIT_COMMITTER_NAME": committer["name"],
+            "GIT_COMMITTER_EMAIL": committer["email"],
+            "GIT_COMMITTER_DATE": committer["date"],
+        }
+    )
+    completed = subprocess.run(
+        args,
+        cwd=root,
+        check=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        input=message,
+        capture_output=True,
+        env=env,
+    )
+    return completed.stdout.strip()
+
+
+def internal_git_blob_text(root: Path, commit: str, path: str) -> str:
+    completed = run_internal_git(root, ["show", f"{commit}:{path}"])
+    if completed.returncode != 0:
+        return ""
+    return completed.stdout
+
+
+def internal_git_write_blob(root: Path, text: str) -> str:
+    completed = subprocess.run(
+        ["git", f"--git-dir={internal_git_dir(root)}", "hash-object", "-w", "--stdin"],
+        cwd=root,
+        check=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        input=text,
+        capture_output=True,
+    )
+    return completed.stdout.strip()
+
+
 def internal_git_parent_refs_for_branch(store: "ContextStore", branch_id: str, ref: str) -> list[str]:
     if internal_git_rev_parse(store.root, ref):
         return [ref]
@@ -1350,6 +1439,31 @@ class ContextStore:
                 return turn_id
         return ""
 
+    def internal_snapshot_commit_for_history_record(
+        self,
+        branch_id: str,
+        record: dict[str, Any],
+    ) -> str:
+        branch_ref = ctxgit_branch_ref(branch_id)
+        head = internal_git_rev_parse(self.root, branch_ref)
+        if not head:
+            return ""
+        history_rel = relpath(self.root, self.branch_paths(branch_id).history)
+        record_id = str(record.get("id") or "").strip()
+        chain = run_internal_git(self.root, ["rev-list", "--reverse", "--first-parent", head], check=True)
+        for commit in (value.strip() for value in chain.stdout.splitlines() if value.strip()):
+            commit_records = self.read_history_text(internal_git_blob_text(self.root, commit, history_rel))
+            for candidate in commit_records:
+                same_record = bool(record_id) and str(candidate.get("id") or "") == record_id
+                if not record_id:
+                    same_record = (
+                        str(candidate.get("createdAt") or "") == str(record.get("createdAt") or "")
+                        and str(candidate.get("role") or "") == str(record.get("role") or "")
+                    )
+                if same_record:
+                    return commit
+        return ""
+
     def restore_branch_snapshot_from_internal_commit(self, source_id: str, target_id: str, commit: str) -> bool:
         if not commit:
             return False
@@ -1452,7 +1566,7 @@ class ContextStore:
         if selected_turn_id and any(str(item.get("turnId") or "").strip() == selected_turn_id for item in records[index + 1 :]):
             raise ValueError("cut point is inside a multi-message turn; choose the final message of that turn")
         snapshot_turn_id = self.completed_turn_id_for_history_index(records, index)
-        snapshot_commit = internal_git_rev_parse(self.root, ctxgit_turn_ref(snapshot_turn_id)) if snapshot_turn_id else ""
+        snapshot_commit = self.internal_snapshot_commit_for_history_record(branch_id, record)
         if not snapshot_commit:
             raise ValueError("no internal ctxgit snapshot exists for this cut point")
         if not self.restore_existing_branch_from_internal_commit(branch_id, snapshot_commit):
@@ -1496,7 +1610,7 @@ class ContextStore:
             raise ValueError("history record changed before fork; refresh and try again")
         target_paths.root.parent.mkdir(parents=True, exist_ok=True)
         snapshot_turn_id = self.completed_turn_id_for_history_index(records, index)
-        snapshot_commit = internal_git_rev_parse(self.root, ctxgit_turn_ref(snapshot_turn_id)) if snapshot_turn_id else ""
+        snapshot_commit = self.internal_snapshot_commit_for_history_record(source_id, record)
         restored_from_snapshot = self.restore_branch_snapshot_from_internal_commit(source_id, target_id, snapshot_commit)
         if not restored_from_snapshot:
             shutil.copytree(source_paths.root, target_paths.root)
@@ -1510,7 +1624,6 @@ class ContextStore:
         meta["forkedAtIndex"] = index
         meta["forkedAtCreatedAt"] = str(record.get("createdAt") or "")
         meta["forkedFromTurnId"] = snapshot_turn_id
-        meta["forkedFromCommit"] = snapshot_commit
         meta["forkedSnapshot"] = "internal-git" if restored_from_snapshot else "current-files"
         if not include_history:
             meta["forkedContextOnly"] = True
@@ -2702,6 +2815,198 @@ class ContextStore:
         write_text(paths.history, text)
         self.touch_branch(branch_id)
         return removed
+
+    def revise_history_record(
+        self,
+        branch_id: str,
+        index: int,
+        text: str,
+        expected_created_at: str = "",
+        expected_role: str = "",
+    ) -> dict[str, Any]:
+        paths = self.branch_paths(branch_id)
+        if not paths.root.exists():
+            die(f"branch does not exist: {branch_id}")
+        revised_text = text.strip()
+        if not revised_text:
+            raise ValueError("revised message text is required")
+        records = self.read_history_file(paths.history)
+        if index < 0 or index >= len(records):
+            raise ValueError(f"history record index out of range: {index}")
+        record = records[index]
+        if expected_created_at and str(record.get("createdAt") or "") != expected_created_at:
+            raise ValueError("history record changed before revise; refresh and try again")
+        if expected_role and str(record.get("role") or "") != expected_role:
+            raise ValueError("history record changed before revise; refresh and try again")
+        turn_id = str(record.get("turnId") or "").strip()
+        branch_ref = ctxgit_branch_ref(branch_id)
+        old_head = internal_git_rev_parse(self.root, branch_ref)
+        if not old_head:
+            raise ValueError("no internal ctxgit branch history exists for this message")
+        chain_result = run_internal_git(self.root, ["rev-list", "--reverse", "--first-parent", old_head], check=True)
+        first_parent_chain = [value.strip() for value in chain_result.stdout.splitlines() if value.strip()]
+        message_id = str(record.get("id") or "").strip()
+        history_rel = relpath(self.root, paths.history)
+        meta_rel = relpath(self.root, paths.meta)
+        compactions_rel = relpath(self.root, paths.compactions)
+        target_commit = ""
+        for candidate_commit in first_parent_chain:
+            candidate_records = self.read_history_text(
+                internal_git_blob_text(self.root, candidate_commit, history_rel)
+            )
+            for candidate_record in candidate_records:
+                same_record = bool(message_id) and str(candidate_record.get("id") or "") == message_id
+                if not message_id:
+                    same_record = (
+                        str(candidate_record.get("createdAt") or "") == str(record.get("createdAt") or "")
+                        and str(candidate_record.get("role") or "") == str(record.get("role") or "")
+                    )
+                if same_record:
+                    target_commit = candidate_commit
+                    break
+            if target_commit:
+                break
+        if not target_commit:
+            raise ValueError("message is not present in the current internal git branch history")
+        rewrite_commits = first_parent_chain[first_parent_chain.index(target_commit) :]
+        rewritten: dict[str, str] = {}
+
+        with internal_git_lock(self.root), tempfile.TemporaryDirectory(prefix="ctxgit-revise-index-") as tmp:
+            index_path = Path(tmp) / "index"
+            git_env = os.environ.copy()
+            git_env["GIT_INDEX_FILE"] = str(index_path)
+
+            def index_git(args: list[str], *, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    ["git", f"--git-dir={internal_git_dir(self.root)}", f"--work-tree={self.root}", *args],
+                    cwd=self.root,
+                    check=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    input=input_text,
+                    capture_output=True,
+                    env=git_env,
+                )
+
+            for old_commit in rewrite_commits:
+                commit_data = internal_git_commit_data(self.root, old_commit)
+                index_git(["read-tree", old_commit])
+                commit_history = self.read_history_text(internal_git_blob_text(self.root, old_commit, history_rel))
+                matched = False
+                for commit_record in commit_history:
+                    same_record = bool(message_id) and str(commit_record.get("id") or "") == message_id
+                    if not message_id:
+                        same_record = (
+                            str(commit_record.get("createdAt") or "") == str(record.get("createdAt") or "")
+                            and str(commit_record.get("role") or "") == str(record.get("role") or "")
+                        )
+                    if same_record:
+                        commit_record["text"] = revised_text
+                        matched = True
+                        break
+                if not matched:
+                    raise ValueError(f"message is missing from internal snapshot {old_commit[:12]}")
+                history_blob = internal_git_write_blob(self.root, self.serialize_history_records(commit_history))
+                index_git(["update-index", "--add", "--cacheinfo", "100644", history_blob, history_rel])
+
+                meta_text = internal_git_blob_text(self.root, old_commit, meta_rel)
+                if meta_text:
+                    try:
+                        commit_meta = json.loads(meta_text)
+                    except json.JSONDecodeError:
+                        commit_meta = {}
+                    if isinstance(commit_meta, dict):
+                        commit_meta.pop("lastCompactedHistoryCount", None)
+                        commit_meta.pop("lastCompactionPath", None)
+                        meta_blob = internal_git_write_blob(
+                            self.root,
+                            json.dumps(commit_meta, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                        )
+                        index_git(["update-index", "--add", "--cacheinfo", "100644", meta_blob, meta_rel])
+
+                compaction_files = run_internal_git(
+                    self.root,
+                    ["ls-tree", "-r", "--name-only", old_commit, "--", compactions_rel],
+                    check=True,
+                ).stdout.splitlines()
+                for compaction_file in compaction_files:
+                    if compaction_file.strip():
+                        index_git(["update-index", "--force-remove", "--", compaction_file.strip()])
+
+                new_tree = index_git(["write-tree"]).stdout.strip()
+                new_parents = [rewritten.get(parent, parent) for parent in commit_data["parents"]]
+                rewritten[old_commit] = internal_git_commit_tree(
+                    self.root,
+                    new_tree,
+                    new_parents,
+                    commit_data["message"],
+                    commit_data["author"],
+                    commit_data["committer"],
+                )
+
+            new_head = rewritten[old_head]
+            ref_updates = [(branch_ref, new_head, old_head)]
+            turn_refs = run_internal_git(
+                self.root,
+                ["for-each-ref", "--format=%(refname)%00%(objectname)", "refs/ctxgit/turns"],
+                check=True,
+            ).stdout.splitlines()
+            for line in turn_refs:
+                ref_name, separator, old_commit = line.partition("\0")
+                if separator and old_commit in rewritten:
+                    ref_updates.append((ref_name, rewritten[old_commit], old_commit))
+            if internal_git_rev_parse(self.root, "HEAD") == old_head:
+                ref_updates.append(("HEAD", new_head, old_head))
+            update_lines = [
+                *(f"update {ref_name} {new_commit} {old_commit}" for ref_name, new_commit, old_commit in ref_updates),
+                "",
+            ]
+            update_result = subprocess.run(
+                ["git", f"--git-dir={internal_git_dir(self.root)}", "update-ref", "--stdin"],
+                cwd=self.root,
+                check=False,
+                text=False,
+                input="\n".join(update_lines).encode("utf-8"),
+                capture_output=True,
+            )
+            if update_result.returncode != 0:
+                raise ValueError(
+                    (
+                        (update_result.stderr or update_result.stdout).decode("utf-8", errors="replace")
+                        if update_result.stderr or update_result.stdout
+                        else "could not update rewritten internal git refs"
+                    ).strip()
+                )
+            run_internal_git(self.root, ["read-tree", new_head], check=True)
+
+        record["text"] = revised_text
+        write_text(paths.history, self.serialize_history_records(records))
+        if paths.compactions.exists():
+            for compaction_path in paths.compactions.glob("*.md"):
+                compaction_path.unlink()
+        meta = load_json(paths.meta)
+        meta.pop("lastCompactedHistoryCount", None)
+        meta.pop("lastCompactionPath", None)
+        dump_json(paths.meta, meta)
+        return {
+            "record": record,
+            "turnId": turn_id,
+            "oldHead": old_head,
+            "newHead": rewritten[old_head],
+            "rewrittenCommits": len(rewritten),
+        }
+
+    def read_history_text(self, text: str) -> list[dict[str, Any]]:
+        records = []
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                records.append({"role": "system", "text": f"[invalid jsonl] {line}"})
+        return records
 
     def list_archives(self, branch_id: str) -> list[dict[str, Any]]:
         paths = self.branch_paths_for_read(branch_id)
@@ -8446,6 +8751,41 @@ def make_handler(
                     self.send_json({"error": "delete_failed", "message": str(exc)}, status=409)
                 except SystemExit as exc:
                     self.send_json({"error": "delete_failed"}, status=int(exc.code or 400))
+                return
+            if parsed.path == "/api/history/revise":
+                branch_id = str(body.get("branch") or "")
+                text = str(body.get("text") or "")
+                try:
+                    index = int(body.get("index"))
+                except (TypeError, ValueError):
+                    self.send_json({"error": "invalid_history_index", "message": "history index is required"}, status=400)
+                    return
+                expected_created_at = str(body.get("createdAt") or "")
+                expected_role = str(body.get("role") or "")
+                try:
+                    revision = store.revise_history_record(
+                        branch_id,
+                        index,
+                        text,
+                        expected_created_at=expected_created_at,
+                        expected_role=expected_role,
+                    )
+                    revised = revision["record"]
+                    payload = branch_payload(store, branch_id)
+                    payload["revised"] = {
+                        "index": index,
+                        "role": revised.get("role"),
+                        "createdAt": revised.get("createdAt"),
+                        "turnId": revision.get("turnId"),
+                        "oldHead": revision.get("oldHead"),
+                        "newHead": revision.get("newHead"),
+                        "rewrittenCommits": revision.get("rewrittenCommits"),
+                    }
+                    self.send_json(payload)
+                except ValueError as exc:
+                    self.send_json({"error": "revise_failed", "message": str(exc)}, status=409)
+                except SystemExit as exc:
+                    self.send_json({"error": "revise_failed"}, status=int(exc.code or 400))
                 return
             if parsed.path == "/api/history/cut":
                 branch_id = str(body.get("branch") or "")

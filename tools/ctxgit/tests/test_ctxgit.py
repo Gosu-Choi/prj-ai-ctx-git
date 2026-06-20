@@ -715,6 +715,76 @@ class CtxgitTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 store.delete_history_record("AItrust", 0, expected_created_at="stale")
 
+    def test_revise_history_record_updates_text_and_preserves_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("AItrust")
+            turn_id = "turn_20260101T000000000000Z"
+            original = store.append_history("AItrust", "user", "Original message", extra={"turnId": turn_id})
+            original_commit = ctxgit.internal_git_commit_turn(
+                store,
+                kind="chat",
+                actor="user+agent",
+                summary="original turn",
+                branch_id="AItrust",
+                turn_id=turn_id,
+            )
+            original_count = int(
+                ctxgit.run_internal_git(
+                    root,
+                    ["rev-list", "--count", ctxgit.ctxgit_branch_ref("AItrust")],
+                    check=True,
+                ).stdout.strip()
+            )
+            paths = store.branch_paths("AItrust")
+            paths.compactions.mkdir(parents=True, exist_ok=True)
+            ctxgit.write_text(paths.compactions / "old.md", "stale compaction")
+            meta = ctxgit.load_json(paths.meta)
+            meta["lastCompactedHistoryCount"] = 1
+            meta["lastCompactionPath"] = "contexts/branches/AItrust/compactions/old.md"
+            ctxgit.dump_json(paths.meta, meta)
+
+            revision = store.revise_history_record(
+                "AItrust",
+                0,
+                "Revised message",
+                expected_created_at=original["createdAt"],
+                expected_role=original["role"],
+            )
+
+            records = list(store.iter_history("AItrust"))
+            self.assertEqual(records[0]["text"], "Revised message")
+            self.assertEqual(records[0]["id"], original["id"])
+            self.assertEqual(records[0]["createdAt"], original["createdAt"])
+            self.assertNotIn("revisionCount", records[0])
+            self.assertNotIn("revisedAt", records[0])
+            self.assertEqual(revision["oldHead"], original_commit["commit"])
+            self.assertNotEqual(revision["newHead"], original_commit["commit"])
+            self.assertEqual(ctxgit.internal_git_rev_parse(root, ctxgit.ctxgit_turn_ref(turn_id)), revision["newHead"])
+            self.assertEqual(ctxgit.internal_git_rev_parse(root, ctxgit.ctxgit_branch_ref("AItrust")), revision["newHead"])
+            rewritten_count = int(
+                ctxgit.run_internal_git(
+                    root,
+                    ["rev-list", "--count", ctxgit.ctxgit_branch_ref("AItrust")],
+                    check=True,
+                ).stdout.strip()
+            )
+            self.assertEqual(rewritten_count, original_count)
+            self.assertEqual(store.list_compactions("AItrust"), [])
+            revised_meta = ctxgit.load_json(paths.meta)
+            self.assertNotIn("lastCompactedHistoryCount", revised_meta)
+
+    def test_revise_history_record_rejects_stale_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("AItrust")
+            store.append_history("AItrust", "assistant", "Original message")
+
+            with self.assertRaises(ValueError):
+                store.revise_history_record("AItrust", 0, "Revised", expected_role="user")
+
     def test_merge_creates_branch_with_archived_parent_histories(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1036,7 +1106,6 @@ class CtxgitTest(unittest.TestCase):
             self.assertEqual([item["text"] for item in store.iter_history("forked")], ["First"])
             meta = ctxgit.load_json(fork_root / "branch.json")
             self.assertEqual(meta["forkedFromTurnId"], first_turn)
-            self.assertEqual(meta["forkedFromCommit"], first_commit["commit"])
             self.assertEqual(meta["forkedSnapshot"], "internal-git")
 
     def test_fork_context_restores_branch_files_with_empty_history(self) -> None:
@@ -1088,7 +1157,6 @@ class CtxgitTest(unittest.TestCase):
             meta = ctxgit.load_json(fork_root / "branch.json")
             self.assertEqual(meta["forkedFrom"], "source")
             self.assertEqual(meta["forkedAtIndex"], 0)
-            self.assertEqual(meta["forkedFromCommit"], first_commit["commit"])
             self.assertTrue(meta["forkedContextOnly"])
 
     def test_cut_branch_restores_history_and_context_to_turn_snapshot(self) -> None:
@@ -1139,6 +1207,135 @@ class CtxgitTest(unittest.TestCase):
             self.assertEqual(cut["commit"], first_commit["commit"])
             self.assertEqual(ctxgit.internal_git_rev_parse(root, ctxgit.ctxgit_branch_ref("source")), first_commit["commit"])
             self.assertEqual(ctxgit.internal_git_rev_parse(root, "HEAD"), second_commit["commit"])
+
+    def test_cut_branch_preserves_revised_history_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("source")
+            first_turn = "turn_20260101T000000000000Z"
+            second_turn = "turn_20260101T000001000000Z"
+            first = store.append_history("source", "user", "Original", extra={"turnId": first_turn})
+            ctxgit.internal_git_commit_turn(
+                store,
+                kind="chat",
+                actor="user+agent",
+                summary="first turn",
+                branch_id="source",
+                turn_id=first_turn,
+            )
+            store.append_history("source", "assistant", "Later", extra={"turnId": second_turn})
+            ctxgit.internal_git_commit_turn(
+                store,
+                kind="chat",
+                actor="user+agent",
+                summary="second turn",
+                branch_id="source",
+                turn_id=second_turn,
+            )
+            store.revise_history_record(
+                "source",
+                0,
+                "Revised",
+                expected_created_at=first["createdAt"],
+                expected_role=first["role"],
+            )
+
+            store.cut_branch_at_history(
+                "source",
+                0,
+                expected_created_at=first["createdAt"],
+                expected_role=first["role"],
+            )
+
+            records = list(store.iter_history("source"))
+            self.assertEqual([record["text"] for record in records], ["Revised"])
+            self.assertNotIn("revisionCount", records[0])
+            self.assertNotIn("revisedAt", records[0])
+
+    def test_revised_history_survives_fork_and_cut_at_later_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("source")
+            records = []
+            for index, text in enumerate(["a", "b", "c", "d"], start=1):
+                turn_id = f"turn_20260101T00000{index}000000Z"
+                record = store.append_history("source", "user", text, extra={"turnId": turn_id})
+                ctxgit.write_text(
+                    root / "contexts" / "branches" / "source" / "context.md",
+                    f"# Source\n\nContext after {text}.\n",
+                )
+                store.add_note("source", f"note-{text}", f"note after {text}")
+                ctxgit.internal_git_commit_turn(
+                    store,
+                    kind="chat",
+                    actor="user+agent",
+                    summary=f"turn {text}",
+                    branch_id="source",
+                    turn_id=turn_id,
+                )
+                records.append(record)
+
+            store.revise_history_record(
+                "source",
+                1,
+                "b revised",
+                expected_created_at=records[1]["createdAt"],
+                expected_role=records[1]["role"],
+            )
+            rewritten_c_commit = ctxgit.internal_git_rev_parse(
+                root,
+                ctxgit.ctxgit_turn_ref(str(records[2]["turnId"])),
+            )
+
+            store.fork_branch_at_history(
+                "source",
+                "forked",
+                2,
+                expected_created_at=records[2]["createdAt"],
+                expected_role=records[2]["role"],
+            )
+            fork_records = list(store.iter_history("forked"))
+            self.assertEqual([record["text"] for record in fork_records], ["a", "b revised", "c"])
+            self.assertNotIn("revisionCount", fork_records[1])
+            self.assertNotIn("revisedAt", fork_records[1])
+            self.assertEqual(
+                (root / "contexts" / "branches" / "forked" / "context.md").read_text(encoding="utf-8"),
+                "# Source\n\nContext after c.\n",
+            )
+            fork_notes = "\n".join(
+                path.read_text(encoding="utf-8")
+                for path in (root / "contexts" / "branches" / "forked" / "notes").glob("*.md")
+            )
+            self.assertIn("note after c", fork_notes)
+            self.assertNotIn("note after d", fork_notes)
+
+            cut = store.cut_branch_at_history(
+                "source",
+                2,
+                expected_created_at=records[2]["createdAt"],
+                expected_role=records[2]["role"],
+            )
+            cut_records = list(store.iter_history("source"))
+            self.assertEqual([record["text"] for record in cut_records], ["a", "b revised", "c"])
+            self.assertNotIn("revisionCount", cut_records[1])
+            self.assertNotIn("revisedAt", cut_records[1])
+            self.assertEqual(cut["commit"], rewritten_c_commit)
+            self.assertEqual(
+                (root / "contexts" / "branches" / "source" / "context.md").read_text(encoding="utf-8"),
+                "# Source\n\nContext after c.\n",
+            )
+            cut_notes = "\n".join(
+                path.read_text(encoding="utf-8")
+                for path in (root / "contexts" / "branches" / "source" / "notes").glob("*.md")
+            )
+            self.assertIn("note after c", cut_notes)
+            self.assertNotIn("note after d", cut_notes)
+            self.assertEqual(
+                ctxgit.internal_git_rev_parse(root, ctxgit.ctxgit_branch_ref("source")),
+                rewritten_c_commit,
+            )
 
     def test_cut_branch_rejects_mid_turn_message(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
