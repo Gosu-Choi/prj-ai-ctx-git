@@ -466,6 +466,50 @@ class CtxgitTest(unittest.TestCase):
             self.assertEqual(project_status, 200)
             self.assertEqual(project["path"], str(root.resolve()))
 
+    def test_choose_directory_api_handles_non_ascii_git_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "한글 프로젝트"
+            root.mkdir()
+            subprocess.run(
+                ["git", "init"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            project_state = ctxgit.ProjectState(None)
+            handler = ctxgit.make_handler(project_state, auth_required=False)
+            original_chooser = ctxgit.choose_project_directory
+            ctxgit.choose_project_directory = lambda path_value: root.resolve()
+
+            try:
+                with ctxgit.ReusableThreadingHTTPServer(("127.0.0.1", 0), handler) as server:
+                    thread = threading.Thread(target=server.serve_forever, daemon=True)
+                    thread.start()
+                    base_url = f"http://127.0.0.1:{server.server_port}"
+                    request = urllib.request.Request(
+                        f"{base_url}/api/project/choose-directory",
+                        data=json.dumps({"path": ""}).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    try:
+                        with urllib.request.urlopen(request, timeout=5) as response:
+                            status = response.status
+                            payload = json.loads(response.read().decode("utf-8"))
+                    finally:
+                        server.shutdown()
+                        thread.join(timeout=5)
+            finally:
+                ctxgit.choose_project_directory = original_chooser
+
+            self.assertEqual(status, 200)
+            self.assertEqual(payload["path"], str(root.resolve()))
+            self.assertTrue(payload["project"]["gitInitialized"])
+
     def test_handler_uses_project_header_for_tab_scoped_requests(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -2178,6 +2222,25 @@ class CtxgitTest(unittest.TestCase):
             payload = ctxgit.browse_directories(str(root))
             entry = next(item for item in payload["entries"] if item["name"] == "child")
             self.assertTrue(entry["initialized"])
+
+    def test_project_payload_handles_non_ascii_git_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "한글 프로젝트"
+            root.mkdir()
+            subprocess.run(
+                ["git", "init"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+
+            payload = ctxgit.project_payload(root)
+
+            self.assertEqual(payload["path"], str(root.resolve()))
+            self.assertTrue(payload["gitInitialized"])
 
     def test_init_command_creates_git_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

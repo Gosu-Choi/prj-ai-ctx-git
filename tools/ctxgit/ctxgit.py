@@ -346,11 +346,13 @@ def run_git(root: Path, args: list[str]) -> str:
         cwd=root,
         check=False,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         capture_output=True,
     )
     if completed.returncode != 0:
-        return completed.stderr.strip()
-    return completed.stdout.strip()
+        return (completed.stderr or "").strip()
+    return (completed.stdout or "").strip()
 
 
 def internal_git_dir(root: Path) -> Path:
@@ -8011,6 +8013,14 @@ def make_handler(
                     self.send_json({"path": str(selected), "project": project_payload(selected)})
                 except ValueError as exc:
                     self.send_json({"error": "directory_choice_failed", "message": str(exc)}, status=400)
+                except Exception as exc:
+                    self.send_json(
+                        {
+                            "error": "directory_choice_failed",
+                            "message": f"Could not inspect the selected directory: {exc}",
+                        },
+                        status=500,
+                    )
                 return
             if parsed.path == "/api/project/open":
                 path_value = str(body.get("path") or "")
