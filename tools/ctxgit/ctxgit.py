@@ -85,8 +85,11 @@ PROJECT_ENV_GITIGNORE_LINES = (
     "!.ctxgit/.env.example",
     ".ctxgit/auth.json",
     ".ctxgit/auth.json.*",
-    ".ctxgit/git/",
 )
+LEGACY_PROJECT_GITIGNORE_LINES = {
+    ".ctxgit/git/",
+    ".ctxgit/git/**",
+}
 PROJECT_SYNC_SKIP_DIRS = {".git", "__pycache__", ".mypy_cache", ".pytest_cache", "node_modules", ".venv", "venv"}
 PROJECT_SYNC_SKIP_FILES = {".env", ".DS_Store"}
 PROJECT_SYNC_SKIP_PATHS = {(".ctxgit", ".env"), (".ctxgit", "auth.json")}
@@ -321,12 +324,20 @@ def load_project_env(root: Path) -> dict[str, Any]:
 def ensure_project_gitignore(root: Path) -> None:
     path = root / ".gitignore"
     existing = read_text(path)
-    existing_lines = {line.strip() for line in existing.splitlines()}
+    lines = existing.splitlines()
+    kept_lines = [line for line in lines if line.strip() not in LEGACY_PROJECT_GITIGNORE_LINES]
+    existing_lines = {line.strip() for line in kept_lines}
     missing = [line for line in PROJECT_ENV_GITIGNORE_LINES if line not in existing_lines]
-    if not missing:
+    if not missing and kept_lines == lines:
         return
-    prefix = existing.rstrip() + "\n" if existing.strip() else ""
-    write_text(path, prefix + "\n".join(missing) + "\n")
+    body = "\n".join(kept_lines).rstrip()
+    additions = "\n".join(missing)
+    next_text = ""
+    if body:
+        next_text += body + "\n"
+    if additions:
+        next_text += additions + "\n"
+    write_text(path, next_text)
 
 
 def run_git(root: Path, args: list[str]) -> str:
@@ -1269,6 +1280,7 @@ class ContextStore:
     def require_initialized(self) -> None:
         if not self.contexts.exists():
             die("contexts workspace is not initialized; run `ctxgit init` first")
+        ensure_project_gitignore(self.root)
 
     def create_branch(
         self,
@@ -6925,8 +6937,6 @@ def should_skip_project_sync_path(rel: Path) -> bool:
     parts = rel.parts
     if not parts:
         return False
-    if len(parts) >= 2 and parts[0] == ".ctxgit" and parts[1] == "git":
-        return True
     if len(parts) >= 2 and parts[0] == "contexts" and parts[1] == "jobs":
         return True
     if any(part in PROJECT_SYNC_SKIP_DIRS for part in parts):
