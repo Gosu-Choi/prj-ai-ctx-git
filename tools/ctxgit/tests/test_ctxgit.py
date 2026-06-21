@@ -847,9 +847,31 @@ class CtxgitTest(unittest.TestCase):
             replies = iter(
                 [
                     {"assistant": "First draft"},
-                    {"assistant": "Needs revision [[SEQUENCE_CONTINUE]]"},
+                    {
+                        "assistant": "Needs revision",
+                        "sequenceEvaluation": {
+                            "decision": "continue",
+                            "requiredChanges": ["Tighten the opening."],
+                            "optionalSuggestions": [],
+                            "criteria": [
+                                {"name": criterion, "passed": False, "evidence": "Revision remains."}
+                                for criterion in ctxgit.DEFAULT_SEQUENCE_ACCEPTANCE_CRITERIA
+                            ],
+                        },
+                    },
                     {"assistant": "Improved draft"},
-                    {"assistant": "Complete [[SEQUENCE_STOP]]"},
+                    {
+                        "assistant": "Complete",
+                        "sequenceEvaluation": {
+                            "decision": "complete",
+                            "requiredChanges": [],
+                            "optionalSuggestions": [],
+                            "criteria": [
+                                {"name": criterion, "passed": True, "evidence": "Satisfied."}
+                                for criterion in ctxgit.DEFAULT_SEQUENCE_ACCEPTANCE_CRITERIA
+                            ],
+                        },
+                    },
                 ]
             )
             original_call = ctxgit.call_codex_history_chat
@@ -875,6 +897,9 @@ class CtxgitTest(unittest.TestCase):
             self.assertEqual([item["sequenceSpeaker"]["order"] for item in history[1:]], [1, 2, 1, 2])
             self.assertEqual([item["sequenceAccessMode"] for item in history[1:]], ["send", "info-chat", "send", "info-chat"])
             self.assertTrue(result["sequenceRun"]["stopped"])
+            self.assertEqual(result["sequenceRun"]["evaluatorRounds"], 2)
+            self.assertEqual(history[2]["sequenceEvaluation"]["decision"], "continue")
+            self.assertEqual(history[4]["sequenceEvaluation"]["decision"], "complete")
             self.assertEqual(
                 [event for event in progress_events if event.startswith("Sequence reply ")],
                 [
@@ -906,6 +931,66 @@ class CtxgitTest(unittest.TestCase):
                 ("branch:writer", "branch:room", "sequence 1"),
                 ("branch:critic", "branch:room", "sequence 2"),
             ])
+
+    def test_sequence_evaluation_defaults_to_continue_when_invalid_or_changes_remain(self) -> None:
+        criteria = list(ctxgit.DEFAULT_SEQUENCE_ACCEPTANCE_CRITERIA)
+        invalid, valid = ctxgit.normalize_sequence_evaluation(None, criteria)
+        self.assertFalse(valid)
+        self.assertEqual(invalid["decision"], "continue")
+        self.assertTrue(invalid["requiredChanges"])
+
+        contradictory, valid = ctxgit.normalize_sequence_evaluation(
+            {
+                "decision": "complete",
+                "requiredChanges": ["One more required revision."],
+                "optionalSuggestions": [],
+                "criteria": [
+                    {"name": criterion, "passed": True, "evidence": "Looks good."}
+                    for criterion in criteria
+                ],
+            },
+            criteria,
+        )
+        self.assertTrue(valid)
+        self.assertEqual(contradictory["decision"], "complete")
+        self.assertTrue(contradictory["requiredChanges"])
+        self.assertFalse(
+            ctxgit.sequence_evaluation_allows_stop(
+                contradictory,
+                valid=valid,
+                evaluator_rounds=2,
+                minimum_evaluator_rounds=2,
+                acceptance_criteria=criteria,
+            )
+        )
+
+        complete = {
+            "decision": "complete",
+            "requiredChanges": [],
+            "optionalSuggestions": [],
+            "criteria": [
+                {"name": criterion, "passed": True, "evidence": "Satisfied."}
+                for criterion in criteria
+            ],
+        }
+        self.assertFalse(
+            ctxgit.sequence_evaluation_allows_stop(
+                complete,
+                valid=True,
+                evaluator_rounds=1,
+                minimum_evaluator_rounds=2,
+                acceptance_criteria=criteria,
+            )
+        )
+        self.assertTrue(
+            ctxgit.sequence_evaluation_allows_stop(
+                complete,
+                valid=True,
+                evaluator_rounds=2,
+                minimum_evaluator_rounds=2,
+                acceptance_criteria=criteria,
+            )
+        )
 
     def test_empty_archive_directory_does_not_add_archive_prompt_section(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

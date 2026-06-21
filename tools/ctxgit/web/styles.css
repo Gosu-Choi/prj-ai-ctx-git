@@ -916,6 +916,33 @@ textarea {
   overflow-wrap: anywhere;
 }
 
+.sequence-evaluation {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid #cbd9da;
+  border-radius: 8px;
+  background: #f4f8f8;
+  font-size: 0.9rem;
+}
+
+.sequence-evaluation summary {
+  cursor: pointer;
+  color: #176b73;
+  font-weight: 700;
+}
+
+.sequence-evaluation ul {
+  margin: 8px 0 0 20px;
+}
+
+.sequence-criteria .passed {
+  color: #256b3b;
+}
+
+.sequence-criteria .failed {
+  color: #9a3d2f;
+}
+
 .message-text p {
   margin: 0 0 0.55em;
 }

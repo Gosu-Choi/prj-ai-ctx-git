@@ -277,6 +277,10 @@
         <label>Agent 2 permission<select id="sequenceAccess2"><option value="send">Can send and edit project</option><option value="info-chat">Info chat only</option></select></label>
         <label>Room name<input id="sequenceRoomName" required /></label>
         <label>Maximum agent replies<input id="sequenceMaxReplies" type="number" min="2" max="40" value="6" /></label>
+        <label>Minimum Agent 2 evaluation rounds<input id="sequenceMinEvaluatorRounds" type="number" min="1" max="20" value="2" /></label>
+        <label>Acceptance criteria (one per line)<textarea id="sequenceAcceptanceCriteria" rows="5">The original user request has been substantively addressed.
+No required correction or unresolved blocking issue remains.
+The latest evaluator feedback has been incorporated or explicitly resolved.</textarea></label>
         <div id="sequenceRoomStatus" class="settings-status"></div>
         <div class="dialog-actions"><button type="button" onclick="this.closest('dialog').close()">Cancel</button><button id="sequenceRoomSubmit" type="submit">Create</button></div>
       </form>
@@ -288,6 +292,9 @@
         <label>Participant<select id="sequenceUpdateOrder"><option value="1">Agent 1</option><option value="2">Agent 2</option></select></label>
         <label>Persistent system prompt<textarea id="sequenceUpdatePrompt" rows="6"></textarea></label>
         <label>Permission<select id="sequenceUpdateAccess"><option value="send">Can send and edit project</option><option value="info-chat">Info chat only</option></select></label>
+        <label>Maximum agent replies<input id="sequenceUpdateMaxReplies" type="number" min="2" max="40" /></label>
+        <label>Minimum Agent 2 evaluation rounds<input id="sequenceUpdateMinEvaluatorRounds" type="number" min="1" max="20" /></label>
+        <label>Acceptance criteria (one per line)<textarea id="sequenceUpdateAcceptanceCriteria" rows="5"></textarea></label>
         <div class="sequence-compare">
           <section><h3>Archived snapshot</h3><pre id="sequenceSnapshotView"></pre></section>
           <section><h3>Current source branch</h3><pre id="sequenceCurrentView"></pre></section>

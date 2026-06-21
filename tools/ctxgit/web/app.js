@@ -163,12 +163,17 @@ const els = {
   sequenceAccess2: document.querySelector("#sequenceAccess2"),
   sequenceRoomName: document.querySelector("#sequenceRoomName"),
   sequenceMaxReplies: document.querySelector("#sequenceMaxReplies"),
+  sequenceMinEvaluatorRounds: document.querySelector("#sequenceMinEvaluatorRounds"),
+  sequenceAcceptanceCriteria: document.querySelector("#sequenceAcceptanceCriteria"),
   sequenceRoomStatus: document.querySelector("#sequenceRoomStatus"),
   sequenceUpdateDialog: document.querySelector("#sequenceUpdateDialog"),
   sequenceUpdateForm: document.querySelector("#sequenceUpdateForm"),
   sequenceUpdateOrder: document.querySelector("#sequenceUpdateOrder"),
   sequenceUpdatePrompt: document.querySelector("#sequenceUpdatePrompt"),
   sequenceUpdateAccess: document.querySelector("#sequenceUpdateAccess"),
+  sequenceUpdateMaxReplies: document.querySelector("#sequenceUpdateMaxReplies"),
+  sequenceUpdateMinEvaluatorRounds: document.querySelector("#sequenceUpdateMinEvaluatorRounds"),
+  sequenceUpdateAcceptanceCriteria: document.querySelector("#sequenceUpdateAcceptanceCriteria"),
   sequenceSnapshotView: document.querySelector("#sequenceSnapshotView"),
   sequenceCurrentView: document.querySelector("#sequenceCurrentView"),
   sequenceUpdateSnapshot: document.querySelector("#sequenceUpdateSnapshot"),
@@ -1953,6 +1958,33 @@ function renderMessageResources(resources) {
   `;
 }
 
+function renderSequenceEvaluation(message) {
+  const evaluation = message?.sequenceEvaluation;
+  if (!evaluation) return "";
+  const required = Array.isArray(evaluation.requiredChanges) ? evaluation.requiredChanges : [];
+  const criteria = Array.isArray(evaluation.criteria) ? evaluation.criteria : [];
+  const valid = message.sequenceEvaluationValid !== false;
+  const decision = valid ? evaluation.decision || "continue" : "invalid · continue";
+  return `
+    <details class="sequence-evaluation">
+      <summary>Evaluation ${escapeHtml(String(message.sequenceEvaluatorRound || ""))}: ${escapeHtml(decision)}</summary>
+      ${
+        required.length
+          ? `<div><strong>Required changes</strong><ul>${required.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul></div>`
+          : "<div>No required changes.</div>"
+      }
+      <ul class="sequence-criteria">
+        ${criteria
+          .map(
+            (item) =>
+              `<li class="${item.passed ? "passed" : "failed"}">${item.passed ? "Pass" : "Fail"} · ${escapeHtml(item.name || "")}${item.evidence ? ` — ${escapeHtml(item.evidence)}` : ""}</li>`,
+          )
+          .join("")}
+      </ul>
+    </details>
+  `;
+}
+
 function renderApprovalRequests(requests, statuses = {}) {
   if (!Array.isArray(requests) || requests.length === 0) return "";
   return `
@@ -2586,6 +2618,7 @@ function renderBranch(payload) {
               </span>
             </div>
             <div class="message-text">${renderMessageText(message.text)}</div>
+            ${renderSequenceEvaluation(message)}
             ${renderMessageResources(message.resources)}
             ${renderArtifacts(message.artifacts)}
             ${archived ? "" : renderApprovalRequests(message.approvalRequests, payload.approvalStatuses || {})}
@@ -3611,6 +3644,11 @@ els.sequenceRoomForm.addEventListener("submit", async (event) => {
         name: roomId,
         title: roomTitle,
         maxAgentReplies: Number(els.sequenceMaxReplies.value || 6),
+        minimumEvaluatorRounds: Number(els.sequenceMinEvaluatorRounds.value || 2),
+        acceptanceCriteria: els.sequenceAcceptanceCriteria.value
+          .split(/\r?\n/)
+          .map((item) => item.trim())
+          .filter(Boolean),
       }),
     });
     els.sequenceRoomDialog.close();
@@ -3628,6 +3666,9 @@ async function loadSequenceParticipantComparison() {
   const data = await api(`/api/sequence-room/participant?branch=${encodeURIComponent(state.activeBranch)}&order=${order}`);
   els.sequenceUpdatePrompt.value = data.participant?.systemPrompt || "";
   els.sequenceUpdateAccess.value = data.participant?.accessMode || "info-chat";
+  els.sequenceUpdateMaxReplies.value = data.sequenceRoom?.defaultMaxAgentReplies || 6;
+  els.sequenceUpdateMinEvaluatorRounds.value = data.sequenceRoom?.minimumEvaluatorRounds || 2;
+  els.sequenceUpdateAcceptanceCriteria.value = (data.sequenceRoom?.acceptanceCriteria || []).join("\n");
   const formatSide = (side) =>
     `CONTEXT\n${side.context || ""}\n\nHISTORY\n${(side.history || []).map((item) => `${item.role}: ${item.text}`).join("\n\n")}`;
   els.sequenceSnapshotView.textContent = formatSide(data.snapshot);
@@ -3657,6 +3698,12 @@ els.sequenceUpdateForm.addEventListener("submit", async (event) => {
         order: Number(els.sequenceUpdateOrder.value),
         systemPrompt: els.sequenceUpdatePrompt.value,
         accessMode: els.sequenceUpdateAccess.value,
+        maxAgentReplies: Number(els.sequenceUpdateMaxReplies.value || 6),
+        minimumEvaluatorRounds: Number(els.sequenceUpdateMinEvaluatorRounds.value || 2),
+        acceptanceCriteria: els.sequenceUpdateAcceptanceCriteria.value
+          .split(/\r?\n/)
+          .map((item) => item.trim())
+          .filter(Boolean),
         updateSnapshot: els.sequenceUpdateSnapshot.checked,
       }),
     });

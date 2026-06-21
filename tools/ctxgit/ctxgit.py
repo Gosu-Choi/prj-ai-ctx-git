@@ -3007,6 +3007,8 @@ class ContextStore:
         system_prompts: list[str],
         access_modes: list[str],
         max_agent_replies: int,
+        acceptance_criteria: list[str] | None = None,
+        minimum_evaluator_rounds: int = 2,
     ) -> Path:
         self.require_initialized()
         if len(source_ids) != 2 or len(set(source_ids)) != 2:
@@ -3020,6 +3022,9 @@ class ContextStore:
                 raise ValueError(f"branch does not exist: {source_id}")
         if max_agent_replies < 2 or max_agent_replies > 40:
             raise ValueError("maximum agent replies must be between 2 and 40")
+        if minimum_evaluator_rounds < 1 or minimum_evaluator_rounds > 20:
+            raise ValueError("minimum evaluator rounds must be between 1 and 20")
+        normalized_criteria = normalize_sequence_acceptance_criteria(acceptance_criteria)
         self.create_branch_files(safe_target, title=title or f"Sequence: {safe_sources[0]} → {safe_sources[1]}", tags=["sequence-room"])
         paths = self.branch_paths(safe_target)
         participants = []
@@ -3048,13 +3053,17 @@ class ContextStore:
             "participants": participants,
             "defaultMaxAgentReplies": max_agent_replies,
             "stopDecider": 2,
+            "acceptanceCriteria": normalized_criteria,
+            "minimumEvaluatorRounds": minimum_evaluator_rounds,
         }
         dump_json(paths.meta, meta)
         write_text(
             paths.context,
             f"# {title or safe_target}\n\n## Sequence Room\n\n"
             f"- Agent 1: `{safe_sources[0]}`\n- Agent 2: `{safe_sources[1]}`\n"
-            f"- Maximum agent replies: {max_agent_replies}\n- Stop decider: Agent 2\n",
+            f"- Maximum agent replies: {max_agent_replies}\n- Stop evaluator: Agent 2\n"
+            f"- Minimum evaluator rounds: {minimum_evaluator_rounds}\n"
+            f"- Acceptance criteria: {len(normalized_criteria)}\n",
         )
         write_text(paths.history, "")
         self.write_index()
@@ -3075,6 +3084,9 @@ class ContextStore:
         update_snapshot: bool = False,
         system_prompt: str | None = None,
         access_mode: str | None = None,
+        acceptance_criteria: list[str] | None = None,
+        minimum_evaluator_rounds: int | None = None,
+        default_max_agent_replies: int | None = None,
     ) -> dict[str, Any]:
         paths = self.branch_paths(branch_id)
         meta = load_json(paths.meta)
@@ -3101,6 +3113,16 @@ class ContextStore:
             if normalized_access not in {"send", "info-chat"}:
                 raise ValueError("participant access mode must be send or info-chat")
             participant["accessMode"] = normalized_access
+        if acceptance_criteria is not None:
+            config["acceptanceCriteria"] = normalize_sequence_acceptance_criteria(acceptance_criteria)
+        if minimum_evaluator_rounds is not None:
+            if minimum_evaluator_rounds < 1 or minimum_evaluator_rounds > 20:
+                raise ValueError("minimum evaluator rounds must be between 1 and 20")
+            config["minimumEvaluatorRounds"] = minimum_evaluator_rounds
+        if default_max_agent_replies is not None:
+            if default_max_agent_replies < 2 or default_max_agent_replies > 40:
+                raise ValueError("maximum agent replies must be between 2 and 40")
+            config["defaultMaxAgentReplies"] = default_max_agent_replies
         meta["sequenceRoom"] = config
         dump_json(paths.meta, meta)
         self.append_history(
@@ -3124,6 +3146,7 @@ class ContextStore:
         source_paths = self.branch_paths(source_id)
         return {
             "participant": participant,
+            "sequenceRoom": config,
             "snapshot": {
                 "context": read_text(archive_root / "context.md"),
                 "history": self.read_history_file(archive_root / "history.jsonl"),
@@ -5338,6 +5361,51 @@ def chat_output_schema() -> dict[str, Any]:
     }
 
 
+DEFAULT_SEQUENCE_ACCEPTANCE_CRITERIA = [
+    "The original user request has been substantively addressed.",
+    "No required correction or unresolved blocking issue remains.",
+    "The latest evaluator feedback has been incorporated or explicitly resolved.",
+]
+
+
+def normalize_sequence_acceptance_criteria(criteria: list[str] | None) -> list[str]:
+    normalized = []
+    for item in criteria or []:
+        text = str(item).strip()
+        if text and text not in normalized:
+            normalized.append(text)
+    return normalized or list(DEFAULT_SEQUENCE_ACCEPTANCE_CRITERIA)
+
+
+def sequence_evaluator_output_schema() -> dict[str, Any]:
+    schema = chat_output_schema()
+    schema["required"].append("sequenceEvaluation")
+    schema["properties"]["sequenceEvaluation"] = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["decision", "requiredChanges", "optionalSuggestions", "criteria"],
+        "properties": {
+            "decision": {"type": "string", "enum": ["continue", "complete"]},
+            "requiredChanges": {"type": "array", "items": {"type": "string"}},
+            "optionalSuggestions": {"type": "array", "items": {"type": "string"}},
+            "criteria": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["name", "passed", "evidence"],
+                    "properties": {
+                        "name": {"type": "string"},
+                        "passed": {"type": "boolean"},
+                        "evidence": {"type": "string"},
+                    },
+                },
+            },
+        },
+    }
+    return schema
+
+
 def parse_chat_result(raw: str) -> dict[str, Any]:
     text = raw.strip()
     if text.startswith("```"):
@@ -5352,11 +5420,14 @@ def parse_chat_result(raw: str) -> dict[str, Any]:
     assistant = parsed.get("assistant")
     artifacts = parsed.get("artifacts")
     approval_requests = parsed.get("approvalRequests")
-    return {
+    result = {
         "assistant": assistant if isinstance(assistant, str) else raw.strip(),
         "artifacts": artifacts if isinstance(artifacts, list) else [],
         "approvalRequests": approval_requests if isinstance(approval_requests, list) else [],
     }
+    if isinstance(parsed.get("sequenceEvaluation"), dict):
+        result["sequenceEvaluation"] = parsed["sequenceEvaluation"]
+    return result
 
 
 def normalize_approval_requests(
@@ -5683,6 +5754,7 @@ def call_codex_chat(
     approved_external_paths: list[str] | None = None,
     resource_paths: list[str] | None = None,
     progress: ProgressCallback | None = None,
+    output_schema: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     emit_progress(progress, "Checking Codex login")
     status = codex_login_status(root)
@@ -5704,7 +5776,7 @@ def call_codex_chat(
         tmp_path = Path(tmp)
         schema_path = tmp_path / "chat-output.schema.json"
         output_path = tmp_path / "last-message.txt"
-        write_text(schema_path, json.dumps(chat_output_schema(), indent=2))
+        write_text(schema_path, json.dumps(output_schema or chat_output_schema(), indent=2))
         cmd = resolve_codex_command(root)
         if codex_config.get("webSearch") is not False:
             cmd.append("--search")
@@ -5773,6 +5845,7 @@ def call_codex_history_chat(
     user_message: str,
     resource_paths: list[str] | None = None,
     progress: ProgressCallback | None = None,
+    output_schema: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     emit_progress(progress, "Checking Codex login")
     status = codex_login_status(root)
@@ -5787,7 +5860,7 @@ def call_codex_history_chat(
         tmp_path = Path(tmp)
         schema_path = tmp_path / "chat-output.schema.json"
         output_path = tmp_path / "last-message.txt"
-        write_text(schema_path, json.dumps(chat_output_schema(), indent=2))
+        write_text(schema_path, json.dumps(output_schema or chat_output_schema(), indent=2))
         cmd = resolve_codex_command(root)
         if codex_config.get("webSearch") is not False:
             cmd.append("--search")
@@ -6286,6 +6359,83 @@ def run_merge_branches(
     return payload
 
 
+def normalize_sequence_evaluation(
+    raw: Any,
+    acceptance_criteria: list[str],
+) -> tuple[dict[str, Any], bool]:
+    if not isinstance(raw, dict):
+        return {
+            "decision": "continue",
+            "requiredChanges": ["Agent 2 did not return a valid structured evaluation."],
+            "optionalSuggestions": [],
+            "criteria": [],
+        }, False
+    decision = str(raw.get("decision") or "").strip().lower()
+    required_changes = [
+        str(item).strip()
+        for item in raw.get("requiredChanges", [])
+        if str(item).strip()
+    ] if isinstance(raw.get("requiredChanges"), list) else []
+    optional_suggestions = [
+        str(item).strip()
+        for item in raw.get("optionalSuggestions", [])
+        if str(item).strip()
+    ] if isinstance(raw.get("optionalSuggestions"), list) else []
+    raw_criteria = raw.get("criteria") if isinstance(raw.get("criteria"), list) else []
+    criteria = []
+    for item in raw_criteria:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        criteria.append(
+            {
+                "name": name,
+                "passed": item.get("passed") is True,
+                "evidence": str(item.get("evidence") or "").strip(),
+            }
+        )
+    criteria_by_name = {item["name"]: item for item in criteria}
+    criteria_complete = all(name in criteria_by_name for name in acceptance_criteria)
+    valid = decision in {"continue", "complete"} and criteria_complete
+    if not valid:
+        decision = "continue"
+        if not required_changes:
+            required_changes = ["Agent 2 returned an incomplete structured evaluation."]
+    return {
+        "decision": decision,
+        "requiredChanges": required_changes,
+        "optionalSuggestions": optional_suggestions,
+        "criteria": criteria,
+    }, valid
+
+
+def sequence_evaluation_allows_stop(
+    evaluation: dict[str, Any],
+    *,
+    valid: bool,
+    evaluator_rounds: int,
+    minimum_evaluator_rounds: int,
+    acceptance_criteria: list[str],
+) -> bool:
+    criteria_by_name = {
+        str(item.get("name") or ""): item
+        for item in evaluation.get("criteria", [])
+        if isinstance(item, dict)
+    }
+    return (
+        valid
+        and evaluator_rounds >= minimum_evaluator_rounds
+        and evaluation.get("decision") == "complete"
+        and not evaluation.get("requiredChanges")
+        and all(
+            criteria_by_name.get(criterion, {}).get("passed") is True
+            for criterion in acceptance_criteria
+        )
+    )
+
+
 def run_sequence_room_turn(
     root: Path,
     store: ContextStore,
@@ -6301,6 +6451,13 @@ def run_sequence_room_turn(
         raise ValueError("sequence room must have exactly two participants")
     maximum = max_agent_replies or coerce_positive_int(config.get("defaultMaxAgentReplies"), 6)
     maximum = max(2, min(40, maximum))
+    acceptance_criteria = normalize_sequence_acceptance_criteria(
+        config.get("acceptanceCriteria") if isinstance(config.get("acceptanceCriteria"), list) else None
+    )
+    minimum_evaluator_rounds = max(
+        1,
+        min(20, coerce_positive_int(config.get("minimumEvaluatorRounds"), 2)),
+    )
     run_id = new_turn_id()
     if run_mode not in {"send", "info-chat"}:
         raise ValueError("sequence room run mode must be send or info-chat")
@@ -6313,6 +6470,9 @@ def run_sequence_room_turn(
     room_paths = store.branch_paths(branch_id)
     stopped = False
     stop_reason = ""
+    evaluator_rounds = 0
+    pending_required_changes: list[str] = []
+    last_evaluation: dict[str, Any] | None = None
     for reply_index in range(maximum):
         participant = participants[reply_index % 2]
         order = int(participant.get("order") or (reply_index % 2 + 1))
@@ -6350,23 +6510,70 @@ def run_sequence_room_turn(
                 f"Original user request: {user_message}",
                 "",
                 (
-                    "You are Agent 2 and the stop decider. End your response with exactly "
-                    "`[[SEQUENCE_STOP]]` when the work is sufficiently complete; otherwise end with "
-                    "`[[SEQUENCE_CONTINUE]]`."
+                    "You are Agent 2, the evaluator. Give your substantive response in `assistant`, then "
+                    "return `sequenceEvaluation` using the required output schema. The harness, not you, "
+                    "makes the final stop decision. Use decision `complete` only when every acceptance "
+                    "criterion passes and requiredChanges is empty. Any change you ask Agent 1 to make "
+                    "must appear in requiredChanges; optionalSuggestions must contain only improvements "
+                    "that are genuinely unnecessary for completion. Do not emit textual stop markers.\n"
+                    f"Evaluator round: {evaluator_rounds + 1}. The harness requires at least "
+                    f"{minimum_evaluator_rounds} evaluator rounds before completion.\n"
+                    "Acceptance criteria, whose exact text must be used as each criteria.name:\n"
+                    + "\n".join(f"- {criterion}" for criterion in acceptance_criteria)
+                    + "\nRequired changes from your previous evaluation that Agent 1 was expected to address:\n"
+                    + (
+                        "\n".join(f"- {change}" for change in pending_required_changes)
+                        if pending_required_changes
+                        else "- None."
+                    )
                     if order == 2
-                    else "Respond with your next contribution. Do not emit sequence stop markers."
+                    else (
+                        "Respond with your next contribution. If Agent 2 previously requested changes, "
+                        "address them explicitly. Do not emit sequence stop markers."
+                    )
                 ),
             ]
         )
         participant_access = str(participant.get("accessMode") or "info-chat")
         effective_access = "info-chat" if run_mode == "info-chat" else participant_access
+        output_schema = sequence_evaluator_output_schema() if order == 2 else None
         if effective_access == "send":
-            result = call_codex_chat(root, store, branch_id, prompt, progress=progress)
+            result = call_codex_chat(
+                root,
+                store,
+                branch_id,
+                prompt,
+                progress=progress,
+                output_schema=output_schema,
+            )
         else:
-            result = call_codex_history_chat(root, store, branch_id, prompt, progress=progress)
+            result = call_codex_history_chat(
+                root,
+                store,
+                branch_id,
+                prompt,
+                progress=progress,
+                output_schema=output_schema,
+            )
         text = str(result.get("assistant") or "").strip()
-        marker_stop = "[[SEQUENCE_STOP]]" in text
-        text = text.replace("[[SEQUENCE_STOP]]", "").replace("[[SEQUENCE_CONTINUE]]", "").strip()
+        evaluation = None
+        evaluation_valid = False
+        should_stop = False
+        if order == 2:
+            evaluator_rounds += 1
+            evaluation, evaluation_valid = normalize_sequence_evaluation(
+                result.get("sequenceEvaluation"),
+                acceptance_criteria,
+            )
+            last_evaluation = evaluation
+            pending_required_changes = list(evaluation["requiredChanges"])
+            should_stop = sequence_evaluation_allows_stop(
+                evaluation,
+                valid=evaluation_valid,
+                evaluator_rounds=evaluator_rounds,
+                minimum_evaluator_rounds=minimum_evaluator_rounds,
+                acceptance_criteria=acceptance_criteria,
+            )
         store.append_history(
             branch_id,
             "assistant",
@@ -6381,13 +6588,32 @@ def run_sequence_room_turn(
                 },
                 "sequenceReply": reply_index + 1,
                 "sequenceAccessMode": effective_access,
+                **(
+                    {
+                        "sequenceEvaluation": evaluation,
+                        "sequenceEvaluationValid": evaluation_valid,
+                        "sequenceEvaluatorRound": evaluator_rounds,
+                    }
+                    if order == 2
+                    else {}
+                ),
             },
         )
         emit_progress(progress, f"Sequence reply {reply_index + 1} saved")
-        if order == 2 and marker_stop:
+        if order == 2:
+            emit_progress(
+                progress,
+                f"Sequence evaluation {evaluator_rounds}: "
+                f"{'complete' if should_stop else 'continue'}",
+            )
+        if should_stop:
             stopped = True
-            stop_reason = "Agent 2 marked the sequence complete."
+            stop_reason = (
+                f"Harness accepted Agent 2's evaluation after {evaluator_rounds} evaluator rounds."
+            )
             break
+    if not stopped:
+        stop_reason = "Maximum agent replies reached before the completion criteria passed."
     turn_commit = internal_git_commit_turn(
         store,
         kind="sequence-room-turn",
@@ -6400,6 +6626,9 @@ def run_sequence_room_turn(
             "stopped": stopped,
             "stopReason": stop_reason,
             "runMode": run_mode,
+            "evaluatorRounds": evaluator_rounds,
+            "minimumEvaluatorRounds": minimum_evaluator_rounds,
+            "lastEvaluation": last_evaluation,
         },
     )
     payload = branch_payload(store, branch_id)
@@ -6409,6 +6638,9 @@ def run_sequence_room_turn(
         "stopReason": stop_reason,
         "maxAgentReplies": maximum,
         "runMode": run_mode,
+        "evaluatorRounds": evaluator_rounds,
+        "minimumEvaluatorRounds": minimum_evaluator_rounds,
+        "lastEvaluation": last_evaluation,
     }
     return payload
 
@@ -8865,8 +9097,21 @@ def make_handler(
                 name = str(body.get("name") or "")
                 title = str(body.get("title") or name)
                 maximum = coerce_positive_int(body.get("maxAgentReplies"), 6)
+                acceptance_criteria = [
+                    str(item) for item in body.get("acceptanceCriteria", []) if str(item).strip()
+                ]
+                minimum_evaluator_rounds = coerce_positive_int(body.get("minimumEvaluatorRounds"), 2)
                 try:
-                    store.create_sequence_room(branches, name, title, prompts, access_modes, maximum)
+                    store.create_sequence_room(
+                        branches,
+                        name,
+                        title,
+                        prompts,
+                        access_modes,
+                        maximum,
+                        acceptance_criteria,
+                        minimum_evaluator_rounds,
+                    )
                     payload = branch_payload(store, name)
                     payload["turnCommit"] = internal_git_commit_turn(
                         store,
@@ -8874,7 +9119,11 @@ def make_handler(
                         actor="user",
                         summary=f"Create sequence room {name}",
                         branch_id=name,
-                        metadata={"sourceBranches": branches, "maxAgentReplies": maximum},
+                        metadata={
+                            "sourceBranches": branches,
+                            "maxAgentReplies": maximum,
+                            "minimumEvaluatorRounds": minimum_evaluator_rounds,
+                        },
                     )
                     self.send_json(payload)
                 except (ValueError, SystemExit) as exc:
@@ -8910,6 +9159,21 @@ def make_handler(
                         update_snapshot=bool(body.get("updateSnapshot")),
                         system_prompt=str(body.get("systemPrompt")) if "systemPrompt" in body else None,
                         access_mode=str(body.get("accessMode")) if "accessMode" in body else None,
+                        acceptance_criteria=(
+                            [str(item) for item in body.get("acceptanceCriteria", [])]
+                            if "acceptanceCriteria" in body
+                            else None
+                        ),
+                        minimum_evaluator_rounds=(
+                            int(body.get("minimumEvaluatorRounds") or 0)
+                            if "minimumEvaluatorRounds" in body
+                            else None
+                        ),
+                        default_max_agent_replies=(
+                            int(body.get("maxAgentReplies") or 0)
+                            if "maxAgentReplies" in body
+                            else None
+                        ),
                     )
                     payload = branch_payload(store, branch_id)
                     payload["participant"] = participant
