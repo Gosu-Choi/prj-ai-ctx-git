@@ -6238,6 +6238,65 @@ def call_codex_context_chat(
         return parsed
 
 
+def call_codex_prompt(
+    root: Path,
+    prompt: str,
+    *,
+    writable: bool,
+    progress: ProgressCallback | None = None,
+    output_schema: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    emit_progress(progress, "Checking Codex login")
+    status = codex_login_status(root)
+    if not status["ok"]:
+        raise RuntimeError(status["message"])
+    config = read_llm_config(root).get("codex", {})
+    timeout_seconds = coerce_positive_int(config.get("timeoutSeconds"), 900)
+    with tempfile.TemporaryDirectory(prefix="ctxgit-codex-raw-") as tmp:
+        tmp_path = Path(tmp)
+        schema_path = tmp_path / "output.schema.json"
+        output_path = tmp_path / "last-message.txt"
+        write_text(schema_path, json.dumps(output_schema or chat_output_schema(), indent=2))
+        cmd = resolve_codex_command(root)
+        if config.get("webSearch") is not False:
+            cmd.append("--search")
+        cmd.extend(["--ask-for-approval", "never", "exec"])
+        if progress:
+            cmd.append("--json")
+        cmd.extend([
+            "--cd", str(root),
+            "--sandbox", codex_sandbox_mode(config) if writable else "read-only",
+            "--output-schema", str(schema_path),
+            "--output-last-message", str(output_path),
+        ])
+        model = str(config.get("model") or "gpt-5.5").strip()
+        if model:
+            cmd.extend(["--model", model])
+        cmd.append("-")
+        try:
+            emit_progress(progress, "Codex is working")
+            if progress:
+                completed = run_process_with_progress(
+                    cmd, root, timeout_seconds, progress, stdin_text=prompt
+                )
+            else:
+                completed = subprocess.run(
+                    cmd, cwd=root, check=False, text=True, encoding="utf-8",
+                    errors="replace", input=prompt, capture_output=True,
+                    timeout=timeout_seconds,
+                )
+        except subprocess.TimeoutExpired as exc:
+            raise ChatTimeoutError(f"Codex timed out after {timeout_seconds} seconds") from exc
+        raw = read_text(output_path).strip()
+        if completed.returncode != 0 and not raw:
+            detail = completed.stdout.strip() or completed.stderr.strip()
+            raise RuntimeError(detail or f"Codex failed with exit code {completed.returncode}")
+        parsed = parse_chat_result(raw or completed.stdout)
+        parsed["provider"] = "codex"
+        parsed["command"] = cmd
+        return parsed
+
+
 def parse_claude_result(raw: str) -> dict[str, Any]:
     try:
         payload = json.loads(raw.strip())
@@ -6394,6 +6453,28 @@ def call_provider_history_chat(provider: str, *args: Any, **kwargs: Any) -> dict
         return call_claude_history_chat(*args, **kwargs)
     if provider == "codex":
         return call_codex_history_chat(*args, **kwargs)
+    raise RuntimeError(f"Unsupported chat provider: {provider}")
+
+
+def call_provider_prompt(
+    provider: str,
+    root: Path,
+    prompt: str,
+    *,
+    writable: bool,
+    progress: ProgressCallback | None = None,
+    output_schema: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if provider == "claude":
+        return call_claude_prompt(
+            root, prompt, cwd=root, writable=writable,
+            progress=progress, output_schema=output_schema,
+        )
+    if provider == "codex":
+        return call_codex_prompt(
+            root, prompt, writable=writable,
+            progress=progress, output_schema=output_schema,
+        )
     raise RuntimeError(f"Unsupported chat provider: {provider}")
 
 
@@ -6842,6 +6923,103 @@ def sequence_evaluation_allows_stop(
     )
 
 
+def sequence_history_text(
+    records: list[dict[str, Any]],
+    budget_chars: int,
+) -> str:
+    selected = select_history_for_budget(records, budget_chars)
+    omitted = max(0, len(records) - len(selected))
+    lines = [format_history_record(item) for item in selected]
+    if omitted:
+        lines.insert(0, f"- [ctxgit omitted {omitted} older records to fit the sequence context budget]")
+    return "\n".join(lines) or "(none)"
+
+
+def build_sequence_agent_prompt(
+    store: ContextStore,
+    branch_id: str,
+    participant: dict[str, Any],
+    *,
+    reply_index: int,
+    maximum: int,
+    stop_decider: int | None,
+    evaluator_rounds: int,
+    minimum_evaluator_rounds: int,
+    acceptance_criteria: list[str],
+    pending_required_changes: list[str],
+) -> str:
+    order = int(participant.get("order") or 0)
+    source_id = str(participant.get("sourceBranch") or "")
+    room_paths = store.branch_paths(branch_id)
+    archive_root = room_paths.archives / source_id
+    archive_history = store.read_history_file(archive_root / "history.jsonl")
+    room_history = list(store.iter_history(branch_id))
+    config = active_llm_provider_config(store.root)
+    total_budget = coerce_positive_int(
+        config.get("sequenceContextBudgetCharacters") or config.get("contextBudgetCharacters"),
+        DEFAULT_CONTEXT_BUDGET_CHARS,
+    )
+    source_context_budget = max(8000, int(total_budget * 0.22))
+    source_history_budget = max(14000, int(total_budget * 0.42))
+    room_history_budget = max(12000, int(total_budget * 0.30))
+    room_context_budget = max(2000, int(total_budget * 0.06))
+    evaluator_instruction = (
+        f"You are Agent {stop_decider}, the evaluator. Give your substantive response in `assistant`, then "
+        "return `sequenceEvaluation` using the required output schema. The harness, not you, "
+        "makes the final stop decision. Use decision `complete` only when every acceptance "
+        "criterion passes and requiredChanges is empty. Any change you ask another agent to make "
+        "must appear in requiredChanges; optionalSuggestions must contain only improvements "
+        "that are genuinely unnecessary for completion. Do not emit textual stop markers.\n"
+        f"Evaluator round: {evaluator_rounds + 1}. The harness requires at least "
+        f"{minimum_evaluator_rounds} evaluator rounds before completion.\n"
+        "Acceptance criteria, whose exact text must be used as each criteria.name:\n"
+        + "\n".join(f"- {criterion}" for criterion in acceptance_criteria)
+        + "\nRequired changes from your previous evaluation that another agent was expected to address:\n"
+        + (
+            "\n".join(f"- {change}" for change in pending_required_changes)
+            if pending_required_changes
+            else "- None."
+        )
+    )
+    participant_instruction = (
+        (
+            f"Respond with your next contribution. If Agent {stop_decider} previously requested changes, "
+            "address them explicitly. Do not emit sequence stop markers."
+        )
+        if stop_decider is not None
+        else "Respond with your contribution. This room has no evaluator and will run for one cycle."
+    )
+    return "\n".join([
+        "You are one participant in a ctxgit sequence room.",
+        f"You are Agent {order}. Speak only as Agent {order}; do not write another agent's response.",
+        "Use only your private archived source context/history and this room's conversation supplied below.",
+        "Do not infer or load other branches unless the user explicitly asks you to inspect one.",
+        "Your persistent role instruction follows and must be obeyed on every reply:",
+        "<persistent_system_prompt>",
+        str(participant.get("systemPrompt") or "(no additional role prompt)"),
+        "</persistent_system_prompt>",
+        "",
+        "Your private source-branch snapshot context:",
+        "<source_context>",
+        truncate_middle(read_text(archive_root / "context.md"), source_context_budget),
+        "</source_context>",
+        "<source_history>",
+        sequence_history_text(archive_history, source_history_budget),
+        "</source_history>",
+        "",
+        "Sequence room context:",
+        "<room_context>",
+        truncate_middle(read_text(room_paths.context), room_context_budget),
+        "</room_context>",
+        "<room_history>",
+        sequence_history_text(room_history, room_history_budget),
+        "</room_history>",
+        "",
+        f"Current reply number: {reply_index + 1} of at most {maximum}.",
+        evaluator_instruction if stop_decider is not None and order == stop_decider else participant_instruction,
+    ])
+
+
 def run_sequence_room_turn(
     root: Path,
     store: ContextStore,
@@ -6897,7 +7075,6 @@ def run_sequence_room_turn(
         user_message,
         extra={"turnId": run_id, "mode": "sequence-room", "sequenceRunMode": run_mode},
     )
-    room_paths = store.branch_paths(branch_id)
     stopped = False
     stop_reason = ""
     evaluator_rounds = 0
@@ -6907,66 +7084,18 @@ def run_sequence_room_turn(
         order = speaking_order[reply_index % len(speaking_order)]
         participant = participants_by_order[order]
         source_id = str(participant.get("sourceBranch") or "")
-        archive_root = room_paths.archives / source_id
-        archive_history = store.read_history_file(archive_root / "history.jsonl")
-        room_history = list(store.iter_history(branch_id))
         emit_progress(progress, f"Agent {order} ({source_id}) is responding")
-        prompt = "\n".join(
-            [
-                "You are one participant in a ctxgit sequence room.",
-                f"You are Agent {order}. Speak only as Agent {order}; do not write the other agent's response.",
-                "Your persistent role instruction follows and must be obeyed on every reply:",
-                "<persistent_system_prompt>",
-                str(participant.get("systemPrompt") or "(no additional role prompt)"),
-                "</persistent_system_prompt>",
-                "",
-                "Your private source-branch snapshot context:",
-                "<source_context>",
-                read_text(archive_root / "context.md"),
-                "</source_context>",
-                "<source_history>",
-                "\n".join(format_history_record(item) for item in archive_history[-80:]),
-                "</source_history>",
-                "",
-                "Sequence room context:",
-                "<room_context>",
-                read_text(room_paths.context),
-                "</room_context>",
-                "<room_history>",
-                "\n".join(format_history_record(item) for item in room_history[-80:]),
-                "</room_history>",
-                "",
-                f"Current reply number: {reply_index + 1} of at most {maximum}.",
-                f"Original user request: {user_message}",
-                "",
-                (
-                    f"You are Agent {stop_decider}, the evaluator. Give your substantive response in `assistant`, then "
-                    "return `sequenceEvaluation` using the required output schema. The harness, not you, "
-                    "makes the final stop decision. Use decision `complete` only when every acceptance "
-                    "criterion passes and requiredChanges is empty. Any change you ask another agent to make "
-                    "must appear in requiredChanges; optionalSuggestions must contain only improvements "
-                    "that are genuinely unnecessary for completion. Do not emit textual stop markers.\n"
-                    f"Evaluator round: {evaluator_rounds + 1}. The harness requires at least "
-                    f"{minimum_evaluator_rounds} evaluator rounds before completion.\n"
-                    "Acceptance criteria, whose exact text must be used as each criteria.name:\n"
-                    + "\n".join(f"- {criterion}" for criterion in acceptance_criteria)
-                    + "\nRequired changes from your previous evaluation that Agent 1 was expected to address:\n"
-                    + (
-                        "\n".join(f"- {change}" for change in pending_required_changes)
-                        if pending_required_changes
-                        else "- None."
-                    )
-                    if stop_decider is not None and order == stop_decider
-                    else (
-                        (
-                            f"Respond with your next contribution. If Agent {stop_decider} previously requested changes, "
-                            "address them explicitly. Do not emit sequence stop markers."
-                            if stop_decider is not None
-                            else "Respond with your contribution. This room has no evaluator and will run for one cycle."
-                        )
-                    )
-                ),
-            ]
+        prompt = build_sequence_agent_prompt(
+            store,
+            branch_id,
+            participant,
+            reply_index=reply_index,
+            maximum=maximum,
+            stop_decider=stop_decider,
+            evaluator_rounds=evaluator_rounds,
+            minimum_evaluator_rounds=minimum_evaluator_rounds,
+            acceptance_criteria=acceptance_criteria,
+            pending_required_changes=pending_required_changes,
         )
         participant_access = str(participant.get("accessMode") or "info-chat")
         effective_access = "info-chat" if run_mode == "info-chat" else participant_access
@@ -6975,26 +7104,14 @@ def run_sequence_room_turn(
             if stop_decider is not None and order == stop_decider
             else None
         )
-        if effective_access == "send":
-            result = call_provider_chat(
-                selected_provider,
-                root,
-                store,
-                branch_id,
-                prompt,
-                progress=progress,
-                output_schema=output_schema,
-            )
-        else:
-            result = call_provider_history_chat(
-                selected_provider,
-                root,
-                store,
-                branch_id,
-                prompt,
-                progress=progress,
-                output_schema=output_schema,
-            )
+        result = call_provider_prompt(
+            selected_provider,
+            root,
+            prompt,
+            writable=effective_access == "send",
+            progress=progress,
+            output_schema=output_schema,
+        )
         text = str(result.get("assistant") or "").strip()
         evaluation = None
         evaluation_valid = False

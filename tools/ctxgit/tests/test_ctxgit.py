@@ -880,11 +880,9 @@ class CtxgitTest(unittest.TestCase):
                     },
                 ]
             )
-            original_call = ctxgit.call_codex_history_chat
-            original_send = ctxgit.call_codex_chat
+            original_call = ctxgit.call_provider_prompt
             progress_events = []
-            ctxgit.call_codex_history_chat = lambda *args, **kwargs: next(replies)
-            ctxgit.call_codex_chat = lambda *args, **kwargs: next(replies)
+            ctxgit.call_provider_prompt = lambda *args, **kwargs: next(replies)
             try:
                 result = ctxgit.run_sequence_room_turn(
                     root,
@@ -895,8 +893,7 @@ class CtxgitTest(unittest.TestCase):
                     progress=progress_events.append,
                 )
             finally:
-                ctxgit.call_codex_history_chat = original_call
-                ctxgit.call_codex_chat = original_send
+                ctxgit.call_provider_prompt = original_call
 
             history = result["history"]
             self.assertEqual([item["role"] for item in history], ["user", "assistant", "assistant", "assistant", "assistant"])
@@ -1052,12 +1049,12 @@ class CtxgitTest(unittest.TestCase):
                     {"assistant": "Writer revision again"},
                 ]
             )
-            original_call = ctxgit.call_codex_history_chat
-            ctxgit.call_codex_history_chat = lambda *args, **kwargs: next(replies)
+            original_call = ctxgit.call_provider_prompt
+            ctxgit.call_provider_prompt = lambda *args, **kwargs: next(replies)
             try:
                 result = ctxgit.run_sequence_room_turn(root, store, "room", "Prepare copy", max_agent_replies=4)
             finally:
-                ctxgit.call_codex_history_chat = original_call
+                ctxgit.call_provider_prompt = original_call
 
             speakers = [item["sequenceSpeaker"]["order"] for item in result["history"] if item["role"] == "assistant"]
             self.assertEqual(speakers, [3, 1, 3, 1])
@@ -1085,18 +1082,51 @@ class CtxgitTest(unittest.TestCase):
                 update_evaluator=True,
             )
             replies = iter([{"assistant": "two"}, {"assistant": "one"}])
-            original_call = ctxgit.call_codex_history_chat
-            ctxgit.call_codex_history_chat = lambda *args, **kwargs: next(replies)
+            original_call = ctxgit.call_provider_prompt
+            ctxgit.call_provider_prompt = lambda *args, **kwargs: next(replies)
             try:
                 result = ctxgit.run_sequence_room_turn(root, store, "room", "Go", max_agent_replies=20)
             finally:
-                ctxgit.call_codex_history_chat = original_call
+                ctxgit.call_provider_prompt = original_call
 
             speakers = [item["sequenceSpeaker"]["order"] for item in result["history"] if item["role"] == "assistant"]
             self.assertEqual(speakers, [2, 1])
             self.assertIsNone(result["sequenceRun"]["stopDecider"])
             self.assertEqual(result["sequenceRun"]["maxAgentReplies"], 2)
             self.assertIn("one speaking-order cycle", result["sequenceRun"]["stopReason"])
+
+    def test_sequence_prompt_is_budgeted_and_excludes_other_private_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("one")
+            store.create_branch("two")
+            for index in range(80):
+                store.append_history("one", "assistant", f"ONE-{index}-" + ("a" * 1200))
+                store.append_history("two", "assistant", f"TWO-{index}-" + ("b" * 1200))
+            store.create_sequence_room(
+                ["one", "two"], "room", "Room", ["", ""],
+                ["info-chat", "info-chat"], 4,
+            )
+            store.append_history("room", "user", "Current room request")
+            participant = store.sequence_room_config("room")["participants"][0]
+            prompt = ctxgit.build_sequence_agent_prompt(
+                store,
+                "room",
+                participant,
+                reply_index=0,
+                maximum=4,
+                stop_decider=None,
+                evaluator_rounds=0,
+                minimum_evaluator_rounds=2,
+                acceptance_criteria=ctxgit.DEFAULT_SEQUENCE_ACCEPTANCE_CRITERIA,
+                pending_required_changes=[],
+            )
+            self.assertLess(len(prompt), 70000)
+            self.assertIn("ONE-79", prompt)
+            self.assertNotIn("ONE-0-", prompt)
+            self.assertNotIn("TWO-79", prompt)
+            self.assertEqual(prompt.count("Current room request"), 1)
 
     def test_empty_archive_directory_does_not_add_archive_prompt_section(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
