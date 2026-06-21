@@ -1835,6 +1835,24 @@ class CtxgitTest(unittest.TestCase):
             self.assertEqual(reloaded["status"], "done")
             self.assertEqual(reloaded["payload"], {"ok": True})
 
+    def test_job_store_cancel_marks_job_and_signals_work(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ctxgit.ContextStore(root).init()
+            jobs = ctxgit.JobStore(ctxgit.ProjectState(root))
+
+            def work(progress):
+                while not progress.cancelled():
+                    time.sleep(0.01)
+                raise ctxgit.JobCancelledError("canceled")
+
+            started = jobs.create("unit", work)
+            canceled = jobs.cancel(started["id"], root=root)
+            self.assertEqual(canceled["status"], "canceled")
+            self.assertEqual(canceled["error"], "canceled")
+            time.sleep(0.05)
+            self.assertEqual(jobs.snapshot(started["id"], root=root)["status"], "canceled")
+
     def test_job_store_marks_persisted_running_job_as_restarted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2434,6 +2452,14 @@ class CtxgitTest(unittest.TestCase):
 
             self.assertEqual(completed.returncode, 0)
             self.assertIn("LEN=", completed.stdout)
+
+    def test_claude_read_only_tools_include_web_without_write_tools(self) -> None:
+        tools = ctxgit.claude_tools(writable=False, web_search=True).split(",")
+        self.assertIn("WebSearch", tools)
+        self.assertIn("WebFetch", tools)
+        self.assertNotIn("Edit", tools)
+        self.assertNotIn("Write", tools)
+        self.assertNotIn("Bash", tools)
 
     def test_codex_chat_adds_only_approved_external_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

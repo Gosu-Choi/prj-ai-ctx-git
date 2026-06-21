@@ -146,6 +146,10 @@ class ChatTimeoutError(RuntimeError):
     pass
 
 
+class JobCancelledError(RuntimeError):
+    pass
+
+
 class ResearchExecutionError(RuntimeError):
     pass
 
@@ -5919,6 +5923,18 @@ def run_process_with_progress(
     last_progress = ""
     startup_warnings_seen: set[str] = set()
     while len(closed) < 2:
+        cancelled = getattr(progress, "cancelled", None)
+        if callable(cancelled) and cancelled():
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            else:
+                process.kill()
+            raise JobCancelledError("Job canceled by user.")
         if time.monotonic() > deadline:
             process.kill()
             raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout_seconds)
@@ -6268,13 +6284,15 @@ def call_claude_prompt(
     timeout_seconds = coerce_positive_int(config.get("timeoutSeconds"), 900)
     schema = output_schema or chat_output_schema()
     cmd = resolve_claude_command(root)
+    tools = claude_tools(writable=writable, web_search=config.get("webSearch") is not False)
     cmd.extend([
         "-p",
         "--output-format", "json",
         "--json-schema", json.dumps(schema, ensure_ascii=False, separators=(",", ":")),
         "--no-session-persistence",
-        "--permission-mode", "auto" if writable else "dontAsk",
-        "--tools", claude_tools(writable=writable, web_search=config.get("webSearch") is not False),
+        "--permission-mode", "auto" if writable else "bypassPermissions",
+        "--tools", tools,
+        "--allowedTools", tools,
         "--append-system-prompt",
         (
             "You are running inside ctxgit. Do not push, publish, deploy, or modify files outside "
@@ -6289,10 +6307,15 @@ def call_claude_prompt(
         cmd.extend(["--add-dir", str(path)])
     try:
         emit_progress(progress, "Claude Code is working")
-        completed = subprocess.run(
-            cmd, cwd=cwd, check=False, text=True, encoding="utf-8", errors="replace",
-            input=prompt, capture_output=True, timeout=timeout_seconds,
-        )
+        if progress:
+            completed = run_process_with_progress(
+                cmd, cwd, timeout_seconds, progress, stdin_text=prompt
+            )
+        else:
+            completed = subprocess.run(
+                cmd, cwd=cwd, check=False, text=True, encoding="utf-8", errors="replace",
+                input=prompt, capture_output=True, timeout=timeout_seconds,
+            )
     except subprocess.TimeoutExpired as exc:
         raise ChatTimeoutError(f"Claude Code timed out after {timeout_seconds} seconds") from exc
     raw = completed.stdout.strip()
@@ -8434,12 +8457,15 @@ class JobStore:
 
         def progress(message: str) -> None:
             self.add_event(job_id, message)
+        progress.cancelled = lambda: job.get("cancelRequested") is True  # type: ignore[attr-defined]
 
         def target() -> None:
             try:
                 progress("시작됨")
                 payload = work(progress)
                 with self._lock:
+                    if job.get("cancelRequested") is True:
+                        return
                     job["status"] = "done"
                     job["payload"] = payload
                     job["updatedAt"] = utc_now()
@@ -8447,6 +8473,8 @@ class JobStore:
                     self.persist_locked(job)
             except ChatTimeoutError as exc:
                 self.fail(job_id, "timeout", str(exc))
+            except JobCancelledError:
+                self.cancel(job_id)
             except SystemExit as exc:
                 self.fail(job_id, "failed", f"ctxgit command exited with code {int(exc.code or 1)}")
             except Exception as exc:
@@ -8454,6 +8482,28 @@ class JobStore:
 
         threading.Thread(target=target, daemon=True).start()
         return self.snapshot(job_id)
+
+    def cancel(self, job_id: str, root: Path | None = None) -> dict[str, Any]:
+        with self._lock:
+            job = self._jobs.get(job_id) or self.load_locked(job_id, root=root)
+            if not job:
+                return {"error": "job_not_found", "message": f"job not found: {job_id}"}
+            if root and Path(str(job.get("projectPath") or "")).expanduser().resolve() != root.resolve():
+                return {"error": "job_not_found", "message": f"job not found: {job_id}"}
+            if job.get("status") != "running":
+                return self.public_job(job)
+            now = utc_now()
+            job["cancelRequested"] = True
+            job["status"] = "canceled"
+            job["error"] = "canceled"
+            job["message"] = "Job canceled by user."
+            job["updatedAt"] = now
+            if job.get("runner") == "worker":
+                job["workerStatus"] = "canceled"
+            job.setdefault("events", []).append({"message": "Canceled by user.", "createdAt": now})
+            self._jobs[job_id] = job
+            self.persist_locked(job)
+        return self.snapshot(job_id, root=root)
 
     def create_worker(self, kind: str, request: dict[str, Any], root: Path | None = None) -> dict[str, Any]:
         job_id = self.new_job_id()
@@ -8552,6 +8602,8 @@ class JobStore:
                 return {"error": "job_not_found", "message": f"job not found: {job_id}"}
             if job.get("workerId") and job.get("workerId") != worker_id:
                 return {"error": "worker_mismatch", "message": "job is claimed by another worker"}
+            if job.get("status") == "canceled":
+                return self.public_job(job)
             now = utc_now()
             if error:
                 job["status"] = "failed"
@@ -8584,6 +8636,8 @@ class JobStore:
         with self._lock:
             job = self._jobs.get(job_id)
             if not job:
+                return
+            if job.get("status") == "canceled":
                 return
             job["status"] = "failed"
             job["error"] = error
@@ -9208,6 +9262,14 @@ def make_handler(
                 status = 404 if payload.get("error") == "job_not_found" else 409 if payload.get("error") else 200
                 self.send_json(payload, status=status)
                 return
+            if parsed.path == "/api/worker/job/status":
+                if not self.worker_authorized(body):
+                    self.send_json({"error": "unauthorized", "message": "worker token is invalid"}, status=401)
+                    return
+                job_id = str(body.get("jobId") or "")
+                payload = jobs.snapshot(job_id)
+                self.send_json(payload, status=404 if payload.get("error") == "job_not_found" else 200)
+                return
             if parsed.path == "/api/worker/job/complete":
                 if not self.worker_authorized(body):
                     self.send_json({"error": "unauthorized", "message": "worker token is invalid"}, status=401)
@@ -9224,6 +9286,9 @@ def make_handler(
                             job = jobs.snapshot(job_id)
                             if job.get("error"):
                                 self.send_json(job, status=404)
+                                return
+                            if job.get("status") == "canceled":
+                                self.send_json(job)
                                 return
                             project_path = str(job.get("projectPath") or "")
                             if not project_path:
@@ -9298,6 +9363,18 @@ def make_handler(
                 except subprocess.CalledProcessError as exc:
                     detail = (exc.stderr or exc.stdout or "").strip()
                     self.send_json({"error": "git_init_failed", "message": detail or str(exc)}, status=500)
+                return
+            if parsed.path == "/api/job/cancel":
+                job_id = str(body.get("id") or "")
+                if not job_id:
+                    self.send_json({"error": "job_id_required"}, status=400)
+                    return
+                try:
+                    project_root = self.request_project_root()
+                except ValueError:
+                    project_root = None
+                payload = jobs.cancel(job_id, root=project_root)
+                self.send_json(payload, status=404 if payload.get("error") == "job_not_found" else 200)
                 return
             try:
                 root, store = self.request_context(require_initialized=True)
@@ -10320,6 +10397,27 @@ def run_worker_claimed_job(
 
         def progress(message: str) -> None:
             post_event(message)
+        cancel_state = {"checkedAt": 0.0, "canceled": False}
+
+        def worker_cancelled() -> bool:
+            now = time.monotonic()
+            if now - cancel_state["checkedAt"] < 1.0:
+                return bool(cancel_state["canceled"])
+            cancel_state["checkedAt"] = now
+            try:
+                status = worker_json_request(
+                    server,
+                    "/api/worker/job/status",
+                    token,
+                    {"jobId": job_id, "workerId": worker_id},
+                    timeout=10,
+                )
+                cancel_state["canceled"] = status.get("status") == "canceled"
+            except Exception:
+                pass
+            return bool(cancel_state["canceled"])
+
+        progress.cancelled = worker_cancelled  # type: ignore[attr-defined]
 
         provider = provider_override or str(request_payload.get("provider") or "codex")
         if provider == "codex-worker":

@@ -2473,21 +2473,21 @@ function updateComposerState() {
   const startingMode = activeKey ? state.startingBranches[activeKey] : "";
   const archived = state.payload?.archived === true;
   const contextMode = state.activeContextChat === true;
-  const disabled = !activeKey || archived || Boolean(running) || Boolean(startingMode);
+  const disabled = !activeKey || archived || Boolean(startingMode);
   els.composer.classList.toggle("context-mode", contextMode);
   els.contextResetButton.hidden = !contextMode;
   els.historyChatButton.hidden = contextMode;
   els.sendButton.disabled = disabled;
   els.contextResetButton.disabled = !contextMode || !activeKey || Boolean(running) || Boolean(startingMode);
   els.historyChatButton.disabled = disabled;
-  els.sequenceRoomUpdateButton.disabled = disabled;
+  els.sequenceRoomUpdateButton.disabled = disabled || Boolean(running);
   const busyMode = running?.mode || startingMode;
-  els.sendButton.textContent = archived ? "Archived" : busyMode === "chat" || busyMode === "context-chat" ? "생각 중" : "Send";
+  els.sendButton.textContent = archived ? "Archived" : running ? "Stop" : "Send";
   els.contextResetButton.textContent = busyMode === "context-chat" ? "Busy" : "Reset";
   els.historyChatButton.textContent = archived
     ? "Archived"
-    : busyMode === "info-chat" || busyMode === "context-chat"
-      ? "Info..."
+    : running
+      ? "Stop"
       : "Info chat";
 }
 
@@ -2534,6 +2534,20 @@ async function startTrackedJob(endpoint, body, { branch, mode, title }) {
   loadWorkerStatus().catch(() => {});
   monitorTrackedJob(remembered.id).catch((error) => handleMonitorError(remembered, error));
   return remembered;
+}
+
+async function cancelTrackedJob(job) {
+  if (!job?.id || job.status !== "running") return;
+  const canceled = await api("/api/job/cancel", {
+    method: "POST",
+    body: JSON.stringify({ id: job.id }),
+  });
+  rememberJob(canceled, { branch: job.branch, mode: job.mode });
+  if (activeChatKey() === job.branch) {
+    renderEventPanel(canceled);
+    hideProgress();
+    updateComposerState();
+  }
 }
 
 function handleMonitorError(job, error) {
@@ -2683,6 +2697,16 @@ async function monitorTrackedJob(jobId) {
                     : "채팅 실패";
         showChatError(`${prefix}: ${remembered.message || "작업 실패"}`);
         hideProgress();
+      }
+      updateComposerState();
+      loadWorkerStatus().catch(() => {});
+      return;
+    }
+    if (remembered.status === "canceled") {
+      renderBranches();
+      if (activeChatKey() === branch) {
+        hideProgress();
+        hideChatError();
       }
       updateComposerState();
       loadWorkerStatus().catch(() => {});
@@ -3948,6 +3972,11 @@ async function sendComposerMessage({ mode }) {
     return;
   }
   const branch = isContextChat ? CONTEXT_CHAT_KEY : state.activeBranch;
+  const runningJob = activeBranchRunningJob(branch);
+  if (runningJob) {
+    await cancelTrackedJob(runningJob);
+    return;
+  }
   const text = els.messageInput.value.trim();
   const stagedFiles = isContextChat ? [] : stagedBranchResources(branch);
   if (!text && !stagedFiles.length) return;
@@ -3955,7 +3984,7 @@ async function sendComposerMessage({ mode }) {
   const isChat = mode === "chat";
   const isResearch = mode === "research";
   const isInfoChat = mode === "info-chat";
-  if (activeBranchRunningJob(branch) || state.startingBranches[branch]) {
+  if (state.startingBranches[branch]) {
     window.alert(
       isContextChat
         ? "Contexts chat에는 이미 실행 중인 작업이 있습니다."
