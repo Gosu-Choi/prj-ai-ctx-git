@@ -95,6 +95,11 @@
         </section>
 
         <section class="sidebar-section">
+          <div class="section-title">Sequence room</div>
+          <button id="sequenceRoomCreateButton" class="wide-button" type="button">Create sequence room</button>
+        </section>
+
+        <section class="sidebar-section">
           <div class="section-title">Git</div>
           <div id="gitSummary" class="git-summary"></div>
           <button id="refreshButton" class="wide-button" type="button">Refresh</button>
@@ -140,6 +145,7 @@
             <div id="activeMeta" class="active-meta"></div>
           </div>
           <div class="tabs" role="tablist">
+            <button id="sequenceRoomUpdateButton" class="event-panel-toggle" type="button" hidden>Update agents</button>
             <button class="tab active" data-tab="chat" type="button">Chat</button>
             <button class="tab" data-tab="report" type="button">Report</button>
             <button class="tab" data-tab="files" type="button">Files</button>
@@ -259,6 +265,38 @@
         </section>
       </main>
     </div>
+
+    <dialog id="sequenceRoomDialog" class="sequence-dialog">
+      <form id="sequenceRoomForm" method="dialog">
+        <h2>Create sequence room</h2>
+        <label>Agent 1 source<select id="sequenceAgent1"></select></label>
+        <label>Agent 1 persistent system prompt<textarea id="sequencePrompt1" rows="5"></textarea></label>
+        <label>Agent 1 permission<select id="sequenceAccess1"><option value="send">Can send and edit project</option><option value="info-chat">Info chat only</option></select></label>
+        <label>Agent 2 source<select id="sequenceAgent2"></select></label>
+        <label>Agent 2 persistent system prompt<textarea id="sequencePrompt2" rows="5"></textarea></label>
+        <label>Agent 2 permission<select id="sequenceAccess2"><option value="send">Can send and edit project</option><option value="info-chat">Info chat only</option></select></label>
+        <label>Room name<input id="sequenceRoomName" required /></label>
+        <label>Maximum agent replies<input id="sequenceMaxReplies" type="number" min="2" max="40" value="6" /></label>
+        <div id="sequenceRoomStatus" class="settings-status"></div>
+        <div class="dialog-actions"><button type="button" onclick="this.closest('dialog').close()">Cancel</button><button id="sequenceRoomSubmit" type="submit">Create</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="sequenceUpdateDialog" class="sequence-dialog sequence-update-dialog">
+      <form id="sequenceUpdateForm" method="dialog">
+        <h2>Update sequence agents</h2>
+        <label>Participant<select id="sequenceUpdateOrder"><option value="1">Agent 1</option><option value="2">Agent 2</option></select></label>
+        <label>Persistent system prompt<textarea id="sequenceUpdatePrompt" rows="6"></textarea></label>
+        <label>Permission<select id="sequenceUpdateAccess"><option value="send">Can send and edit project</option><option value="info-chat">Info chat only</option></select></label>
+        <div class="sequence-compare">
+          <section><h3>Archived snapshot</h3><pre id="sequenceSnapshotView"></pre></section>
+          <section><h3>Current source branch</h3><pre id="sequenceCurrentView"></pre></section>
+        </div>
+        <label class="checkbox-label"><input id="sequenceUpdateSnapshot" type="checkbox" /><span>Update archived snapshot from current branch</span></label>
+        <div id="sequenceUpdateStatus" class="settings-status"></div>
+        <div class="dialog-actions"><button type="button" onclick="this.closest('dialog').close()">Cancel</button><button id="sequenceUpdateSubmit" type="submit">Save update</button></div>
+      </form>
+    </dialog>
 
     <script src="/app.js"></script>
   </body>

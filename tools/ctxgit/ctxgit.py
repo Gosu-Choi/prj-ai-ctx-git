@@ -2999,6 +2999,142 @@ class ContextStore:
             "rewrittenCommits": len(rewritten),
         }
 
+    def create_sequence_room(
+        self,
+        source_ids: list[str],
+        target_id: str,
+        title: str,
+        system_prompts: list[str],
+        access_modes: list[str],
+        max_agent_replies: int,
+    ) -> Path:
+        self.require_initialized()
+        if len(source_ids) != 2 or len(set(source_ids)) != 2:
+            raise ValueError("sequence room requires two distinct source branches")
+        safe_target = validate_id(target_id, "branch")
+        safe_sources = [validate_id(item, "branch") for item in source_ids]
+        if self.branch_paths(safe_target).root.exists():
+            raise ValueError(f"branch already exists: {safe_target}")
+        for source_id in safe_sources:
+            if not self.branch_paths(source_id).root.exists():
+                raise ValueError(f"branch does not exist: {source_id}")
+        if max_agent_replies < 2 or max_agent_replies > 40:
+            raise ValueError("maximum agent replies must be between 2 and 40")
+        self.create_branch_files(safe_target, title=title or f"Sequence: {safe_sources[0]} → {safe_sources[1]}", tags=["sequence-room"])
+        paths = self.branch_paths(safe_target)
+        participants = []
+        for index, source_id in enumerate(safe_sources):
+            archive = self.archive_source_branch(safe_target, source_id)
+            participants.append(
+                {
+                    "order": index + 1,
+                    "sourceBranch": source_id,
+                    "title": archive["title"],
+                    "systemPrompt": str(system_prompts[index] if index < len(system_prompts) else "").strip(),
+                    "accessMode": (
+                        str(access_modes[index] if index < len(access_modes) else "info-chat").strip()
+                        if str(access_modes[index] if index < len(access_modes) else "info-chat").strip() in {"send", "info-chat"}
+                        else "info-chat"
+                    ),
+                    "snapshot": archive,
+                    "snapshotUpdatedAt": utc_now(),
+                }
+            )
+        meta = load_json(paths.meta)
+        meta["kind"] = "sequence-room"
+        meta["parents"] = safe_sources
+        meta["sequenceRoom"] = {
+            "createdAt": utc_now(),
+            "participants": participants,
+            "defaultMaxAgentReplies": max_agent_replies,
+            "stopDecider": 2,
+        }
+        dump_json(paths.meta, meta)
+        write_text(
+            paths.context,
+            f"# {title or safe_target}\n\n## Sequence Room\n\n"
+            f"- Agent 1: `{safe_sources[0]}`\n- Agent 2: `{safe_sources[1]}`\n"
+            f"- Maximum agent replies: {max_agent_replies}\n- Stop decider: Agent 2\n",
+        )
+        write_text(paths.history, "")
+        self.write_index()
+        return paths.root
+
+    def sequence_room_config(self, branch_id: str) -> dict[str, Any]:
+        meta = load_json(self.branch_paths(branch_id).meta)
+        config = meta.get("sequenceRoom")
+        if meta.get("kind") != "sequence-room" or not isinstance(config, dict):
+            raise ValueError("branch is not a sequence room")
+        return config
+
+    def update_sequence_participant(
+        self,
+        branch_id: str,
+        order: int,
+        *,
+        update_snapshot: bool = False,
+        system_prompt: str | None = None,
+        access_mode: str | None = None,
+    ) -> dict[str, Any]:
+        paths = self.branch_paths(branch_id)
+        meta = load_json(paths.meta)
+        config = self.sequence_room_config(branch_id)
+        participants = config.get("participants") if isinstance(config.get("participants"), list) else []
+        participant = next((item for item in participants if int(item.get("order") or 0) == order), None)
+        if not isinstance(participant, dict):
+            raise ValueError("sequence participant not found")
+        source_id = str(participant.get("sourceBranch") or "")
+        if update_snapshot:
+            source_paths = self.branch_paths(source_id)
+            if not source_paths.root.exists():
+                raise ValueError(f"source branch does not exist: {source_id}")
+            archive_root = paths.archives / source_id
+            if archive_root.exists():
+                shutil.rmtree(archive_root)
+            participant["snapshot"] = self.archive_source_branch(branch_id, source_id)
+            participant["snapshotUpdatedAt"] = utc_now()
+        if system_prompt is not None:
+            participant["systemPrompt"] = system_prompt.strip()
+            participant["promptUpdatedAt"] = utc_now()
+        if access_mode is not None:
+            normalized_access = access_mode.strip()
+            if normalized_access not in {"send", "info-chat"}:
+                raise ValueError("participant access mode must be send or info-chat")
+            participant["accessMode"] = normalized_access
+        meta["sequenceRoom"] = config
+        dump_json(paths.meta, meta)
+        self.append_history(
+            branch_id,
+            "system",
+            f"Updated sequence participant {order}: {source_id}.",
+            extra={"event": "sequence-participant-updated", "participantOrder": order, "sourceBranch": source_id},
+        )
+        self.touch_branch(branch_id)
+        return participant
+
+    def sequence_participant_comparison(self, branch_id: str, order: int) -> dict[str, Any]:
+        config = self.sequence_room_config(branch_id)
+        participants = config.get("participants") if isinstance(config.get("participants"), list) else []
+        participant = next((item for item in participants if int(item.get("order") or 0) == order), None)
+        if not isinstance(participant, dict):
+            raise ValueError("sequence participant not found")
+        source_id = str(participant.get("sourceBranch") or "")
+        room_paths = self.branch_paths(branch_id)
+        archive_root = room_paths.archives / source_id
+        source_paths = self.branch_paths(source_id)
+        return {
+            "participant": participant,
+            "snapshot": {
+                "context": read_text(archive_root / "context.md"),
+                "history": self.read_history_file(archive_root / "history.jsonl"),
+            },
+            "current": {
+                "exists": source_paths.root.exists(),
+                "context": read_text(source_paths.context) if source_paths.root.exists() else "",
+                "history": self.read_history_file(source_paths.history) if source_paths.root.exists() else [],
+            },
+        }
+
     def read_history_text(self, text: str) -> list[dict[str, Any]]:
         records = []
         for line in text.splitlines():
@@ -3124,6 +3260,8 @@ class ContextStore:
         def is_merge_lineage(meta: dict[str, Any]) -> bool:
             if str(meta.get("forkedFrom") or "").strip() or str(meta.get("clonedFrom") or "").strip():
                 return False
+            if meta.get("kind") == "sequence-room":
+                return False
             return len(merge_source_ids(meta)) > 1
 
         branch_meta: dict[str, dict[str, Any]] = {}
@@ -3194,6 +3332,16 @@ class ContextStore:
                 for source_id in merge_source_ids(meta):
                     add_missing_branch(source_id)
                     add_edge(node_id(source_id), target, "merge", "merge")
+                continue
+            sequence = meta.get("sequenceRoom") if isinstance(meta.get("sequenceRoom"), dict) else {}
+            sequence_participants = sequence.get("participants") if isinstance(sequence.get("participants"), list) else []
+            if sequence_participants:
+                for participant in sequence_participants:
+                    source_id = str(participant.get("sourceBranch") or "").strip()
+                    order = int(participant.get("order") or 0)
+                    if source_id:
+                        add_missing_branch(source_id)
+                        add_edge(node_id(source_id), target, "sequence", f"sequence {order}")
                 continue
             parent = str(meta.get("parent") or "").strip()
             if parent:
@@ -6138,6 +6286,133 @@ def run_merge_branches(
     return payload
 
 
+def run_sequence_room_turn(
+    root: Path,
+    store: ContextStore,
+    branch_id: str,
+    user_message: str,
+    max_agent_replies: int | None = None,
+    run_mode: str = "send",
+    progress: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    config = store.sequence_room_config(branch_id)
+    participants = config.get("participants") if isinstance(config.get("participants"), list) else []
+    if len(participants) != 2:
+        raise ValueError("sequence room must have exactly two participants")
+    maximum = max_agent_replies or coerce_positive_int(config.get("defaultMaxAgentReplies"), 6)
+    maximum = max(2, min(40, maximum))
+    run_id = new_turn_id()
+    if run_mode not in {"send", "info-chat"}:
+        raise ValueError("sequence room run mode must be send or info-chat")
+    store.append_history(
+        branch_id,
+        "user",
+        user_message,
+        extra={"turnId": run_id, "mode": "sequence-room", "sequenceRunMode": run_mode},
+    )
+    room_paths = store.branch_paths(branch_id)
+    stopped = False
+    stop_reason = ""
+    for reply_index in range(maximum):
+        participant = participants[reply_index % 2]
+        order = int(participant.get("order") or (reply_index % 2 + 1))
+        source_id = str(participant.get("sourceBranch") or "")
+        archive_root = room_paths.archives / source_id
+        archive_history = store.read_history_file(archive_root / "history.jsonl")
+        room_history = list(store.iter_history(branch_id))
+        emit_progress(progress, f"Agent {order} ({source_id}) is responding")
+        prompt = "\n".join(
+            [
+                "You are one participant in a ctxgit sequence room.",
+                f"You are Agent {order}. Speak only as Agent {order}; do not write the other agent's response.",
+                "Your persistent role instruction follows and must be obeyed on every reply:",
+                "<persistent_system_prompt>",
+                str(participant.get("systemPrompt") or "(no additional role prompt)"),
+                "</persistent_system_prompt>",
+                "",
+                "Your private source-branch snapshot context:",
+                "<source_context>",
+                read_text(archive_root / "context.md"),
+                "</source_context>",
+                "<source_history>",
+                "\n".join(format_history_record(item) for item in archive_history[-80:]),
+                "</source_history>",
+                "",
+                "Sequence room context:",
+                "<room_context>",
+                read_text(room_paths.context),
+                "</room_context>",
+                "<room_history>",
+                "\n".join(format_history_record(item) for item in room_history[-80:]),
+                "</room_history>",
+                "",
+                f"Current reply number: {reply_index + 1} of at most {maximum}.",
+                f"Original user request: {user_message}",
+                "",
+                (
+                    "You are Agent 2 and the stop decider. End your response with exactly "
+                    "`[[SEQUENCE_STOP]]` when the work is sufficiently complete; otherwise end with "
+                    "`[[SEQUENCE_CONTINUE]]`."
+                    if order == 2
+                    else "Respond with your next contribution. Do not emit sequence stop markers."
+                ),
+            ]
+        )
+        participant_access = str(participant.get("accessMode") or "info-chat")
+        effective_access = "info-chat" if run_mode == "info-chat" else participant_access
+        if effective_access == "send":
+            result = call_codex_chat(root, store, branch_id, prompt, progress=progress)
+        else:
+            result = call_codex_history_chat(root, store, branch_id, prompt, progress=progress)
+        text = str(result.get("assistant") or "").strip()
+        marker_stop = "[[SEQUENCE_STOP]]" in text
+        text = text.replace("[[SEQUENCE_STOP]]", "").replace("[[SEQUENCE_CONTINUE]]", "").strip()
+        store.append_history(
+            branch_id,
+            "assistant",
+            text or "(No response.)",
+            extra={
+                "turnId": run_id,
+                "mode": "sequence-room",
+                "sequenceSpeaker": {
+                    "order": order,
+                    "sourceBranch": source_id,
+                    "title": participant.get("title") or source_id,
+                },
+                "sequenceReply": reply_index + 1,
+                "sequenceAccessMode": effective_access,
+            },
+        )
+        emit_progress(progress, f"Sequence reply {reply_index + 1} saved")
+        if order == 2 and marker_stop:
+            stopped = True
+            stop_reason = "Agent 2 marked the sequence complete."
+            break
+    turn_commit = internal_git_commit_turn(
+        store,
+        kind="sequence-room-turn",
+        actor="user+agents",
+        summary=f"Sequence room turn on {branch_id}",
+        branch_id=branch_id,
+        turn_id=run_id,
+        metadata={
+            "maxAgentReplies": maximum,
+            "stopped": stopped,
+            "stopReason": stop_reason,
+            "runMode": run_mode,
+        },
+    )
+    payload = branch_payload(store, branch_id)
+    payload["turnCommit"] = turn_commit
+    payload["sequenceRun"] = {
+        "stopped": stopped,
+        "stopReason": stop_reason,
+        "maxAgentReplies": maximum,
+        "runMode": run_mode,
+    }
+    return payload
+
+
 def run_approval_decision(
     root: Path,
     store: ContextStore,
@@ -6589,8 +6864,9 @@ def branch_payload(store: ContextStore, branch_id: str) -> dict[str, Any]:
     archived = store.branch_is_archived(paths.meta)
     history_path = relpath(store.root, paths.history)
     context_path = relpath(store.root, paths.context)
-    return {
-        "meta": load_json(paths.meta),
+    meta = load_json(paths.meta)
+    payload = {
+        "meta": meta,
         "archived": archived,
         "paths": {
             "context": context_path,
@@ -6621,6 +6897,9 @@ def branch_payload(store: ContextStore, branch_id: str) -> dict[str, Any]:
             },
         },
     }
+    if meta.get("kind") == "sequence-room":
+        payload["sequenceRoom"] = meta.get("sequenceRoom")
+    return payload
 
 
 def internal_git_status_payload(root: Path) -> dict[str, Any]:
@@ -8082,6 +8361,17 @@ def make_handler(
                 except SystemExit as exc:
                     self.send_json({"error": "branch_not_found"}, status=int(exc.code or 404))
                 return True
+            if parsed.path == "/api/sequence-room/participant":
+                try:
+                    self.send_json(
+                        store.sequence_participant_comparison(
+                            (query.get("branch") or [""])[0],
+                            int((query.get("order") or ["0"])[0]),
+                        )
+                    )
+                except ValueError as exc:
+                    self.send_json({"error": "sequence_participant_failed", "message": str(exc)}, status=400)
+                return True
             if parsed.path == "/api/archive":
                 branch_id = (query.get("branch") or [""])[0]
                 archive_id = (query.get("id") or [""])[0]
@@ -8567,6 +8857,72 @@ def make_handler(
                     self.send_json({"error": "merge_failed", "message": str(exc)}, status=500)
                 except SystemExit as exc:
                     self.send_json({"error": "merge_failed"}, status=int(exc.code or 400))
+                return
+            if parsed.path == "/api/sequence-room/create":
+                branches = [str(item) for item in body.get("branches", []) if str(item).strip()]
+                prompts = [str(item) for item in body.get("systemPrompts", [])]
+                access_modes = [str(item) for item in body.get("accessModes", [])]
+                name = str(body.get("name") or "")
+                title = str(body.get("title") or name)
+                maximum = coerce_positive_int(body.get("maxAgentReplies"), 6)
+                try:
+                    store.create_sequence_room(branches, name, title, prompts, access_modes, maximum)
+                    payload = branch_payload(store, name)
+                    payload["turnCommit"] = internal_git_commit_turn(
+                        store,
+                        kind="sequence-room-create",
+                        actor="user",
+                        summary=f"Create sequence room {name}",
+                        branch_id=name,
+                        metadata={"sourceBranches": branches, "maxAgentReplies": maximum},
+                    )
+                    self.send_json(payload)
+                except (ValueError, SystemExit) as exc:
+                    self.send_json({"error": "sequence_room_create_failed", "message": str(exc)}, status=400)
+                return
+            if parsed.path == "/api/sequence-room/start":
+                branch_id = str(body.get("branch") or "")
+                text = str(body.get("text") or "").strip()
+                maximum_raw = int(body.get("maxAgentReplies") or 0)
+                run_mode = str(body.get("runMode") or "send")
+                if not text:
+                    self.send_json({"error": "message_required"}, status=400)
+                    return
+                def sequence_work(progress: ProgressCallback) -> dict[str, Any]:
+                    return run_sequence_room_turn(
+                        root,
+                        store,
+                        branch_id,
+                        text,
+                        maximum_raw or None,
+                        run_mode=run_mode,
+                        progress=progress,
+                    )
+                self.send_json(jobs.create("sequence-room", sequence_work, root=root), status=202)
+                return
+            if parsed.path == "/api/sequence-room/update":
+                try:
+                    branch_id = str(body.get("branch") or "")
+                    order = int(body.get("order") or 0)
+                    participant = store.update_sequence_participant(
+                        branch_id,
+                        order,
+                        update_snapshot=bool(body.get("updateSnapshot")),
+                        system_prompt=str(body.get("systemPrompt")) if "systemPrompt" in body else None,
+                        access_mode=str(body.get("accessMode")) if "accessMode" in body else None,
+                    )
+                    payload = branch_payload(store, branch_id)
+                    payload["participant"] = participant
+                    payload["turnCommit"] = internal_git_commit_turn(
+                        store,
+                        kind="sequence-room-update",
+                        actor="user",
+                        summary=f"Update sequence participant {order} on {branch_id}",
+                        branch_id=branch_id,
+                    )
+                    self.send_json(payload)
+                except ValueError as exc:
+                    self.send_json({"error": "sequence_room_update_failed", "message": str(exc)}, status=400)
                 return
             if parsed.path == "/api/branch/clone":
                 source_id = str(body.get("source") or "")

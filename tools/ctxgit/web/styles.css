@@ -645,6 +645,74 @@ textarea {
   color: var(--accent);
 }
 
+.sequence-dialog {
+  width: min(760px, calc(100vw - 32px));
+  max-height: calc(100vh - 32px);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0;
+}
+
+.sequence-dialog::backdrop {
+  background: rgb(0 0 0 / 35%);
+}
+
+.sequence-dialog form {
+  display: grid;
+  gap: 12px;
+  padding: 20px;
+}
+
+.sequence-dialog label {
+  display: grid;
+  gap: 5px;
+  font-weight: 650;
+}
+
+.sequence-dialog input,
+.sequence-dialog select,
+.sequence-dialog textarea {
+  width: 100%;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.dialog-actions button {
+  padding: 8px 12px;
+}
+
+.sequence-update-dialog {
+  width: min(1100px, calc(100vw - 32px));
+}
+
+.sequence-compare {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  min-height: 320px;
+}
+
+.sequence-compare section {
+  min-width: 0;
+}
+
+.sequence-compare pre {
+  height: 360px;
+  overflow: auto;
+  white-space: pre-wrap;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 10px;
+  background: #f7f7f2;
+}
+
 .tab-panel {
   display: none;
   min-height: 0;
@@ -1565,6 +1633,15 @@ textarea {
 .graph-edge-merge path {
   stroke: #8b4b96;
   stroke-width: 2.1;
+}
+
+.graph-edge-sequence path {
+  stroke: #8b4fc4;
+  stroke-dasharray: 7 4;
+}
+
+.graph-edge-sequence text {
+  fill: #6e329f;
 }
 
 .graph-edge-fork path {

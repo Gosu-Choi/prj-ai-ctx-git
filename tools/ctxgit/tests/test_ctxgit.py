@@ -820,6 +820,93 @@ class CtxgitTest(unittest.TestCase):
             source_prompt = ctxgit.build_history_chat_prompt(store, "AItrust", "No archives here.")
             self.assertNotIn("Merge archives available for this branch", source_prompt)
 
+    def test_sequence_room_create_run_update_and_graph(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("writer", title="Writer")
+            store.create_branch("critic", title="Critic")
+            store.append_history("writer", "user", "draft background")
+            store.append_history("critic", "user", "evaluation background")
+            ctxgit.write_text(store.branch_paths("writer").context, "# Writer\n\nWrite releases.\n")
+            ctxgit.write_text(store.branch_paths("critic").context, "# Critic\n\nEvaluate releases.\n")
+
+            store.create_sequence_room(
+                ["writer", "critic"],
+                "room",
+                "Press room",
+                ["Write and improve.", "Critique and decide when complete."],
+                ["send", "info-chat"],
+                6,
+            )
+            payload = ctxgit.branch_payload(store, "room")
+            self.assertEqual(payload["meta"]["kind"], "sequence-room")
+            self.assertEqual([item["sourceBranch"] for item in payload["sequenceRoom"]["participants"]], ["writer", "critic"])
+            self.assertEqual(payload["history"], [])
+
+            replies = iter(
+                [
+                    {"assistant": "First draft"},
+                    {"assistant": "Needs revision [[SEQUENCE_CONTINUE]]"},
+                    {"assistant": "Improved draft"},
+                    {"assistant": "Complete [[SEQUENCE_STOP]]"},
+                ]
+            )
+            original_call = ctxgit.call_codex_history_chat
+            original_send = ctxgit.call_codex_chat
+            progress_events = []
+            ctxgit.call_codex_history_chat = lambda *args, **kwargs: next(replies)
+            ctxgit.call_codex_chat = lambda *args, **kwargs: next(replies)
+            try:
+                result = ctxgit.run_sequence_room_turn(
+                    root,
+                    store,
+                    "room",
+                    "Create the release",
+                    max_agent_replies=8,
+                    progress=progress_events.append,
+                )
+            finally:
+                ctxgit.call_codex_history_chat = original_call
+                ctxgit.call_codex_chat = original_send
+
+            history = result["history"]
+            self.assertEqual([item["role"] for item in history], ["user", "assistant", "assistant", "assistant", "assistant"])
+            self.assertEqual([item["sequenceSpeaker"]["order"] for item in history[1:]], [1, 2, 1, 2])
+            self.assertEqual([item["sequenceAccessMode"] for item in history[1:]], ["send", "info-chat", "send", "info-chat"])
+            self.assertTrue(result["sequenceRun"]["stopped"])
+            self.assertEqual(
+                [event for event in progress_events if event.startswith("Sequence reply ")],
+                [
+                    "Sequence reply 1 saved",
+                    "Sequence reply 2 saved",
+                    "Sequence reply 3 saved",
+                    "Sequence reply 4 saved",
+                ],
+            )
+
+            comparison = store.sequence_participant_comparison("room", 1)
+            self.assertIn("Write releases", comparison["snapshot"]["context"])
+            ctxgit.write_text(store.branch_paths("writer").context, "# Writer\n\nUpdated source.\n")
+            store.update_sequence_participant(
+                "room",
+                1,
+                update_snapshot=True,
+                system_prompt="New writer role.",
+                access_mode="info-chat",
+            )
+            updated = store.sequence_participant_comparison("room", 1)
+            self.assertIn("Updated source", updated["snapshot"]["context"])
+            self.assertEqual(updated["participant"]["systemPrompt"], "New writer role.")
+            self.assertEqual(updated["participant"]["accessMode"], "info-chat")
+
+            graph = store.branch_graph_payload()
+            sequence_edges = [edge for edge in graph["edges"] if edge["kind"] == "sequence"]
+            self.assertEqual([(edge["source"], edge["target"], edge["label"]) for edge in sequence_edges], [
+                ("branch:writer", "branch:room", "sequence 1"),
+                ("branch:critic", "branch:room", "sequence 2"),
+            ])
+
     def test_empty_archive_directory_does_not_add_archive_prompt_section(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

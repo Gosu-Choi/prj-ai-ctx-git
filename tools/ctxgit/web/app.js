@@ -27,6 +27,7 @@ const state = {
   eventsVisible: false,
   mergeSelectedBranches: [],
   mergePickerOpen: false,
+  sequenceRenderedReplies: {},
 };
 
 const CONTEXT_CHAT_KEY = "__contexts__";
@@ -150,6 +151,28 @@ const els = {
   contextResetButton: document.querySelector("#contextResetButton"),
   historyChatButton: document.querySelector("#historyChatButton"),
   refreshButton: document.querySelector("#refreshButton"),
+  sequenceRoomCreateButton: document.querySelector("#sequenceRoomCreateButton"),
+  sequenceRoomUpdateButton: document.querySelector("#sequenceRoomUpdateButton"),
+  sequenceRoomDialog: document.querySelector("#sequenceRoomDialog"),
+  sequenceRoomForm: document.querySelector("#sequenceRoomForm"),
+  sequenceAgent1: document.querySelector("#sequenceAgent1"),
+  sequenceAgent2: document.querySelector("#sequenceAgent2"),
+  sequencePrompt1: document.querySelector("#sequencePrompt1"),
+  sequencePrompt2: document.querySelector("#sequencePrompt2"),
+  sequenceAccess1: document.querySelector("#sequenceAccess1"),
+  sequenceAccess2: document.querySelector("#sequenceAccess2"),
+  sequenceRoomName: document.querySelector("#sequenceRoomName"),
+  sequenceMaxReplies: document.querySelector("#sequenceMaxReplies"),
+  sequenceRoomStatus: document.querySelector("#sequenceRoomStatus"),
+  sequenceUpdateDialog: document.querySelector("#sequenceUpdateDialog"),
+  sequenceUpdateForm: document.querySelector("#sequenceUpdateForm"),
+  sequenceUpdateOrder: document.querySelector("#sequenceUpdateOrder"),
+  sequenceUpdatePrompt: document.querySelector("#sequenceUpdatePrompt"),
+  sequenceUpdateAccess: document.querySelector("#sequenceUpdateAccess"),
+  sequenceSnapshotView: document.querySelector("#sequenceSnapshotView"),
+  sequenceCurrentView: document.querySelector("#sequenceCurrentView"),
+  sequenceUpdateSnapshot: document.querySelector("#sequenceUpdateSnapshot"),
+  sequenceUpdateStatus: document.querySelector("#sequenceUpdateStatus"),
 };
 
 class ApiError extends Error {
@@ -718,6 +741,7 @@ function clearWorkspace(message = "Select or initialize a ctxgit project.") {
   renderBranches();
   hideChatError();
   els.activeTitle.textContent = "No project selected";
+  els.sequenceRoomUpdateButton.hidden = true;
   els.activeMeta.textContent = message;
   replaceMessageListHtml(`<div class="muted">${escapeHtml(message)}</div>`);
   els.reportView.innerHTML = "";
@@ -2233,6 +2257,27 @@ function activeBranchRunningJob(branch = activeChatKey()) {
   return job?.status === "running" ? job : null;
 }
 
+async function refreshSequenceRoomProgress(job) {
+  if (!job?.id || !String(job.mode || job.kind || "").startsWith("sequence-room")) return;
+  const savedReplies = (job.events || []).reduce((highest, event) => {
+    const match = String(event?.message || "").match(/^Sequence reply (\d+) saved$/);
+    return match ? Math.max(highest, Number(match[1])) : highest;
+  }, 0);
+  if (!savedReplies || savedReplies <= (state.sequenceRenderedReplies[job.id] || 0)) return;
+  state.sequenceRenderedReplies[job.id] = savedReplies;
+  if (activeChatKey() !== job.branch) return;
+  try {
+    const payload = await api(`/api/branch?id=${encodeURIComponent(job.branch)}`);
+    if (activeChatKey() === job.branch) {
+      renderBranch(payload);
+      updateComposerState();
+      scrollChatToBottom();
+    }
+  } catch {
+    // The next job poll or final payload will retry rendering.
+  }
+}
+
 function resizeMessageInput() {
   const input = els.messageInput;
   if (!input) return;
@@ -2257,6 +2302,7 @@ function updateComposerState() {
   els.sendButton.disabled = disabled;
   els.contextResetButton.disabled = !contextMode || !activeKey || Boolean(running) || Boolean(startingMode);
   els.historyChatButton.disabled = disabled;
+  els.sequenceRoomUpdateButton.disabled = disabled;
   const busyMode = running?.mode || startingMode;
   els.sendButton.textContent = archived ? "Archived" : busyMode === "chat" || busyMode === "context-chat" ? "생각 중" : "Send";
   els.contextResetButton.textContent = busyMode === "context-chat" ? "Busy" : "Reset";
@@ -2418,6 +2464,7 @@ async function monitorTrackedJob(jobId) {
       updateProgress(remembered);
       renderEventPanel(remembered);
       updateComposerState();
+      await refreshSequenceRoomProgress(remembered);
     }
     if (remembered.status === "done") {
       if (isActiveChat) {
@@ -2472,6 +2519,8 @@ function renderBranch(payload) {
   state.payload = payload;
   const meta = payload.meta;
   const archived = payload.archived === true;
+  const sequenceRoom = payload.meta?.kind === "sequence-room";
+  els.sequenceRoomUpdateButton.hidden = !sequenceRoom;
   els.activeTitle.textContent = meta.title || meta.id;
   els.activeMeta.textContent = archived
     ? `${meta.id} · archived branch · read only`
@@ -2483,7 +2532,7 @@ function renderBranch(payload) {
         (message, index) => `
           <article class="message" data-history-message="${index}">
             <div class="message-header">
-              <span class="message-role">${escapeHtml(message.role)}</span>
+              <span class="message-role">${escapeHtml(message.sequenceSpeaker ? `Agent ${message.sequenceSpeaker.order} · ${message.sequenceSpeaker.title || message.sequenceSpeaker.sourceBranch}` : message.role)}</span>
                 <span class="message-meta-actions">
                   <span class="message-number">${index + 1}</span>
                   <span>${escapeHtml(message.createdAt)}</span>
@@ -3526,6 +3575,100 @@ els.mergeForm.addEventListener("submit", async (event) => {
   }
 });
 
+function populateSequenceBranchSelects() {
+  const options = orderedBranches()
+    .filter((branch) => branch.id !== state.activeBranch || state.branches.length > 1)
+    .map((branch) => `<option value="${escapeHtml(branch.id)}">${escapeHtml(branch.title || branch.id)} (${escapeHtml(branch.id)})</option>`)
+    .join("");
+  els.sequenceAgent1.innerHTML = options;
+  els.sequenceAgent2.innerHTML = options;
+  if (els.sequenceAgent2.options.length > 1) els.sequenceAgent2.selectedIndex = 1;
+}
+
+els.sequenceRoomCreateButton.addEventListener("click", () => {
+  populateSequenceBranchSelects();
+  els.sequenceRoomStatus.textContent = "";
+  els.sequenceRoomDialog.showModal();
+});
+
+els.sequenceRoomForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const branches = [els.sequenceAgent1.value, els.sequenceAgent2.value];
+  if (!branches[0] || !branches[1] || branches[0] === branches[1]) {
+    els.sequenceRoomStatus.textContent = "Choose two distinct branches.";
+    els.sequenceRoomStatus.className = "settings-status error";
+    return;
+  }
+  try {
+    const roomTitle = els.sequenceRoomName.value.trim();
+    const roomId = uniqueBranchIdForTitle(roomTitle);
+    const payload = await api("/api/sequence-room/create", {
+      method: "POST",
+      body: JSON.stringify({
+        branches,
+        systemPrompts: [els.sequencePrompt1.value, els.sequencePrompt2.value],
+        accessModes: [els.sequenceAccess1.value, els.sequenceAccess2.value],
+        name: roomId,
+        title: roomTitle,
+        maxAgentReplies: Number(els.sequenceMaxReplies.value || 6),
+      }),
+    });
+    els.sequenceRoomDialog.close();
+    state.activeBranch = payload.meta.id;
+    await loadBranches();
+    renderBranch(payload);
+  } catch (error) {
+    els.sequenceRoomStatus.textContent = `Create failed: ${error.message}`;
+    els.sequenceRoomStatus.className = "settings-status error";
+  }
+});
+
+async function loadSequenceParticipantComparison() {
+  const order = Number(els.sequenceUpdateOrder.value || 1);
+  const data = await api(`/api/sequence-room/participant?branch=${encodeURIComponent(state.activeBranch)}&order=${order}`);
+  els.sequenceUpdatePrompt.value = data.participant?.systemPrompt || "";
+  els.sequenceUpdateAccess.value = data.participant?.accessMode || "info-chat";
+  const formatSide = (side) =>
+    `CONTEXT\n${side.context || ""}\n\nHISTORY\n${(side.history || []).map((item) => `${item.role}: ${item.text}`).join("\n\n")}`;
+  els.sequenceSnapshotView.textContent = formatSide(data.snapshot);
+  els.sequenceCurrentView.textContent = data.current?.exists ? formatSide(data.current) : "Source branch is missing.";
+  els.sequenceUpdateSnapshot.checked = false;
+}
+
+els.sequenceRoomUpdateButton.addEventListener("click", async () => {
+  els.sequenceUpdateStatus.textContent = "";
+  await loadSequenceParticipantComparison();
+  els.sequenceUpdateDialog.showModal();
+});
+
+els.sequenceUpdateOrder.addEventListener("change", () => {
+  loadSequenceParticipantComparison().catch((error) => {
+    els.sequenceUpdateStatus.textContent = error.message;
+  });
+});
+
+els.sequenceUpdateForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  try {
+    const payload = await api("/api/sequence-room/update", {
+      method: "POST",
+      body: JSON.stringify({
+        branch: state.activeBranch,
+        order: Number(els.sequenceUpdateOrder.value),
+        systemPrompt: els.sequenceUpdatePrompt.value,
+        accessMode: els.sequenceUpdateAccess.value,
+        updateSnapshot: els.sequenceUpdateSnapshot.checked,
+      }),
+    });
+    els.sequenceUpdateDialog.close();
+    renderBranch(payload);
+    await refreshBranchNavigation();
+  } catch (error) {
+    els.sequenceUpdateStatus.textContent = `Update failed: ${error.message}`;
+    els.sequenceUpdateStatus.className = "settings-status error";
+  }
+});
+
 async function sendComposerMessage({ mode }) {
   const isContextChat = state.activeContextChat === true;
   if (!state.activeBranch && !isContextChat) return;
@@ -3603,6 +3746,20 @@ async function sendComposerMessage({ mode }) {
     }
     if (isChat) {
       const provider = state.worker?.preferWorker ? "codex-worker" : "codex";
+      if (state.payload?.meta?.kind === "sequence-room") {
+        await startTrackedJob(
+          "/api/sequence-room/start",
+          {
+            branch,
+            text,
+            runMode: "send",
+            maxAgentReplies: state.payload?.sequenceRoom?.defaultMaxAgentReplies || 6,
+          },
+          { branch, mode: "sequence-room", title: "Sequence room running" },
+        );
+        clearDraft(branch);
+        return;
+      }
       await startTrackedJob(
         "/api/chat/start",
         { branch, text, provider, resources: turnResourcePaths },
@@ -3613,6 +3770,20 @@ async function sendComposerMessage({ mode }) {
     }
     if (isInfoChat) {
       const provider = state.worker?.preferWorker ? "codex-worker" : "codex";
+      if (state.payload?.meta?.kind === "sequence-room") {
+        await startTrackedJob(
+          "/api/sequence-room/start",
+          {
+            branch,
+            text,
+            runMode: "info-chat",
+            maxAgentReplies: state.payload?.sequenceRoom?.defaultMaxAgentReplies || 6,
+          },
+          { branch, mode: "sequence-room-info", title: "Sequence room info chat running" },
+        );
+        clearDraft(branch);
+        return;
+      }
       await startTrackedJob(
         "/api/info-chat/start",
         { branch, text, provider, resources: turnResourcePaths },
