@@ -28,6 +28,9 @@ const state = {
   mergeSelectedBranches: [],
   mergePickerOpen: false,
   sequenceRenderedReplies: {},
+  sequenceOrder: [],
+  sequenceEvaluator: null,
+  sequenceOrderOpen: false,
 };
 
 const CONTEXT_CHAT_KEY = "__contexts__";
@@ -155,16 +158,10 @@ const els = {
   sequenceRoomUpdateButton: document.querySelector("#sequenceRoomUpdateButton"),
   sequenceRoomDialog: document.querySelector("#sequenceRoomDialog"),
   sequenceRoomForm: document.querySelector("#sequenceRoomForm"),
-  sequenceAgent1: document.querySelector("#sequenceAgent1"),
-  sequenceAgent2: document.querySelector("#sequenceAgent2"),
-  sequencePrompt1: document.querySelector("#sequencePrompt1"),
-  sequencePrompt2: document.querySelector("#sequencePrompt2"),
-  sequenceAccess1: document.querySelector("#sequenceAccess1"),
-  sequenceAccess2: document.querySelector("#sequenceAccess2"),
+  sequenceAgentRows: document.querySelector("#sequenceAgentRows"),
+  sequenceAddAgentButton: document.querySelector("#sequenceAddAgentButton"),
   sequenceRoomName: document.querySelector("#sequenceRoomName"),
   sequenceMaxReplies: document.querySelector("#sequenceMaxReplies"),
-  sequenceMinEvaluatorRounds: document.querySelector("#sequenceMinEvaluatorRounds"),
-  sequenceAcceptanceCriteria: document.querySelector("#sequenceAcceptanceCriteria"),
   sequenceRoomStatus: document.querySelector("#sequenceRoomStatus"),
   sequenceUpdateDialog: document.querySelector("#sequenceUpdateDialog"),
   sequenceUpdateForm: document.querySelector("#sequenceUpdateForm"),
@@ -178,6 +175,12 @@ const els = {
   sequenceCurrentView: document.querySelector("#sequenceCurrentView"),
   sequenceUpdateSnapshot: document.querySelector("#sequenceUpdateSnapshot"),
   sequenceUpdateStatus: document.querySelector("#sequenceUpdateStatus"),
+  sequenceOrderPicker: document.querySelector("#sequenceOrderPicker"),
+  sequenceOrderButton: document.querySelector("#sequenceOrderButton"),
+  sequenceOrderDropdown: document.querySelector("#sequenceOrderDropdown"),
+  sequenceOrderSelected: document.querySelector("#sequenceOrderSelected"),
+  sequenceOrderOptions: document.querySelector("#sequenceOrderOptions"),
+  sequenceOrderStatus: document.querySelector("#sequenceOrderStatus"),
 };
 
 class ApiError extends Error {
@@ -1772,6 +1775,114 @@ function setMergePickerOpen(open) {
   }
 }
 
+function setSequenceOrderOpen(open) {
+  state.sequenceOrderOpen = Boolean(open);
+  els.sequenceOrderDropdown.hidden = !state.sequenceOrderOpen;
+  els.sequenceOrderButton.setAttribute("aria-expanded", String(state.sequenceOrderOpen));
+}
+
+function sequenceParticipants() {
+  return Array.isArray(state.payload?.sequenceRoom?.participants)
+    ? state.payload.sequenceRoom.participants
+    : [];
+}
+
+function renderSequenceOrderPicker() {
+  const participants = sequenceParticipants();
+  const available = new Set(participants.map((item) => Number(item.order)));
+  state.sequenceOrder = state.sequenceOrder.filter((order) => available.has(Number(order)));
+  if (!state.sequenceOrder.length && participants.length) {
+    state.sequenceOrder = participants.map((item) => Number(item.order));
+  }
+  if (!state.sequenceOrder.includes(Number(state.sequenceEvaluator))) {
+    state.sequenceEvaluator = null;
+  }
+  els.sequenceOrderButton.textContent = `Order ${state.sequenceOrder.join(" → ")}`;
+  els.sequenceOrderSelected.innerHTML = state.sequenceOrder
+    .map((order, index) => {
+      const participant = participants.find((item) => Number(item.order) === Number(order));
+      return `
+        <div class="merge-selected-item">
+          <span class="merge-selected-number">${index + 1}</span>
+          <span>Agent ${order} · ${escapeHtml(participant?.title || participant?.sourceBranch || "")}${state.sequenceEvaluator === order ? " · evaluator" : ""}</span>
+          <button class="merge-selected-remove" data-sequence-order-toggle="${order}" type="button">×</button>
+        </div>
+      `;
+    })
+    .join("");
+  els.sequenceOrderOptions.innerHTML = participants
+    .map((participant) => {
+      const order = Number(participant.order);
+      const selectedIndex = state.sequenceOrder.indexOf(order);
+      return `
+        <div class="sequence-order-option ${selectedIndex >= 0 ? "selected" : ""}">
+          <button class="sequence-order-speak" data-sequence-order-toggle="${order}" type="button">
+            <span class="merge-option-order ${selectedIndex >= 0 ? "" : "empty"}">${selectedIndex >= 0 ? selectedIndex + 1 : "+"}</span>
+            <span class="merge-option-label">
+              <strong>Agent ${order} · ${escapeHtml(participant.title || participant.sourceBranch || "")}</strong>
+              <small>${escapeHtml(participant.sourceBranch || "")}</small>
+            </span>
+          </button>
+          <button
+            class="sequence-evaluator-toggle ${state.sequenceEvaluator === order ? "active" : ""}"
+            data-sequence-evaluator-toggle="${order}"
+            type="button"
+            ${selectedIndex < 0 ? "disabled" : ""}
+          >${state.sequenceEvaluator === order ? "Evaluator" : "Set evaluator"}</button>
+        </div>
+      `;
+    })
+    .join("");
+  els.sequenceOrderDropdown.querySelectorAll("[data-sequence-order-toggle]").forEach((button) => {
+    button.addEventListener("click", async (event) => {
+      event.stopPropagation();
+      const order = Number(button.dataset.sequenceOrderToggle);
+      const index = state.sequenceOrder.indexOf(order);
+      if (index >= 0) {
+        if (state.sequenceOrder.length === 1) {
+          els.sequenceOrderStatus.textContent = "At least one agent must speak.";
+          els.sequenceOrderStatus.className = "settings-status error";
+          return;
+        }
+        state.sequenceOrder.splice(index, 1);
+        if (state.sequenceEvaluator === order) state.sequenceEvaluator = null;
+      } else {
+        state.sequenceOrder.push(order);
+      }
+      renderSequenceOrderPicker();
+      await saveSequenceOrder();
+    });
+  });
+  els.sequenceOrderDropdown.querySelectorAll("[data-sequence-evaluator-toggle]").forEach((button) => {
+    button.addEventListener("click", async (event) => {
+      event.stopPropagation();
+      const order = Number(button.dataset.sequenceEvaluatorToggle);
+      state.sequenceEvaluator = state.sequenceEvaluator === order ? null : order;
+      renderSequenceOrderPicker();
+      await saveSequenceOrder();
+    });
+  });
+}
+
+async function saveSequenceOrder() {
+  try {
+    const payload = await api("/api/sequence-room/order", {
+      method: "POST",
+      body: JSON.stringify({
+        branch: state.activeBranch,
+        speakingOrder: state.sequenceOrder,
+        evaluatorOrder: state.sequenceEvaluator,
+      }),
+    });
+    state.payload = payload;
+    els.sequenceOrderStatus.textContent = "Order saved.";
+    els.sequenceOrderStatus.className = "settings-status ok";
+  } catch (error) {
+    els.sequenceOrderStatus.textContent = `Order failed: ${error.message}`;
+    els.sequenceOrderStatus.className = "settings-status error";
+  }
+}
+
 function toggleMergeBranch(branchId) {
   const index = state.mergeSelectedBranches.indexOf(branchId);
   if (index >= 0) {
@@ -2553,6 +2664,20 @@ function renderBranch(payload) {
   const archived = payload.archived === true;
   const sequenceRoom = payload.meta?.kind === "sequence-room";
   els.sequenceRoomUpdateButton.hidden = !sequenceRoom;
+  els.sequenceOrderPicker.hidden = !sequenceRoom;
+  setSequenceOrderOpen(false);
+  if (sequenceRoom) {
+    const configuredOrder = Array.isArray(payload.sequenceRoom?.speakingOrder)
+      ? payload.sequenceRoom.speakingOrder
+      : (payload.sequenceRoom?.participants || []).map((item) => item.order);
+    state.sequenceOrder = configuredOrder.map(Number);
+    state.sequenceEvaluator =
+      payload.sequenceRoom?.stopDecider == null ? null : Number(payload.sequenceRoom.stopDecider);
+    renderSequenceOrderPicker();
+  } else {
+    state.sequenceOrder = [];
+    state.sequenceEvaluator = null;
+  }
   els.activeTitle.textContent = meta.title || meta.id;
   els.activeMeta.textContent = archived
     ? `${meta.id} · archived branch · read only`
@@ -3460,12 +3585,19 @@ document.addEventListener("click", (event) => {
   if (!event.target.closest("#mergeSourcePicker")) {
     setMergePickerOpen(false);
   }
+  if (!event.target.closest("#sequenceOrderPicker")) {
+    setSequenceOrderOpen(false);
+  }
 });
 
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && state.mergePickerOpen) {
     setMergePickerOpen(false);
     els.mergeSourceToggle.focus();
+  }
+  if (event.key === "Escape" && state.sequenceOrderOpen) {
+    setSequenceOrderOpen(false);
+    els.sequenceOrderButton.focus();
   }
 });
 
@@ -3608,27 +3740,79 @@ els.mergeForm.addEventListener("submit", async (event) => {
   }
 });
 
-function populateSequenceBranchSelects() {
-  const options = orderedBranches()
+function sequenceBranchOptions() {
+  return orderedBranches()
     .filter((branch) => branch.id !== state.activeBranch || state.branches.length > 1)
     .map((branch) => `<option value="${escapeHtml(branch.id)}">${escapeHtml(branch.title || branch.id)} (${escapeHtml(branch.id)})</option>`)
     .join("");
-  els.sequenceAgent1.innerHTML = options;
-  els.sequenceAgent2.innerHTML = options;
-  if (els.sequenceAgent2.options.length > 1) els.sequenceAgent2.selectedIndex = 1;
+}
+
+function renderSequenceAgentRows(count = 2) {
+  const existing = [...els.sequenceAgentRows.querySelectorAll(".sequence-agent-row")].map((row) => ({
+    branch: row.querySelector("[data-sequence-agent-source]")?.value || "",
+    prompt: row.querySelector("[data-sequence-agent-prompt]")?.value || "",
+    access: row.querySelector("[data-sequence-agent-access]")?.value || "info-chat",
+  }));
+  const nextCount = Math.max(2, Math.min(12, count));
+  els.sequenceAgentRows.innerHTML = Array.from({ length: nextCount }, (_, index) => {
+    const previous = existing[index] || {};
+    return `
+      <section class="sequence-agent-row">
+        <div class="sequence-agent-row-header">
+          <strong>Agent ${index + 1}</strong>
+          ${nextCount > 2 ? `<button data-sequence-remove-agent="${index}" type="button">Remove</button>` : ""}
+        </div>
+        <label>Source branch<select data-sequence-agent-source>${sequenceBranchOptions()}</select></label>
+        <label>Persistent system prompt<textarea data-sequence-agent-prompt rows="4">${escapeHtml(previous.prompt || "")}</textarea></label>
+        <label>Permission<select data-sequence-agent-access><option value="send">Can send and edit project</option><option value="info-chat">Info chat only</option></select></label>
+      </section>
+    `;
+  }).join("");
+  [...els.sequenceAgentRows.querySelectorAll(".sequence-agent-row")].forEach((row, index) => {
+    const source = row.querySelector("[data-sequence-agent-source]");
+    const access = row.querySelector("[data-sequence-agent-access]");
+    if (existing[index]?.branch) source.value = existing[index].branch;
+    else if (source.options.length) source.selectedIndex = Math.min(index, source.options.length - 1);
+    access.value = existing[index]?.access || (index === 0 ? "send" : "info-chat");
+  });
+  els.sequenceAgentRows.querySelectorAll("[data-sequence-remove-agent]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const removeIndex = Number(button.dataset.sequenceRemoveAgent);
+      const rows = [...els.sequenceAgentRows.querySelectorAll(".sequence-agent-row")];
+      rows[removeIndex]?.remove();
+      renderSequenceAgentRows(rows.length - 1);
+    });
+  });
 }
 
 els.sequenceRoomCreateButton.addEventListener("click", () => {
-  populateSequenceBranchSelects();
+  renderSequenceAgentRows(2);
   els.sequenceRoomStatus.textContent = "";
   els.sequenceRoomDialog.showModal();
 });
 
+els.sequenceOrderButton.addEventListener("click", (event) => {
+  event.stopPropagation();
+  setSequenceOrderOpen(!state.sequenceOrderOpen);
+  if (state.sequenceOrderOpen) {
+    els.sequenceOrderStatus.textContent = "";
+    renderSequenceOrderPicker();
+  }
+});
+
+els.sequenceAddAgentButton.addEventListener("click", () => {
+  const count = els.sequenceAgentRows.querySelectorAll(".sequence-agent-row").length;
+  if (count < 12) renderSequenceAgentRows(count + 1);
+});
+
 els.sequenceRoomForm.addEventListener("submit", async (event) => {
   event.preventDefault();
-  const branches = [els.sequenceAgent1.value, els.sequenceAgent2.value];
-  if (!branches[0] || !branches[1] || branches[0] === branches[1]) {
-    els.sequenceRoomStatus.textContent = "Choose two distinct branches.";
+  const rows = [...els.sequenceAgentRows.querySelectorAll(".sequence-agent-row")];
+  const branches = rows.map((row) => row.querySelector("[data-sequence-agent-source]").value);
+  const systemPrompts = rows.map((row) => row.querySelector("[data-sequence-agent-prompt]").value);
+  const accessModes = rows.map((row) => row.querySelector("[data-sequence-agent-access]").value);
+  if (branches.length < 2 || branches.some((branch) => !branch) || new Set(branches).size !== branches.length) {
+    els.sequenceRoomStatus.textContent = "Choose at least two distinct branches.";
     els.sequenceRoomStatus.className = "settings-status error";
     return;
   }
@@ -3639,16 +3823,11 @@ els.sequenceRoomForm.addEventListener("submit", async (event) => {
       method: "POST",
       body: JSON.stringify({
         branches,
-        systemPrompts: [els.sequencePrompt1.value, els.sequencePrompt2.value],
-        accessModes: [els.sequenceAccess1.value, els.sequenceAccess2.value],
+        systemPrompts,
+        accessModes,
         name: roomId,
         title: roomTitle,
         maxAgentReplies: Number(els.sequenceMaxReplies.value || 6),
-        minimumEvaluatorRounds: Number(els.sequenceMinEvaluatorRounds.value || 2),
-        acceptanceCriteria: els.sequenceAcceptanceCriteria.value
-          .split(/\r?\n/)
-          .map((item) => item.trim())
-          .filter(Boolean),
       }),
     });
     els.sequenceRoomDialog.close();
@@ -3678,6 +3857,12 @@ async function loadSequenceParticipantComparison() {
 
 els.sequenceRoomUpdateButton.addEventListener("click", async () => {
   els.sequenceUpdateStatus.textContent = "";
+  els.sequenceUpdateOrder.innerHTML = sequenceParticipants()
+    .map(
+      (participant) =>
+        `<option value="${Number(participant.order)}">Agent ${Number(participant.order)} · ${escapeHtml(participant.title || participant.sourceBranch || "")}</option>`,
+    )
+    .join("");
   await loadSequenceParticipantComparison();
   els.sequenceUpdateDialog.showModal();
 });

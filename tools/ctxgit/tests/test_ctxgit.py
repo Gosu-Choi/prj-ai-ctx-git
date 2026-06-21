@@ -843,6 +843,12 @@ class CtxgitTest(unittest.TestCase):
             self.assertEqual(payload["meta"]["kind"], "sequence-room")
             self.assertEqual([item["sourceBranch"] for item in payload["sequenceRoom"]["participants"]], ["writer", "critic"])
             self.assertEqual(payload["history"], [])
+            store.update_sequence_speaking_order(
+                "room",
+                [1, 2],
+                evaluator_order=2,
+                update_evaluator=True,
+            )
 
             replies = iter(
                 [
@@ -991,6 +997,106 @@ class CtxgitTest(unittest.TestCase):
                 acceptance_criteria=criteria,
             )
         )
+
+    def test_sequence_room_supports_multiple_agents_and_custom_speaking_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            for branch_id in ("writer", "critic", "legal"):
+                store.create_branch(branch_id, title=branch_id.title())
+
+            store.create_sequence_room(
+                ["writer", "critic", "legal"],
+                "room",
+                "Multi-agent room",
+                ["Write.", "Critique.", "Check legal language."],
+                ["info-chat", "info-chat", "info-chat"],
+                4,
+            )
+            config = store.update_sequence_speaking_order(
+                "room",
+                [3, 1],
+                evaluator_order=3,
+                update_evaluator=True,
+            )
+            self.assertEqual(config["speakingOrder"], [3, 1])
+            self.assertEqual(config["stopDecider"], 3)
+
+            replies = iter(
+                [
+                    {
+                        "assistant": "Legal review",
+                        "sequenceEvaluation": {
+                            "decision": "continue",
+                            "requiredChanges": ["Revise disclaimer."],
+                            "optionalSuggestions": [],
+                            "criteria": [
+                                {"name": criterion, "passed": False, "evidence": "Work remains."}
+                                for criterion in ctxgit.DEFAULT_SEQUENCE_ACCEPTANCE_CRITERIA
+                            ],
+                        },
+                    },
+                    {"assistant": "Writer revision"},
+                    {
+                        "assistant": "Legal review again",
+                        "sequenceEvaluation": {
+                            "decision": "continue",
+                            "requiredChanges": ["One more revision."],
+                            "optionalSuggestions": [],
+                            "criteria": [
+                                {"name": criterion, "passed": False, "evidence": "Work remains."}
+                                for criterion in ctxgit.DEFAULT_SEQUENCE_ACCEPTANCE_CRITERIA
+                            ],
+                        },
+                    },
+                    {"assistant": "Writer revision again"},
+                ]
+            )
+            original_call = ctxgit.call_codex_history_chat
+            ctxgit.call_codex_history_chat = lambda *args, **kwargs: next(replies)
+            try:
+                result = ctxgit.run_sequence_room_turn(root, store, "room", "Prepare copy", max_agent_replies=4)
+            finally:
+                ctxgit.call_codex_history_chat = original_call
+
+            speakers = [item["sequenceSpeaker"]["order"] for item in result["history"] if item["role"] == "assistant"]
+            self.assertEqual(speakers, [3, 1, 3, 1])
+            self.assertNotIn(2, speakers)
+            self.assertEqual(result["sequenceRun"]["speakingOrder"], [3, 1])
+
+    def test_sequence_room_without_evaluator_runs_one_cycle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            for branch_id in ("one", "two", "three"):
+                store.create_branch(branch_id)
+            store.create_sequence_room(
+                ["one", "two", "three"],
+                "room",
+                "No evaluator",
+                ["", "", ""],
+                ["info-chat", "info-chat", "info-chat"],
+                20,
+            )
+            store.update_sequence_speaking_order(
+                "room",
+                [2, 1],
+                evaluator_order=None,
+                update_evaluator=True,
+            )
+            replies = iter([{"assistant": "two"}, {"assistant": "one"}])
+            original_call = ctxgit.call_codex_history_chat
+            ctxgit.call_codex_history_chat = lambda *args, **kwargs: next(replies)
+            try:
+                result = ctxgit.run_sequence_room_turn(root, store, "room", "Go", max_agent_replies=20)
+            finally:
+                ctxgit.call_codex_history_chat = original_call
+
+            speakers = [item["sequenceSpeaker"]["order"] for item in result["history"] if item["role"] == "assistant"]
+            self.assertEqual(speakers, [2, 1])
+            self.assertIsNone(result["sequenceRun"]["stopDecider"])
+            self.assertEqual(result["sequenceRun"]["maxAgentReplies"], 2)
+            self.assertIn("one speaking-order cycle", result["sequenceRun"]["stopReason"])
 
     def test_empty_archive_directory_does_not_add_archive_prompt_section(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -145,6 +145,16 @@
             <div id="activeMeta" class="active-meta"></div>
           </div>
           <div class="tabs" role="tablist">
+            <div id="sequenceOrderPicker" class="sequence-order-picker" hidden>
+              <button id="sequenceOrderButton" class="event-panel-toggle" type="button" aria-expanded="false">Order</button>
+              <div id="sequenceOrderDropdown" class="sequence-order-dropdown" hidden>
+                <div class="merge-order-hint">Select agents in the order they should speak. Unselected agents stay silent.</div>
+                <div class="merge-order-hint">Optionally assign one selected agent as evaluator. With no evaluator, the room ends after one cycle.</div>
+                <div id="sequenceOrderSelected" class="merge-selected-order"></div>
+                <div id="sequenceOrderOptions" class="merge-source-options"></div>
+                <div id="sequenceOrderStatus" class="settings-status"></div>
+              </div>
+            </div>
             <button id="sequenceRoomUpdateButton" class="event-panel-toggle" type="button" hidden>Update agents</button>
             <button class="tab active" data-tab="chat" type="button">Chat</button>
             <button class="tab" data-tab="report" type="button">Report</button>
@@ -269,18 +279,10 @@
     <dialog id="sequenceRoomDialog" class="sequence-dialog">
       <form id="sequenceRoomForm" method="dialog">
         <h2>Create sequence room</h2>
-        <label>Agent 1 source<select id="sequenceAgent1"></select></label>
-        <label>Agent 1 persistent system prompt<textarea id="sequencePrompt1" rows="5"></textarea></label>
-        <label>Agent 1 permission<select id="sequenceAccess1"><option value="send">Can send and edit project</option><option value="info-chat">Info chat only</option></select></label>
-        <label>Agent 2 source<select id="sequenceAgent2"></select></label>
-        <label>Agent 2 persistent system prompt<textarea id="sequencePrompt2" rows="5"></textarea></label>
-        <label>Agent 2 permission<select id="sequenceAccess2"><option value="send">Can send and edit project</option><option value="info-chat">Info chat only</option></select></label>
+        <div id="sequenceAgentRows" class="sequence-agent-rows"></div>
+        <button id="sequenceAddAgentButton" type="button">Add agent</button>
         <label>Room name<input id="sequenceRoomName" required /></label>
         <label>Maximum agent replies<input id="sequenceMaxReplies" type="number" min="2" max="40" value="6" /></label>
-        <label>Minimum Agent 2 evaluation rounds<input id="sequenceMinEvaluatorRounds" type="number" min="1" max="20" value="2" /></label>
-        <label>Acceptance criteria (one per line)<textarea id="sequenceAcceptanceCriteria" rows="5">The original user request has been substantively addressed.
-No required correction or unresolved blocking issue remains.
-The latest evaluator feedback has been incorporated or explicitly resolved.</textarea></label>
         <div id="sequenceRoomStatus" class="settings-status"></div>
         <div class="dialog-actions"><button type="button" onclick="this.closest('dialog').close()">Cancel</button><button id="sequenceRoomSubmit" type="submit">Create</button></div>
       </form>
@@ -289,11 +291,11 @@ The latest evaluator feedback has been incorporated or explicitly resolved.</tex
     <dialog id="sequenceUpdateDialog" class="sequence-dialog sequence-update-dialog">
       <form id="sequenceUpdateForm" method="dialog">
         <h2>Update sequence agents</h2>
-        <label>Participant<select id="sequenceUpdateOrder"><option value="1">Agent 1</option><option value="2">Agent 2</option></select></label>
+        <label>Participant<select id="sequenceUpdateOrder"></select></label>
         <label>Persistent system prompt<textarea id="sequenceUpdatePrompt" rows="6"></textarea></label>
         <label>Permission<select id="sequenceUpdateAccess"><option value="send">Can send and edit project</option><option value="info-chat">Info chat only</option></select></label>
         <label>Maximum agent replies<input id="sequenceUpdateMaxReplies" type="number" min="2" max="40" /></label>
-        <label>Minimum Agent 2 evaluation rounds<input id="sequenceUpdateMinEvaluatorRounds" type="number" min="1" max="20" /></label>
+        <label>Minimum evaluator rounds<input id="sequenceUpdateMinEvaluatorRounds" type="number" min="1" max="20" /></label>
         <label>Acceptance criteria (one per line)<textarea id="sequenceUpdateAcceptanceCriteria" rows="5"></textarea></label>
         <div class="sequence-compare">
           <section><h3>Archived snapshot</h3><pre id="sequenceSnapshotView"></pre></section>

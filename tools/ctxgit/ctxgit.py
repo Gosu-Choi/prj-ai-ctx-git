@@ -3011,8 +3011,8 @@ class ContextStore:
         minimum_evaluator_rounds: int = 2,
     ) -> Path:
         self.require_initialized()
-        if len(source_ids) != 2 or len(set(source_ids)) != 2:
-            raise ValueError("sequence room requires two distinct source branches")
+        if len(source_ids) < 2 or len(source_ids) > 12 or len(set(source_ids)) != len(source_ids):
+            raise ValueError("sequence room requires 2 to 12 distinct source branches")
         safe_target = validate_id(target_id, "branch")
         safe_sources = [validate_id(item, "branch") for item in source_ids]
         if self.branch_paths(safe_target).root.exists():
@@ -3025,7 +3025,11 @@ class ContextStore:
         if minimum_evaluator_rounds < 1 or minimum_evaluator_rounds > 20:
             raise ValueError("minimum evaluator rounds must be between 1 and 20")
         normalized_criteria = normalize_sequence_acceptance_criteria(acceptance_criteria)
-        self.create_branch_files(safe_target, title=title or f"Sequence: {safe_sources[0]} → {safe_sources[1]}", tags=["sequence-room"])
+        self.create_branch_files(
+            safe_target,
+            title=title or f"Sequence: {' → '.join(safe_sources)}",
+            tags=["sequence-room"],
+        )
         paths = self.branch_paths(safe_target)
         participants = []
         for index, source_id in enumerate(safe_sources):
@@ -3051,8 +3055,9 @@ class ContextStore:
         meta["sequenceRoom"] = {
             "createdAt": utc_now(),
             "participants": participants,
+            "speakingOrder": [item["order"] for item in participants],
             "defaultMaxAgentReplies": max_agent_replies,
-            "stopDecider": 2,
+            "stopDecider": None,
             "acceptanceCriteria": normalized_criteria,
             "minimumEvaluatorRounds": minimum_evaluator_rounds,
         }
@@ -3060,10 +3065,9 @@ class ContextStore:
         write_text(
             paths.context,
             f"# {title or safe_target}\n\n## Sequence Room\n\n"
-            f"- Agent 1: `{safe_sources[0]}`\n- Agent 2: `{safe_sources[1]}`\n"
-            f"- Maximum agent replies: {max_agent_replies}\n- Stop evaluator: Agent 2\n"
-            f"- Minimum evaluator rounds: {minimum_evaluator_rounds}\n"
-            f"- Acceptance criteria: {len(normalized_criteria)}\n",
+            + "".join(f"- Agent {index + 1}: `{source_id}`\n" for index, source_id in enumerate(safe_sources))
+            + f"- Speaking order: {' → '.join(str(index + 1) for index in range(len(safe_sources)))}\n"
+            f"- Maximum agent replies: {max_agent_replies}\n",
         )
         write_text(paths.history, "")
         self.write_index()
@@ -3074,6 +3078,45 @@ class ContextStore:
         config = meta.get("sequenceRoom")
         if meta.get("kind") != "sequence-room" or not isinstance(config, dict):
             raise ValueError("branch is not a sequence room")
+        return config
+
+    def update_sequence_speaking_order(
+        self,
+        branch_id: str,
+        speaking_order: list[int],
+        *,
+        evaluator_order: int | None = None,
+        update_evaluator: bool = False,
+    ) -> dict[str, Any]:
+        paths = self.branch_paths(branch_id)
+        meta = load_json(paths.meta)
+        config = self.sequence_room_config(branch_id)
+        participants = config.get("participants") if isinstance(config.get("participants"), list) else []
+        participant_orders = {
+            int(item.get("order") or 0)
+            for item in participants
+            if isinstance(item, dict) and int(item.get("order") or 0) > 0
+        }
+        normalized = []
+        for item in speaking_order:
+            order = int(item)
+            if order not in participant_orders:
+                raise ValueError(f"unknown sequence participant: {order}")
+            if order not in normalized:
+                normalized.append(order)
+        if not normalized:
+            raise ValueError("speaking order must include at least one participant")
+        if update_evaluator and evaluator_order is not None:
+            evaluator_order = int(evaluator_order)
+            if evaluator_order not in normalized:
+                raise ValueError("evaluator must be one of the speaking participants")
+        config["speakingOrder"] = normalized
+        if update_evaluator:
+            config["stopDecider"] = evaluator_order
+        config["speakingOrderUpdatedAt"] = utc_now()
+        meta["sequenceRoom"] = config
+        dump_json(paths.meta, meta)
+        self.touch_branch(branch_id)
         return config
 
     def update_sequence_participant(
@@ -6366,7 +6409,7 @@ def normalize_sequence_evaluation(
     if not isinstance(raw, dict):
         return {
             "decision": "continue",
-            "requiredChanges": ["Agent 2 did not return a valid structured evaluation."],
+            "requiredChanges": ["The evaluator did not return a valid structured evaluation."],
             "optionalSuggestions": [],
             "criteria": [],
         }, False
@@ -6402,7 +6445,7 @@ def normalize_sequence_evaluation(
     if not valid:
         decision = "continue"
         if not required_changes:
-            required_changes = ["Agent 2 returned an incomplete structured evaluation."]
+            required_changes = ["The evaluator returned an incomplete structured evaluation."]
     return {
         "decision": decision,
         "requiredChanges": required_changes,
@@ -6447,10 +6490,33 @@ def run_sequence_room_turn(
 ) -> dict[str, Any]:
     config = store.sequence_room_config(branch_id)
     participants = config.get("participants") if isinstance(config.get("participants"), list) else []
-    if len(participants) != 2:
-        raise ValueError("sequence room must have exactly two participants")
+    if len(participants) < 2:
+        raise ValueError("sequence room must have at least two participants")
+    participants_by_order = {
+        int(item.get("order") or 0): item
+        for item in participants
+        if isinstance(item, dict) and int(item.get("order") or 0) > 0
+    }
+    configured_speaking_order = (
+        config.get("speakingOrder") if isinstance(config.get("speakingOrder"), list) else []
+    )
+    speaking_order = []
+    for item in configured_speaking_order:
+        order = int(item or 0)
+        if order in participants_by_order and order not in speaking_order:
+            speaking_order.append(order)
+    if not speaking_order:
+        speaking_order = list(participants_by_order)
+    raw_stop_decider = config.get("stopDecider")
+    stop_decider = (
+        int(raw_stop_decider)
+        if raw_stop_decider is not None and int(raw_stop_decider) in speaking_order
+        else None
+    )
     maximum = max_agent_replies or coerce_positive_int(config.get("defaultMaxAgentReplies"), 6)
     maximum = max(2, min(40, maximum))
+    if stop_decider is None:
+        maximum = len(speaking_order)
     acceptance_criteria = normalize_sequence_acceptance_criteria(
         config.get("acceptanceCriteria") if isinstance(config.get("acceptanceCriteria"), list) else None
     )
@@ -6474,8 +6540,8 @@ def run_sequence_room_turn(
     pending_required_changes: list[str] = []
     last_evaluation: dict[str, Any] | None = None
     for reply_index in range(maximum):
-        participant = participants[reply_index % 2]
-        order = int(participant.get("order") or (reply_index % 2 + 1))
+        order = speaking_order[reply_index % len(speaking_order)]
+        participant = participants_by_order[order]
         source_id = str(participant.get("sourceBranch") or "")
         archive_root = room_paths.archives / source_id
         archive_history = store.read_history_file(archive_root / "history.jsonl")
@@ -6510,10 +6576,10 @@ def run_sequence_room_turn(
                 f"Original user request: {user_message}",
                 "",
                 (
-                    "You are Agent 2, the evaluator. Give your substantive response in `assistant`, then "
+                    f"You are Agent {stop_decider}, the evaluator. Give your substantive response in `assistant`, then "
                     "return `sequenceEvaluation` using the required output schema. The harness, not you, "
                     "makes the final stop decision. Use decision `complete` only when every acceptance "
-                    "criterion passes and requiredChanges is empty. Any change you ask Agent 1 to make "
+                    "criterion passes and requiredChanges is empty. Any change you ask another agent to make "
                     "must appear in requiredChanges; optionalSuggestions must contain only improvements "
                     "that are genuinely unnecessary for completion. Do not emit textual stop markers.\n"
                     f"Evaluator round: {evaluator_rounds + 1}. The harness requires at least "
@@ -6526,17 +6592,25 @@ def run_sequence_room_turn(
                         if pending_required_changes
                         else "- None."
                     )
-                    if order == 2
+                    if stop_decider is not None and order == stop_decider
                     else (
-                        "Respond with your next contribution. If Agent 2 previously requested changes, "
-                        "address them explicitly. Do not emit sequence stop markers."
+                        (
+                            f"Respond with your next contribution. If Agent {stop_decider} previously requested changes, "
+                            "address them explicitly. Do not emit sequence stop markers."
+                            if stop_decider is not None
+                            else "Respond with your contribution. This room has no evaluator and will run for one cycle."
+                        )
                     )
                 ),
             ]
         )
         participant_access = str(participant.get("accessMode") or "info-chat")
         effective_access = "info-chat" if run_mode == "info-chat" else participant_access
-        output_schema = sequence_evaluator_output_schema() if order == 2 else None
+        output_schema = (
+            sequence_evaluator_output_schema()
+            if stop_decider is not None and order == stop_decider
+            else None
+        )
         if effective_access == "send":
             result = call_codex_chat(
                 root,
@@ -6559,7 +6633,7 @@ def run_sequence_room_turn(
         evaluation = None
         evaluation_valid = False
         should_stop = False
-        if order == 2:
+        if stop_decider is not None and order == stop_decider:
             evaluator_rounds += 1
             evaluation, evaluation_valid = normalize_sequence_evaluation(
                 result.get("sequenceEvaluation"),
@@ -6594,13 +6668,13 @@ def run_sequence_room_turn(
                         "sequenceEvaluationValid": evaluation_valid,
                         "sequenceEvaluatorRound": evaluator_rounds,
                     }
-                    if order == 2
+                    if stop_decider is not None and order == stop_decider
                     else {}
                 ),
             },
         )
         emit_progress(progress, f"Sequence reply {reply_index + 1} saved")
-        if order == 2:
+        if stop_decider is not None and order == stop_decider:
             emit_progress(
                 progress,
                 f"Sequence evaluation {evaluator_rounds}: "
@@ -6609,11 +6683,15 @@ def run_sequence_room_turn(
         if should_stop:
             stopped = True
             stop_reason = (
-                f"Harness accepted Agent 2's evaluation after {evaluator_rounds} evaluator rounds."
+                f"Harness accepted Agent {stop_decider}'s evaluation after {evaluator_rounds} evaluator rounds."
             )
             break
     if not stopped:
-        stop_reason = "Maximum agent replies reached before the completion criteria passed."
+        stop_reason = (
+            "Completed one speaking-order cycle because no evaluator is configured."
+            if stop_decider is None
+            else "Maximum agent replies reached before the completion criteria passed."
+        )
     turn_commit = internal_git_commit_turn(
         store,
         kind="sequence-room-turn",
@@ -6629,6 +6707,8 @@ def run_sequence_room_turn(
             "evaluatorRounds": evaluator_rounds,
             "minimumEvaluatorRounds": minimum_evaluator_rounds,
             "lastEvaluation": last_evaluation,
+            "speakingOrder": speaking_order,
+            "stopDecider": stop_decider,
         },
     )
     payload = branch_payload(store, branch_id)
@@ -6641,6 +6721,8 @@ def run_sequence_room_turn(
         "evaluatorRounds": evaluator_rounds,
         "minimumEvaluatorRounds": minimum_evaluator_rounds,
         "lastEvaluation": last_evaluation,
+        "speakingOrder": speaking_order,
+        "stopDecider": stop_decider,
     }
     return payload
 
@@ -9148,6 +9230,35 @@ def make_handler(
                         progress=progress,
                     )
                 self.send_json(jobs.create("sequence-room", sequence_work, root=root), status=202)
+                return
+            if parsed.path == "/api/sequence-room/order":
+                try:
+                    branch_id = str(body.get("branch") or "")
+                    speaking_order = [int(item) for item in body.get("speakingOrder", [])]
+                    evaluator_raw = body.get("evaluatorOrder")
+                    evaluator_order = int(evaluator_raw) if evaluator_raw is not None else None
+                    config = store.update_sequence_speaking_order(
+                        branch_id,
+                        speaking_order,
+                        evaluator_order=evaluator_order,
+                        update_evaluator="evaluatorOrder" in body,
+                    )
+                    payload = branch_payload(store, branch_id)
+                    payload["sequenceRoom"] = config
+                    payload["turnCommit"] = internal_git_commit_turn(
+                        store,
+                        kind="sequence-room-order",
+                        actor="user",
+                        summary=f"Update sequence speaking order on {branch_id}",
+                        branch_id=branch_id,
+                        metadata={
+                            "speakingOrder": speaking_order,
+                            "stopDecider": evaluator_order,
+                        },
+                    )
+                    self.send_json(payload)
+                except (TypeError, ValueError) as exc:
+                    self.send_json({"error": "sequence_room_order_failed", "message": str(exc)}, status=400)
                 return
             if parsed.path == "/api/sequence-room/update":
                 try:
