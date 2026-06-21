@@ -2598,6 +2598,72 @@ class CtxgitTest(unittest.TestCase):
             config = ctxgit.load_json(root / ".ctxgit/config.json")
             self.assertEqual(config["llm"]["codex"]["sandbox"], "read-only")
 
+    def test_write_provider_config_can_select_claude_without_api_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("AItrust")
+            original = ctxgit.provider_status
+            ctxgit.provider_status = lambda _root: {
+                "ok": True,
+                "provider": ctxgit.read_llm_config(_root)["provider"],
+            }
+            try:
+                status = ctxgit.write_provider_config(
+                    root,
+                    {
+                        "provider": "claude",
+                        "model": "opus",
+                        "timeoutSeconds": 321,
+                        "webSearch": True,
+                        "sandbox": "read-only",
+                    },
+                )
+            finally:
+                ctxgit.provider_status = original
+            config = ctxgit.read_llm_config(root)
+            self.assertEqual(status["provider"], "claude")
+            self.assertEqual(config["provider"], "claude")
+            self.assertEqual(config["claude"]["model"], "opus")
+            self.assertEqual(config["claude"]["timeoutSeconds"], 321)
+            self.assertNotIn("apiKey", config["claude"])
+
+    def test_parse_claude_structured_output(self) -> None:
+        parsed = ctxgit.parse_claude_result(
+            json.dumps(
+                {
+                    "type": "result",
+                    "structured_output": {
+                        "assistant": "Claude answer",
+                        "artifacts": [],
+                        "approvalRequests": [],
+                    },
+                }
+            )
+        )
+        self.assertEqual(parsed["assistant"], "Claude answer")
+        self.assertEqual(parsed["artifacts"], [])
+
+    def test_provider_models_are_normalized_and_validated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("AItrust")
+            config = ctxgit.load_json(root / ".ctxgit/config.json")
+            config["llm"]["codex"]["model"] = ""
+            ctxgit.dump_json(root / ".ctxgit/config.json", config)
+            self.assertEqual(ctxgit.read_llm_config(root)["codex"]["model"], "gpt-5.5")
+
+            original = ctxgit.provider_status
+            ctxgit.provider_status = lambda _root: {"ok": True, "provider": "codex"}
+            try:
+                ctxgit.write_provider_config(root, {"provider": "codex", "model": "gpt-5.4"})
+                with self.assertRaises(ValueError):
+                    ctxgit.write_provider_config(root, {"provider": "codex", "model": "opus"})
+            finally:
+                ctxgit.provider_status = original
+            self.assertEqual(ctxgit.read_llm_config(root)["codex"]["model"], "gpt-5.4")
+
     def test_llm_config_defaults_web_search_on(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

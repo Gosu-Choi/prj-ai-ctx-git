@@ -3599,7 +3599,7 @@ class ContextStore:
         body = ""
         if use_ai:
             try:
-                body = call_codex_history_compaction(self.root, self, branch_id, compact_records)
+                body = call_provider_history_compaction(self.root, self, branch_id, compact_records)
             except Exception as exc:
                 body = self.history_compaction_markdown(
                     branch_id,
@@ -4461,7 +4461,18 @@ def default_llm_config() -> dict[str, Any]:
         "provider": "codex",
         "codex": {
             "bin": "codex",
-            "model": "",
+            "model": "gpt-5.5",
+            "webSearch": True,
+            "sandbox": DEFAULT_CODEX_SANDBOX,
+            "timeoutSeconds": 900,
+            "contextBudgetCharacters": DEFAULT_CONTEXT_BUDGET_CHARS,
+            "historyBudgetCharacters": DEFAULT_HISTORY_CONTEXT_BUDGET_CHARS,
+            "infoChatHistoryBudgetCharacters": DEFAULT_HISTORY_CONTEXT_BUDGET_CHARS,
+            "historyRecordLimit": DEFAULT_HISTORY_CONTEXT_RECORD_LIMIT,
+        },
+        "claude": {
+            "bin": "claude",
+            "model": "opus",
             "webSearch": True,
             "sandbox": DEFAULT_CODEX_SANDBOX,
             "timeoutSeconds": 900,
@@ -4473,6 +4484,18 @@ def default_llm_config() -> dict[str, Any]:
     }
 
 
+LLM_PROVIDER_MODELS = {
+    "codex": [
+        {"id": "gpt-5.5", "label": "GPT-5.5"},
+        {"id": "gpt-5.4", "label": "GPT-5.4"},
+    ],
+    "claude": [
+        {"id": "opus", "label": "Claude Opus (latest)"},
+        {"id": "sonnet", "label": "Claude Sonnet (latest)"},
+    ],
+}
+
+
 def read_llm_config(root: Path) -> dict[str, Any]:
     config = load_json(root / ".ctxgit" / "config.json")
     defaults = default_llm_config()
@@ -4480,10 +4503,23 @@ def read_llm_config(root: Path) -> dict[str, Any]:
     if not isinstance(llm, dict):
         return defaults
     raw_codex = llm.get("codex") if isinstance(llm.get("codex"), dict) else {}
+    raw_claude = llm.get("claude") if isinstance(llm.get("claude"), dict) else {}
+    codex = {**defaults["codex"], **raw_codex}
+    claude = {**defaults["claude"], **raw_claude}
+    codex["model"] = str(codex.get("model") or defaults["codex"]["model"])
+    claude["model"] = str(claude.get("model") or defaults["claude"]["model"])
     return {
         "provider": str(llm.get("provider") or defaults["provider"]),
-        "codex": {**defaults["codex"], **raw_codex},
+        "codex": codex,
+        "claude": claude,
     }
+
+
+def active_llm_provider_config(root: Path) -> dict[str, Any]:
+    llm = read_llm_config(root)
+    provider = str(llm.get("provider") or "codex")
+    config = llm.get(provider)
+    return config if isinstance(config, dict) else {}
 
 
 def write_provider_config(root: Path, updates: dict[str, Any]) -> dict[str, Any]:
@@ -4491,25 +4527,36 @@ def write_provider_config(root: Path, updates: dict[str, Any]) -> dict[str, Any]
     config = load_json(config_path)
     llm = config.get("llm") if isinstance(config.get("llm"), dict) else {}
     existing = read_llm_config(root)
-    codex_config = existing.get("codex") if isinstance(existing.get("codex"), dict) else default_llm_config()["codex"]
-    next_codex = dict(codex_config)
+    provider = str(updates.get("provider") or existing.get("provider") or "codex").strip().lower()
+    if provider not in {"codex", "claude"}:
+        raise ValueError("provider must be codex or claude")
+    provider_config = existing.get(provider) if isinstance(existing.get(provider), dict) else default_llm_config()[provider]
+    next_provider = dict(provider_config)
     if "timeoutSeconds" in updates:
         timeout_seconds = coerce_positive_int(updates.get("timeoutSeconds"), 0)
         if timeout_seconds <= 0:
             raise ValueError("timeoutSeconds must be a positive integer")
-        next_codex["timeoutSeconds"] = timeout_seconds
+        next_provider["timeoutSeconds"] = timeout_seconds
     if "webSearch" in updates:
-        next_codex["webSearch"] = updates.get("webSearch") is True
+        next_provider["webSearch"] = updates.get("webSearch") is True
     if "sandbox" in updates:
         sandbox = str(updates.get("sandbox") or "").strip()
         if sandbox not in ALLOWED_CODEX_SANDBOXES:
             raise ValueError(f"sandbox must be one of: {', '.join(sorted(ALLOWED_CODEX_SANDBOXES))}")
-        next_codex["sandbox"] = sandbox
-    llm["provider"] = str(llm.get("provider") or existing.get("provider") or "codex")
-    llm["codex"] = next_codex
+        next_provider["sandbox"] = sandbox
+    if "model" in updates:
+        model = str(updates.get("model") or "").strip()
+        allowed_models = {item["id"] for item in LLM_PROVIDER_MODELS[provider]}
+        if model not in allowed_models:
+            raise ValueError(f"model must be one of: {', '.join(sorted(allowed_models))}")
+        next_provider["model"] = model
+    llm["provider"] = provider
+    llm[provider] = next_provider
+    other = "claude" if provider == "codex" else "codex"
+    llm[other] = existing[other]
     config["llm"] = llm
     dump_json(config_path, config)
-    return codex_login_status(root)
+    return provider_status(root)
 
 
 def codex_sandbox_mode(codex_config: dict[str, Any]) -> str:
@@ -4558,6 +4605,111 @@ def display_codex_command(root: Path) -> str:
     return " ".join(shlex.quote(part) for part in resolve_codex_command(root))
 
 
+def resolve_claude_command(root: Path) -> list[str]:
+    override = os.environ.get("CTXGIT_CLAUDE_BIN")
+    if override:
+        return shlex.split(override)
+    llm = read_llm_config(root)
+    claude_config = llm.get("claude") if isinstance(llm.get("claude"), dict) else {}
+    configured = str(claude_config.get("bin") or "claude").strip()
+    resolved = shutil.which(configured)
+    if resolved:
+        return [resolved]
+    native = Path.home() / ".local" / "bin" / ("claude.exe" if os.name == "nt" else "claude")
+    if native.exists():
+        return [str(native)]
+    return shlex.split(configured)
+
+
+def claude_login_status(root: Path) -> dict[str, Any]:
+    env_status = load_project_env(root)
+    llm = read_llm_config(root)
+    config = llm.get("claude") if isinstance(llm.get("claude"), dict) else {}
+    cmd = resolve_claude_command(root) + ["auth", "status"]
+    try:
+        completed = subprocess.run(
+            cmd, cwd=root, check=False, text=True, encoding="utf-8", errors="replace",
+            capture_output=True, timeout=20,
+        )
+    except FileNotFoundError:
+        return {
+            "ok": False, "provider": "claude", "status": "missing",
+            "message": "Claude Code CLI not found. Install it or set CTXGIT_CLAUDE_BIN.",
+            "loginCommand": "claude auth login", "resolvedCommand": " ".join(resolve_claude_command(root)),
+            "model": str(config.get("model") or "opus"),
+            "webSearch": config.get("webSearch") is not False,
+            "sandbox": str(config.get("sandbox") or DEFAULT_CODEX_SANDBOX),
+            "timeoutSeconds": coerce_positive_int(config.get("timeoutSeconds"), 900),
+            "envFiles": env_status.get("files", []),
+        }
+    raw = (completed.stdout or completed.stderr).strip()
+    auth = {}
+    with contextlib.suppress(json.JSONDecodeError):
+        auth = json.loads(raw)
+    ok = completed.returncode == 0 and (not isinstance(auth, dict) or auth.get("loggedIn") is not False)
+    return {
+        "ok": ok, "provider": "claude",
+        "status": "logged_in" if ok else "not_logged_in",
+        "message": (
+            f"Claude Code authenticated via {auth.get('authMethod', 'Claude account')}."
+            if ok and isinstance(auth, dict) else raw
+        ),
+        "loginCommand": "claude auth login",
+        "resolvedCommand": " ".join(resolve_claude_command(root)),
+        "model": str(config.get("model") or "opus"),
+        "webSearch": config.get("webSearch") is not False,
+        "sandbox": str(config.get("sandbox") or DEFAULT_CODEX_SANDBOX),
+        "timeoutSeconds": coerce_positive_int(config.get("timeoutSeconds"), 900),
+        "auth": auth,
+        "envFiles": env_status.get("files", []),
+    }
+
+
+def provider_status(root: Path) -> dict[str, Any]:
+    provider = str(read_llm_config(root).get("provider") or "codex")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        futures = {
+            "codex": executor.submit(codex_login_status, root),
+            "claude": executor.submit(claude_login_status, root),
+        }
+        statuses = {}
+        for name, future in futures.items():
+            try:
+                statuses[name] = future.result(timeout=25)
+            except Exception as exc:
+                config = read_llm_config(root).get(name, {})
+                statuses[name] = {
+                    "ok": False,
+                    "provider": name,
+                    "status": "check_failed",
+                    "message": f"Provider status check failed: {exc}",
+                    "loginCommand": "claude auth login" if name == "claude" else "codex login --device-auth",
+                    "model": str(config.get("model") or ""),
+                }
+    active = dict(statuses.get(provider) or statuses["codex"])
+    active["providers"] = [
+        {
+            "id": name,
+            "label": "Claude Code" if name == "claude" else "Codex",
+            "installed": status.get("status") != "missing",
+            "ok": status.get("ok") is True,
+            "status": status.get("status"),
+            "message": status.get("message"),
+            "loginCommand": status.get("loginCommand"),
+            "model": status.get("model"),
+            "models": LLM_PROVIDER_MODELS[name],
+            "authMode": (
+                "oauth"
+                if name == "claude" and isinstance(status.get("auth"), dict)
+                and status["auth"].get("authMethod") in {"claude.ai", "oauth"}
+                else "provider-session"
+            ),
+        }
+        for name, status in statuses.items()
+    ]
+    return active
+
+
 def codex_login_status(root: Path) -> dict[str, Any]:
     env_status = load_project_env(root)
     cmd = resolve_codex_command(root) + ["login", "status"]
@@ -4589,6 +4741,7 @@ def codex_login_status(root: Path) -> dict[str, Any]:
             "loginCommand": "codex login --device-auth",
             "resolvedCommand": display_codex_command(root),
             "webSearch": codex_config.get("webSearch") is not False,
+            "model": str(codex_config.get("model") or "gpt-5.5"),
             "sandbox": codex_sandbox_mode(codex_config),
             "timeoutSeconds": timeout_seconds,
             "braveApiKeyConfigured": brave_configured,
@@ -4604,6 +4757,7 @@ def codex_login_status(root: Path) -> dict[str, Any]:
         "loginCommand": "codex login --device-auth",
         "resolvedCommand": display_codex_command(root),
         "webSearch": codex_config.get("webSearch") is not False,
+        "model": str(codex_config.get("model") or "gpt-5.5"),
         "sandbox": codex_sandbox_mode(codex_config),
         "timeoutSeconds": coerce_positive_int(codex_config.get("timeoutSeconds"), 900),
         "braveApiKeyConfigured": brave_configured,
@@ -4725,6 +4879,39 @@ def call_codex_history_compaction(
             "",
         ]
     ).rstrip() + "\n"
+
+
+def call_provider_history_compaction(
+    root: Path,
+    store: ContextStore,
+    branch_id: str,
+    records: list[dict[str, Any]],
+) -> str:
+    provider = str(read_llm_config(root).get("provider") or "codex")
+    if provider == "codex":
+        return call_codex_history_compaction(root, store, branch_id, records)
+    formatted = "\n".join(
+        f"- {record.get('createdAt', '')} {record.get('role', 'unknown')}: "
+        f"{truncate_middle(str(record.get('text') or '').strip(), 1200)}"
+        for record in records
+    )
+    prompt = "\n".join([
+        "Compact this older ctxgit conversation into durable Markdown memory.",
+        "Do not invent facts. Preserve goals, decisions, constraints, sources, unresolved questions, and timeline.",
+        "Return the summary in the `assistant` field.",
+        "<history_records>", formatted, "</history_records>",
+    ])
+    result = call_claude_prompt(
+        root, prompt, cwd=root, writable=False,
+        output_schema={
+            "type": "object", "additionalProperties": False, "required": ["assistant"],
+            "properties": {"assistant": {"type": "string"}},
+        },
+    )
+    raw = str(result.get("assistant") or "").strip()
+    if not raw:
+        raise RuntimeError("Claude history compaction returned no text")
+    return f"# History Compaction: {branch_id}\n\n{raw}\n"
 
 
 def coerce_positive_int(value: Any, default: int) -> int:
@@ -5005,8 +5192,7 @@ def history_budget_from_config(codex_config: dict[str, Any], *keys: str) -> int:
 
 
 def build_context_bundle(store: ContextStore, branch_id: str) -> dict[str, str]:
-    llm = read_llm_config(store.root)
-    codex_config = llm.get("codex") if isinstance(llm.get("codex"), dict) else {}
+    codex_config = active_llm_provider_config(store.root)
     budget = coerce_positive_int(
         codex_config.get("contextBudgetCharacters"),
         DEFAULT_CONTEXT_BUDGET_CHARS,
@@ -5154,8 +5340,7 @@ def build_history_chat_prompt(
     user_message: str,
     resource_paths: list[str] | None = None,
 ) -> str:
-    llm = read_llm_config(store.root)
-    codex_config = llm.get("codex") if isinstance(llm.get("codex"), dict) else {}
+    codex_config = active_llm_provider_config(store.root)
     budget = coerce_positive_int(
         codex_config.get("infoChatBudgetCharacters") or codex_config.get("historyOnlyBudgetCharacters"),
         min(DEFAULT_CONTEXT_BUDGET_CHARS, 45000),
@@ -5302,8 +5487,7 @@ def contexts_branch_overview(store: ContextStore, budget_chars: int = 14000) -> 
 
 
 def build_context_chat_prompt(store: ContextStore, user_message: str) -> str:
-    llm = read_llm_config(store.root)
-    codex_config = llm.get("codex") if isinstance(llm.get("codex"), dict) else {}
+    codex_config = active_llm_provider_config(store.root)
     budget = coerce_positive_int(
         codex_config.get("infoChatBudgetCharacters") or codex_config.get("historyOnlyBudgetCharacters"),
         min(DEFAULT_CONTEXT_BUDGET_CHARS, 50000),
@@ -6038,6 +6222,158 @@ def call_codex_context_chat(
         return parsed
 
 
+def parse_claude_result(raw: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(raw.strip())
+    except json.JSONDecodeError:
+        return parse_chat_result(raw)
+    if not isinstance(payload, dict):
+        return parse_chat_result(raw)
+    structured = payload.get("structured_output")
+    if isinstance(structured, dict):
+        parsed = parse_chat_result(json.dumps(structured, ensure_ascii=False))
+        if isinstance(structured.get("sequenceEvaluation"), dict):
+            parsed["sequenceEvaluation"] = structured["sequenceEvaluation"]
+        return parsed
+    result = payload.get("result")
+    if isinstance(result, str):
+        return parse_chat_result(result)
+    return parse_chat_result(raw)
+
+
+def claude_tools(*, writable: bool, web_search: bool) -> str:
+    tools = ["Read", "Glob", "Grep"]
+    if writable:
+        tools.extend(["Edit", "Write", "Bash"])
+    if web_search:
+        tools.extend(["WebSearch", "WebFetch"])
+    return ",".join(tools)
+
+
+def call_claude_prompt(
+    root: Path,
+    prompt: str,
+    *,
+    cwd: Path,
+    writable: bool,
+    approved_external_paths: list[str] | None = None,
+    progress: ProgressCallback | None = None,
+    output_schema: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    emit_progress(progress, "Checking Claude Code login")
+    status = claude_login_status(root)
+    if not status["ok"]:
+        raise RuntimeError(status["message"])
+    config = read_llm_config(root).get("claude", {})
+    timeout_seconds = coerce_positive_int(config.get("timeoutSeconds"), 900)
+    schema = output_schema or chat_output_schema()
+    cmd = resolve_claude_command(root)
+    cmd.extend([
+        "-p",
+        "--output-format", "json",
+        "--json-schema", json.dumps(schema, ensure_ascii=False, separators=(",", ":")),
+        "--no-session-persistence",
+        "--permission-mode", "auto" if writable else "dontAsk",
+        "--tools", claude_tools(writable=writable, web_search=config.get("webSearch") is not False),
+        "--append-system-prompt",
+        (
+            "You are running inside ctxgit. Do not push, publish, deploy, or modify files outside "
+            "the current working directory and explicitly added directories. Respect the requested "
+            "read-only or writable mode. Return the required structured output."
+        ),
+    ])
+    model = str(config.get("model") or "opus").strip()
+    if model:
+        cmd.extend(["--model", model])
+    for path in external_writable_dirs(root, approved_external_paths or []):
+        cmd.extend(["--add-dir", str(path)])
+    try:
+        emit_progress(progress, "Claude Code is working")
+        completed = subprocess.run(
+            cmd, cwd=cwd, check=False, text=True, encoding="utf-8", errors="replace",
+            input=prompt, capture_output=True, timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ChatTimeoutError(f"Claude Code timed out after {timeout_seconds} seconds") from exc
+    raw = completed.stdout.strip()
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or raw
+        raise RuntimeError(detail or f"Claude Code failed with exit code {completed.returncode}")
+    emit_progress(progress, "Parsing Claude Code response")
+    parsed = parse_claude_result(raw)
+    parsed["provider"] = "claude"
+    parsed["command"] = cmd + ["<prompt via stdin>"]
+    return parsed
+
+
+def call_claude_chat(
+    root: Path,
+    store: ContextStore,
+    branch_id: str,
+    user_message: str,
+    approved_external_paths: list[str] | None = None,
+    resource_paths: list[str] | None = None,
+    progress: ProgressCallback | None = None,
+    output_schema: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    prompt = build_chat_prompt(
+        store, branch_id, user_message,
+        approved_external_paths=approved_external_paths,
+        resource_paths=resource_paths,
+    )
+    config = read_llm_config(root).get("claude", {})
+    writable = str(config.get("sandbox") or DEFAULT_CODEX_SANDBOX) != "read-only"
+    return call_claude_prompt(
+        root, prompt, cwd=root, writable=writable,
+        approved_external_paths=approved_external_paths,
+        progress=progress, output_schema=output_schema,
+    )
+
+
+def call_claude_history_chat(
+    root: Path,
+    store: ContextStore,
+    branch_id: str,
+    user_message: str,
+    resource_paths: list[str] | None = None,
+    progress: ProgressCallback | None = None,
+    output_schema: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    prompt = build_history_chat_prompt(store, branch_id, user_message, resource_paths=resource_paths)
+    return call_claude_prompt(
+        root, prompt, cwd=root, writable=False,
+        progress=progress, output_schema=output_schema,
+    )
+
+
+def call_claude_context_chat(
+    root: Path,
+    store: ContextStore,
+    user_message: str,
+    progress: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    return call_claude_prompt(
+        root, build_context_chat_prompt(store, user_message),
+        cwd=store.contexts, writable=False, progress=progress,
+    )
+
+
+def call_provider_chat(provider: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
+    if provider == "claude":
+        return call_claude_chat(*args, **kwargs)
+    if provider == "codex":
+        return call_codex_chat(*args, **kwargs)
+    raise RuntimeError(f"Unsupported chat provider: {provider}")
+
+
+def call_provider_history_chat(provider: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
+    if provider == "claude":
+        return call_claude_history_chat(*args, **kwargs)
+    if provider == "codex":
+        return call_codex_history_chat(*args, **kwargs)
+    raise RuntimeError(f"Unsupported chat provider: {provider}")
+
+
 def run_chat_turn(
     root: Path,
     store: ContextStore,
@@ -6061,9 +6397,8 @@ def run_chat_turn(
         if normalized_resources:
             user_extra["resources"] = normalized_resources
         store.append_history(branch_id, "user", user_message, extra=user_extra)
-    if selected_provider != "codex":
-        raise RuntimeError(f"Unsupported chat provider: {selected_provider}")
-    result = call_codex_chat(
+    result = call_provider_chat(
+        selected_provider,
         root,
         store,
         branch_id,
@@ -6137,15 +6472,14 @@ def run_history_chat_turn(
     selected_provider = provider or str(read_llm_config(root).get("provider") or "codex")
     turn_id = new_turn_id()
     emit_progress(progress, "Preparing branch context")
-    if selected_provider != "codex":
-        raise RuntimeError(f"Unsupported chat provider: {selected_provider}")
     normalized_resources = normalize_branch_resource_paths(store, branch_id, resource_paths)
     emit_progress(progress, "Recording user message")
     user_extra: dict[str, Any] = {"turnId": turn_id, "mode": "info-chat"}
     if normalized_resources:
         user_extra["resources"] = normalized_resources
     store.append_history(branch_id, "user", user_message, extra=user_extra)
-    result = call_codex_history_chat(
+    result = call_provider_history_chat(
+        selected_provider,
         root,
         store,
         branch_id,
@@ -6192,11 +6526,14 @@ def run_context_chat_turn(
     selected_provider = provider or str(read_llm_config(root).get("provider") or "codex")
     turn_id = new_turn_id()
     emit_progress(progress, "Preparing contexts overview")
-    if selected_provider != "codex":
-        raise RuntimeError(f"Unsupported chat provider: {selected_provider}")
     emit_progress(progress, "Recording user message")
     store.append_context_history("user", user_message, extra={"turnId": turn_id, "mode": "context-chat"})
-    result = call_codex_context_chat(root, store, user_message, progress=progress)
+    if selected_provider == "claude":
+        result = call_claude_context_chat(root, store, user_message, progress=progress)
+    elif selected_provider == "codex":
+        result = call_codex_context_chat(root, store, user_message, progress=progress)
+    else:
+        raise RuntimeError(f"Unsupported chat provider: {selected_provider}")
     assistant = str(result.get("assistant") or "").strip() or "(No assistant message returned.)"
     emit_progress(progress, "Saving assistant output")
     store.append_context_history(
@@ -6344,6 +6681,7 @@ def summarize_merge_branch_with_info_chat(
     root: Path,
     store: ContextStore,
     request: dict[str, Any],
+    provider: str = "codex",
     progress: ProgressCallback | None = None,
 ) -> str:
     records = request.get("divergentRecords")
@@ -6354,7 +6692,7 @@ def summarize_merge_branch_with_info_chat(
         return ""
     emit_progress(progress, f"머지 요약 생성 중: {store.branch_display_label(branch_id)}")
     prompt = build_merge_branch_summary_prompt(store, request)
-    result = call_codex_history_chat(root, store, branch_id, prompt, progress=progress)
+    result = call_provider_history_chat(provider, root, store, branch_id, prompt, progress=progress)
     return str(result.get("assistant") or "").strip()
 
 
@@ -6369,12 +6707,14 @@ def run_merge_branches(
     progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     selected_provider = provider or str(read_llm_config(root).get("provider") or "codex")
-    if selected_provider != "codex":
+    if selected_provider not in {"codex", "claude"}:
         raise RuntimeError(f"Unsupported merge provider: {selected_provider}")
     emit_progress(progress, "Preparing merge summaries")
 
     def branch_summarizer(request: dict[str, Any]) -> str:
-        return summarize_merge_branch_with_info_chat(root, store, request, progress=progress)
+        return summarize_merge_branch_with_info_chat(
+            root, store, request, provider=selected_provider, progress=progress
+        )
 
     store.merge_branches(
         branch_ids,
@@ -6489,6 +6829,7 @@ def run_sequence_room_turn(
     progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     config = store.sequence_room_config(branch_id)
+    selected_provider = str(read_llm_config(root).get("provider") or "codex")
     participants = config.get("participants") if isinstance(config.get("participants"), list) else []
     if len(participants) < 2:
         raise ValueError("sequence room must have at least two participants")
@@ -6612,7 +6953,8 @@ def run_sequence_room_turn(
             else None
         )
         if effective_access == "send":
-            result = call_codex_chat(
+            result = call_provider_chat(
+                selected_provider,
                 root,
                 store,
                 branch_id,
@@ -6621,7 +6963,8 @@ def run_sequence_room_turn(
                 output_schema=output_schema,
             )
         else:
-            result = call_codex_history_chat(
+            result = call_provider_history_chat(
+                selected_provider,
                 root,
                 store,
                 branch_id,
@@ -6662,6 +7005,7 @@ def run_sequence_room_turn(
                 },
                 "sequenceReply": reply_index + 1,
                 "sequenceAccessMode": effective_access,
+                "provider": selected_provider,
                 **(
                     {
                         "sequenceEvaluation": evaluation,
@@ -6709,6 +7053,7 @@ def run_sequence_room_turn(
             "lastEvaluation": last_evaluation,
             "speakingOrder": speaking_order,
             "stopDecider": stop_decider,
+            "provider": selected_provider,
         },
     )
     payload = branch_payload(store, branch_id)
@@ -6723,6 +7068,7 @@ def run_sequence_room_turn(
         "lastEvaluation": last_evaluation,
         "speakingOrder": speaking_order,
         "stopDecider": stop_decider,
+        "provider": selected_provider,
     }
     return payload
 
@@ -6781,7 +7127,7 @@ def run_approval_decision(
         store,
         branch_id,
         user_message,
-        provider="codex",
+        provider=str(read_llm_config(root).get("provider") or "codex"),
         record_user=False,
         approved_external_paths=[path],
         progress=None,
@@ -8717,7 +9063,7 @@ def make_handler(
                 self.send_json(git_status_payload(root))
                 return True
             if parsed.path == "/api/provider/status":
-                self.send_json(codex_login_status(root))
+                self.send_json(provider_status(root))
                 return True
             if parsed.path == "/api/project/files":
                 try:
@@ -9119,7 +9465,7 @@ def make_handler(
                 provider = str(body.get("provider") or "") or None
                 history_limit = coerce_positive_int(body.get("limit"), 12)
                 if parsed.path == "/api/merge/start":
-                    if jobs.prefer_worker or provider == "codex-worker":
+                    if provider == "codex-worker" or (jobs.prefer_worker and provider in {None, "codex"}):
                         self.send_json(
                             jobs.create_worker(
                                 "merge",
@@ -9626,7 +9972,7 @@ def make_handler(
                 if not text:
                     self.send_json({"error": "message_required"}, status=400)
                     return
-                if jobs.prefer_worker or provider == "codex-worker":
+                if provider == "codex-worker" or (jobs.prefer_worker and provider in {None, "codex"}):
                     self.send_json(
                         jobs.create_worker(
                             "research",
@@ -9703,7 +10049,7 @@ def make_handler(
                 if not text:
                     self.send_json({"error": "message_required"}, status=400)
                     return
-                if jobs.prefer_worker or provider == "codex-worker":
+                if provider == "codex-worker" or (jobs.prefer_worker and provider in {None, "codex"}):
                     self.send_json(
                         jobs.create_worker(
                             "chat",
@@ -9742,7 +10088,7 @@ def make_handler(
                 if not text:
                     self.send_json({"error": "message_required"}, status=400)
                     return
-                if jobs.prefer_worker or provider == "codex-worker":
+                if provider == "codex-worker" or (jobs.prefer_worker and provider in {None, "codex"}):
                     self.send_json(
                         jobs.create_worker(
                             "info-chat",
@@ -9779,7 +10125,7 @@ def make_handler(
                 if not text:
                     self.send_json({"error": "message_required"}, status=400)
                     return
-                if jobs.prefer_worker or provider == "codex-worker":
+                if provider == "codex-worker" or (jobs.prefer_worker and provider in {None, "codex"}):
                     self.send_json(
                         jobs.create_worker(
                             "context-chat",
@@ -10465,7 +10811,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "provider" and args.provider_command == "status":
-        print(json.dumps(codex_login_status(root), indent=2, ensure_ascii=False))
+        print(json.dumps(provider_status(root), indent=2, ensure_ascii=False))
         return 0
 
     parser.print_help()

@@ -109,6 +109,13 @@
           <div class="section-title">LLM Provider</div>
           <div id="providerSummary" class="git-summary"></div>
           <form id="providerSettings" class="provider-settings">
+            <label for="providerInput">Provider</label>
+            <select id="providerInput">
+              <option value="codex">Codex</option>
+              <option value="claude">Claude Code</option>
+            </select>
+            <label for="providerModelInput">Model</label>
+            <select id="providerModelInput"></select>
             <label class="checkbox-label">
               <input id="webSearchInput" type="checkbox" />
               <span>Web search</span>

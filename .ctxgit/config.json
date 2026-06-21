@@ -3,9 +3,25 @@
   "createdAt": "2026-05-24T12:35:08Z",
   "defaultResearchProvider": "opencode",
   "llm": {
+    "claude": {
+      "bin": "claude",
+      "contextBudgetCharacters": 60000,
+      "historyBudgetCharacters": 120000,
+      "historyRecordLimit": 0,
+      "infoChatHistoryBudgetCharacters": 120000,
+      "model": "opus",
+      "sandbox": "workspace-write",
+      "timeoutSeconds": 900,
+      "webSearch": true
+    },
     "codex": {
       "bin": "codex",
+      "contextBudgetCharacters": 60000,
+      "historyBudgetCharacters": 120000,
+      "historyRecordLimit": 0,
+      "infoChatHistoryBudgetCharacters": 120000,
       "model": "",
+      "sandbox": "workspace-write",
       "timeoutSeconds": 6000,
       "webSearch": true
     },

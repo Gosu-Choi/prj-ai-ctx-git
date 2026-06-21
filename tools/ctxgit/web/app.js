@@ -103,6 +103,8 @@ const els = {
   mergeButton: document.querySelector("#mergeButton"),
   mergeStatus: document.querySelector("#mergeStatus"),
   providerSettings: document.querySelector("#providerSettings"),
+  providerInput: document.querySelector("#providerInput"),
+  providerModelInput: document.querySelector("#providerModelInput"),
   webSearchInput: document.querySelector("#webSearchInput"),
   timeoutSecondsInput: document.querySelector("#timeoutSecondsInput"),
   sandboxInput: document.querySelector("#sandboxInput"),
@@ -2015,16 +2017,38 @@ function renderProvider(status) {
   const webSearch = status.webSearch === false ? "off" : "on";
   const timeoutSeconds = status.timeoutSeconds || 900;
   const sandbox = status.sandbox || "workspace-write";
+  const model = status.model || "";
   const braveStatus = status.braveApiKeyConfigured
     ? `configured via ${status.braveApiKeySource || "environment"}`
     : "not configured";
+  const providers = Array.isArray(status.providers) ? status.providers : [];
+  if (providers.length) {
+    els.providerInput.innerHTML = providers
+      .map(
+        (item) =>
+          `<option value="${escapeHtml(item.id)}" ${item.installed ? "" : "disabled"}>${escapeHtml(item.label)}${item.ok ? " · ready" : item.installed ? " · login required" : " · not installed"}</option>`,
+      )
+      .join("");
+  }
+  const selectedProvider = providers.find((item) => item.id === (status.provider || "codex"));
+  const modelOptions = Array.isArray(selectedProvider?.models) ? selectedProvider.models : [];
+  els.providerModelInput.innerHTML = modelOptions
+    .map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.label)}</option>`)
+    .join("");
   els.providerSummary.innerHTML = `
     <div>Provider: <strong>${escapeHtml(status.provider || "codex")}</strong></div>
+    <div class="muted">Model: ${escapeHtml(model || "provider default")}</div>
     <div>${escapeHtml(status.message || status.status || "")}</div>
     <div class="muted">Web search: ${webSearch} · Timeout: ${escapeHtml(String(timeoutSeconds))}s</div>
     <div class="muted">Brave search: ${escapeHtml(braveStatus)}</div>
     <div class="muted">Sandbox: ${escapeHtml(sandbox)}</div>
     <div class="muted">External writes: approval required</div>
+    ${providers
+      .map(
+        (item) =>
+          `<div class="muted">${escapeHtml(item.label)}: ${item.ok ? "ready" : escapeHtml(item.status || "unavailable")}${item.id === "claude" ? " · OAuth/session auth" : ""}</div>`,
+      )
+      .join("")}
     ${
       status.ok
         ? ""
@@ -2032,6 +2056,8 @@ function renderProvider(status) {
     }
   `;
   els.webSearchInput.checked = webSearch === "on";
+  els.providerInput.value = status.provider || "codex";
+  els.providerModelInput.value = model;
   els.timeoutSecondsInput.value = timeoutSeconds;
   els.sandboxInput.value = sandbox;
   els.providerSettingsStatus.textContent = "";
@@ -2067,6 +2093,15 @@ function renderMessageResources(resources) {
         .join("")}
     </div>
   `;
+}
+
+function renderProviderModelOptions(providerId) {
+  const provider = (state.provider?.providers || []).find((item) => item.id === providerId);
+  const models = Array.isArray(provider?.models) ? provider.models : [];
+  els.providerModelInput.innerHTML = models
+    .map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.label)}</option>`)
+    .join("");
+  els.providerModelInput.value = provider?.model || models[0]?.id || "";
 }
 
 function renderSequenceEvaluation(message) {
@@ -3722,7 +3757,7 @@ els.mergeForm.addEventListener("submit", async (event) => {
     renderBranches();
     await startTrackedJob(
       "/api/merge/start",
-      { branches, name },
+      { branches, name, provider: state.provider?.provider || "codex" },
       { branch: name, mode: "merge", title: "머지 요약 생성 중" },
     );
     state.mergeSelectedBranches = [];
@@ -3958,7 +3993,9 @@ async function sendComposerMessage({ mode }) {
       }
     }
     if (isContextChat) {
-      const provider = state.worker?.preferWorker ? "codex-worker" : "codex";
+      const configuredProvider = state.provider?.provider || "codex";
+      const provider =
+        configuredProvider === "codex" && state.worker?.preferWorker ? "codex-worker" : configuredProvider;
       await startTrackedJob(
         "/api/context-chat/start",
         { text, provider },
@@ -3977,7 +4014,9 @@ async function sendComposerMessage({ mode }) {
       return;
     }
     if (isChat) {
-      const provider = state.worker?.preferWorker ? "codex-worker" : "codex";
+      const configuredProvider = state.provider?.provider || "codex";
+      const provider =
+        configuredProvider === "codex" && state.worker?.preferWorker ? "codex-worker" : configuredProvider;
       if (state.payload?.meta?.kind === "sequence-room") {
         await startTrackedJob(
           "/api/sequence-room/start",
@@ -4001,7 +4040,9 @@ async function sendComposerMessage({ mode }) {
       return;
     }
     if (isInfoChat) {
-      const provider = state.worker?.preferWorker ? "codex-worker" : "codex";
+      const configuredProvider = state.provider?.provider || "codex";
+      const provider =
+        configuredProvider === "codex" && state.worker?.preferWorker ? "codex-worker" : configuredProvider;
       if (state.payload?.meta?.kind === "sequence-room") {
         await startTrackedJob(
           "/api/sequence-room/start",
@@ -4105,6 +4146,10 @@ resizeMessageInput();
 
 els.copyEventLogButton.addEventListener("click", copyEventLog);
 
+els.providerInput.addEventListener("change", () => {
+  renderProviderModelOptions(els.providerInput.value);
+});
+
 els.providerSettings.addEventListener("submit", async (event) => {
   event.preventDefault();
   els.providerSettingsStatus.textContent = "";
@@ -4121,6 +4166,8 @@ els.providerSettings.addEventListener("submit", async (event) => {
       await api("/api/provider/config", {
         method: "POST",
         body: JSON.stringify({
+          provider: els.providerInput.value,
+          model: els.providerModelInput.value.trim(),
           timeoutSeconds,
           webSearch: els.webSearchInput.checked,
           sandbox: els.sandboxInput.value,
