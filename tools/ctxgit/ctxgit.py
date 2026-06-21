@@ -393,6 +393,8 @@ def run_internal_git(root: Path, args: list[str], check: bool = False) -> subpro
         cwd=root,
         check=check,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         capture_output=True,
     )
 
@@ -8880,6 +8882,8 @@ def make_handler(
                     self.send_json({"error": "fork_context_failed", "message": str(exc)}, status=409)
                 except SystemExit as exc:
                     self.send_json({"error": "fork_context_failed"}, status=int(exc.code or 400))
+                except Exception as exc:
+                    self.send_json({"error": "fork_context_failed", "message": str(exc)}, status=500)
                 return
             if parsed.path == "/api/research/start":
                 branch_id = str(body.get("branch") or "")

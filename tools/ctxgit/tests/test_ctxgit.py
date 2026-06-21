@@ -1159,6 +1159,46 @@ class CtxgitTest(unittest.TestCase):
             self.assertEqual(meta["forkedAtIndex"], 0)
             self.assertTrue(meta["forkedContextOnly"])
 
+    def test_fork_context_reads_non_ascii_history_from_internal_git(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("source", title="한글 브랜치")
+            turn_id = "turn_20260101T000000000000Z"
+            message = store.append_history(
+                "source",
+                "assistant",
+                "한글 메시지와 문맥입니다.",
+                extra={"turnId": turn_id},
+            )
+            ctxgit.write_text(
+                root / "contexts" / "branches" / "source" / "context.md",
+                "# 한글 문맥\n\n복원할 내용입니다.\n",
+            )
+            ctxgit.internal_git_commit_turn(
+                store,
+                kind="chat",
+                actor="user+agent",
+                summary="한글 turn",
+                branch_id="source",
+                turn_id=turn_id,
+            )
+
+            store.fork_context_at_history(
+                "source",
+                "forked",
+                0,
+                expected_created_at=message["createdAt"],
+                expected_role=message["role"],
+            )
+
+            fork_root = root / "contexts" / "branches" / "forked"
+            self.assertEqual(
+                (fork_root / "context.md").read_text(encoding="utf-8"),
+                "# 한글 문맥\n\n복원할 내용입니다.\n",
+            )
+            self.assertEqual(list(store.iter_history("forked")), [])
+
     def test_cut_branch_restores_history_and_context_to_turn_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
