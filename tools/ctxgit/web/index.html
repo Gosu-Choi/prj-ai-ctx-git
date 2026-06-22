@@ -165,6 +165,7 @@
             <button id="sequenceRoomUpdateButton" class="event-panel-toggle" type="button" hidden>Update agents</button>
             <button class="tab active" data-tab="chat" type="button">Chat</button>
             <button class="tab" data-tab="report" type="button">Report</button>
+            <button class="tab" data-tab="summaries" type="button">Summaries</button>
             <button class="tab" data-tab="files" type="button">Files</button>
             <button class="tab" data-tab="archives" type="button">Archives</button>
             <button class="tab" data-tab="graph" type="button">Graph</button>
@@ -210,6 +211,23 @@
 
         <section id="reportTab" class="tab-panel">
           <article id="reportView" class="markdown"></article>
+        </section>
+
+        <section id="summariesTab" class="tab-panel">
+          <div class="summary-layout">
+            <aside id="summaryList" class="summary-list"></aside>
+            <section class="summary-editor">
+              <div class="summary-toolbar">
+                <div>
+                  <h2 id="summaryTitle">History Summaries</h2>
+                  <div id="summaryMeta" class="nav-meta">Select a summary.</div>
+                </div>
+                <button id="summarySaveButton" type="button" disabled>Save summary</button>
+              </div>
+              <div id="summaryStatus" class="settings-status"></div>
+              <textarea id="summaryEditor" spellcheck="false" placeholder="Select a summary to inspect or edit."></textarea>
+            </section>
+          </div>
         </section>
 
         <section id="filesTab" class="tab-panel">
@@ -305,8 +323,20 @@
         <label>Minimum evaluator rounds<input id="sequenceUpdateMinEvaluatorRounds" type="number" min="1" max="20" /></label>
         <label>Acceptance criteria (one per line)<textarea id="sequenceUpdateAcceptanceCriteria" rows="5"></textarea></label>
         <div class="sequence-compare">
-          <section><h3>Archived snapshot</h3><pre id="sequenceSnapshotView"></pre></section>
-          <section><h3>Current source branch</h3><pre id="sequenceCurrentView"></pre></section>
+          <section>
+            <h3>Archived snapshot</h3>
+            <h4>Summaries</h4>
+            <pre id="sequenceSnapshotSummaryView" class="sequence-summary-view"></pre>
+            <h4>Context and history</h4>
+            <pre id="sequenceSnapshotView"></pre>
+          </section>
+          <section>
+            <h3>Current source branch</h3>
+            <h4>Summaries</h4>
+            <pre id="sequenceCurrentSummaryView" class="sequence-summary-view"></pre>
+            <h4>Context and history</h4>
+            <pre id="sequenceCurrentView"></pre>
+          </section>
         </div>
         <label class="checkbox-label"><input id="sequenceUpdateSnapshot" type="checkbox" /><span>Update archived snapshot from current branch</span></label>
         <div id="sequenceUpdateStatus" class="settings-status"></div>

@@ -65,10 +65,13 @@ TOOL_REPO_ROOT = Path(__file__).resolve().parents[2]
 INITIAL_BRANCH_ID = "initial"
 INITIAL_BRANCH_TITLE = "Initial branch"
 DEFAULT_CONTEXT_BUDGET_CHARS = 60000
-DEFAULT_HISTORY_CONTEXT_BUDGET_CHARS = 120000
+DEFAULT_HISTORY_CONTEXT_BUDGET_CHARS = 40000
+DEFAULT_INFO_CHAT_BUDGET_CHARS = 60000
+DEFAULT_SEQUENCE_CONTEXT_BUDGET_CHARS = DEFAULT_INFO_CHAT_BUDGET_CHARS
 DEFAULT_HISTORY_CONTEXT_RECORD_LIMIT = 0
-DEFAULT_COMPACTION_THRESHOLD = 80
-DEFAULT_COMPACTION_KEEP_TAIL = 40
+DEFAULT_COMPACTION_THRESHOLD = 40000
+DEFAULT_COMPACTION_KEEP_TAIL = 40000
+DEFAULT_COMPACTION_MIN_RECORDS = 6
 DEFAULT_RESEARCH_MIN_SOURCES = 6
 DEFAULT_RESEARCH_MIN_PAPERS = 3
 DEFAULT_RESEARCH_MAX_SOURCES = 24
@@ -1032,7 +1035,9 @@ class ContextStore:
                             "timeoutSeconds": 900,
                             "contextBudgetCharacters": DEFAULT_CONTEXT_BUDGET_CHARS,
                             "historyBudgetCharacters": DEFAULT_HISTORY_CONTEXT_BUDGET_CHARS,
+                            "infoChatBudgetCharacters": DEFAULT_INFO_CHAT_BUDGET_CHARS,
                             "infoChatHistoryBudgetCharacters": DEFAULT_HISTORY_CONTEXT_BUDGET_CHARS,
+                            "sequenceContextBudgetCharacters": DEFAULT_SEQUENCE_CONTEXT_BUDGET_CHARS,
                             "historyRecordLimit": DEFAULT_HISTORY_CONTEXT_RECORD_LIMIT,
                         },
                     },
@@ -2364,6 +2369,11 @@ class ContextStore:
         archive_root.mkdir(parents=True, exist_ok=True)
         write_text(archive_root / "history.jsonl", read_text(source_paths.history))
         write_text(archive_root / "context.md", read_text(source_paths.context))
+        if source_paths.compactions.exists():
+            target_compactions = archive_root / "compactions"
+            if target_compactions.exists():
+                shutil.rmtree(target_compactions)
+            shutil.copytree(source_paths.compactions, target_compactions)
         source_meta = load_json(source_paths.meta)
         dump_json(archive_root / "branch.json", source_meta)
         return {
@@ -3061,7 +3071,7 @@ class ContextStore:
             "participants": participants,
             "speakingOrder": [item["order"] for item in participants],
             "defaultMaxAgentReplies": max_agent_replies,
-            "stopDecider": None,
+            "stopDecider": participants[-1]["order"] if participants else None,
             "acceptanceCriteria": normalized_criteria,
             "minimumEvaluatorRounds": minimum_evaluator_rounds,
         }
@@ -3197,11 +3207,13 @@ class ContextStore:
             "snapshot": {
                 "context": read_text(archive_root / "context.md"),
                 "history": self.read_history_file(archive_root / "history.jsonl"),
+                "summaries": self.list_compaction_files(archive_root / "compactions"),
             },
             "current": {
                 "exists": source_paths.root.exists(),
                 "context": read_text(source_paths.context) if source_paths.root.exists() else "",
                 "history": self.read_history_file(source_paths.history) if source_paths.root.exists() else [],
+                "summaries": self.list_compactions(source_id) if source_paths.root.exists() else [],
             },
         }
 
@@ -3576,29 +3588,54 @@ class ContextStore:
             )
         return documents
 
+    def list_compaction_files(self, compactions_root: Path) -> list[dict[str, str]]:
+        if not compactions_root.exists():
+            return []
+        documents = []
+        for doc_path in sorted(compactions_root.glob("*.md")):
+            documents.append(
+                {
+                    "title": doc_path.stem,
+                    "path": relpath(self.root, doc_path),
+                    "text": read_text(doc_path),
+                }
+            )
+        return documents
+
+    def compacted_history_count(self, branch_id: str) -> int:
+        paths = self.branch_paths_for_read(branch_id)
+        if not paths.meta.exists():
+            return 0
+        return coerce_nonnegative_int(load_json(paths.meta).get("lastCompactedHistoryCount"), 0)
+
     def maybe_compact_history(
         self,
         branch_id: str,
         threshold: int = DEFAULT_COMPACTION_THRESHOLD,
         keep_tail: int = DEFAULT_COMPACTION_KEEP_TAIL,
+        min_records: int = DEFAULT_COMPACTION_MIN_RECORDS,
         use_ai: bool = True,
     ) -> Path | None:
         records = list(self.iter_history(branch_id))
-        if len(records) <= threshold:
-            return None
         paths = self.branch_paths(branch_id)
         meta = load_json(paths.meta)
-        last_count = coerce_positive_int(meta.get("lastCompactedHistoryCount"), 0)
-        if last_count >= len(records) - keep_tail:
+        last_count = min(coerce_positive_int(meta.get("lastCompactedHistoryCount"), 0), len(records))
+        uncompacted_records = records[last_count:]
+        if len(uncompacted_records) <= min_records:
             return None
-        compact_records = records[: max(0, len(records) - keep_tail)]
-        if not compact_records:
+        if history_records_char_count(uncompacted_records) <= threshold:
+            return None
+
+        tail_records = recent_history_tail(uncompacted_records, keep_tail)
+        compact_records = uncompacted_records[: max(0, len(uncompacted_records) - len(tail_records))]
+        if len(compact_records) < min_records:
             return None
         paths.compactions.mkdir(parents=True, exist_ok=True)
         now = utc_now()
         start = compact_records[0].get("createdAt", "")
         end = compact_records[-1].get("createdAt", "")
-        file_name = f"{now.replace(':', '').replace('-', '')}-history-{len(compact_records)}.md"
+        new_compacted_count = last_count + len(compact_records)
+        file_name = f"{now.replace(':', '').replace('-', '')}-history-{new_compacted_count}.md"
         path = paths.compactions / file_name
         body = ""
         if use_ai:
@@ -3616,7 +3653,7 @@ class ContextStore:
         if not body:
             body = self.history_compaction_markdown(branch_id, compact_records, start, end)
         write_text(path, body)
-        meta["lastCompactedHistoryCount"] = len(compact_records)
+        meta["lastCompactedHistoryCount"] = new_compacted_count
         meta["lastCompactionPath"] = relpath(self.root, path)
         meta["updatedAt"] = now
         dump_json(paths.meta, meta)
@@ -4471,7 +4508,9 @@ def default_llm_config() -> dict[str, Any]:
             "timeoutSeconds": 900,
             "contextBudgetCharacters": DEFAULT_CONTEXT_BUDGET_CHARS,
             "historyBudgetCharacters": DEFAULT_HISTORY_CONTEXT_BUDGET_CHARS,
+            "infoChatBudgetCharacters": DEFAULT_INFO_CHAT_BUDGET_CHARS,
             "infoChatHistoryBudgetCharacters": DEFAULT_HISTORY_CONTEXT_BUDGET_CHARS,
+            "sequenceContextBudgetCharacters": DEFAULT_SEQUENCE_CONTEXT_BUDGET_CHARS,
             "historyRecordLimit": DEFAULT_HISTORY_CONTEXT_RECORD_LIMIT,
         },
         "claude": {
@@ -4482,7 +4521,9 @@ def default_llm_config() -> dict[str, Any]:
             "timeoutSeconds": 900,
             "contextBudgetCharacters": DEFAULT_CONTEXT_BUDGET_CHARS,
             "historyBudgetCharacters": DEFAULT_HISTORY_CONTEXT_BUDGET_CHARS,
+            "infoChatBudgetCharacters": DEFAULT_INFO_CHAT_BUDGET_CHARS,
             "infoChatHistoryBudgetCharacters": DEFAULT_HISTORY_CONTEXT_BUDGET_CHARS,
+            "sequenceContextBudgetCharacters": DEFAULT_SEQUENCE_CONTEXT_BUDGET_CHARS,
             "historyRecordLimit": DEFAULT_HISTORY_CONTEXT_RECORD_LIMIT,
         },
     }
@@ -4782,11 +4823,7 @@ def call_codex_history_compaction(
     llm = read_llm_config(root)
     codex_config = llm.get("codex") if isinstance(llm.get("codex"), dict) else {}
     timeout_seconds = min(coerce_positive_int(codex_config.get("timeoutSeconds"), 900), 300)
-    formatted_records = "\n".join(
-        f"- {record.get('createdAt', '')} {record.get('role', 'unknown')}: "
-        f"{truncate_middle(str(record.get('text') or '').strip(), 1200)}"
-        for record in records
-    )
+    formatted_records = "\n".join(format_history_record(record) for record in records)
     role_counts: dict[str, int] = {}
     for record in records:
         role = str(record.get("role") or "unknown")
@@ -4894,11 +4931,7 @@ def call_provider_history_compaction(
     provider = str(read_llm_config(root).get("provider") or "codex")
     if provider == "codex":
         return call_codex_history_compaction(root, store, branch_id, records)
-    formatted = "\n".join(
-        f"- {record.get('createdAt', '')} {record.get('role', 'unknown')}: "
-        f"{truncate_middle(str(record.get('text') or '').strip(), 1200)}"
-        for record in records
-    )
+    formatted = "\n".join(format_history_record(record) for record in records)
     prompt = "\n".join([
         "Compact this older ctxgit conversation into durable Markdown memory.",
         "Do not invent facts. Preserve goals, decisions, constraints, sources, unresolved questions, and timeline.",
@@ -4935,13 +4968,18 @@ def coerce_nonnegative_int(value: Any, default: int) -> int:
 
 
 def truncate_middle(text: str, max_chars: int) -> str:
-    if max_chars <= 0 or len(text) <= max_chars:
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
         return text
     marker = "\n\n[... truncated ...]\n\n"
+    if max_chars <= len(marker):
+        return text[:max_chars]
     keep = max(0, max_chars - len(marker))
     head = keep // 2
     tail = keep - head
-    return text[:head].rstrip() + marker + text[-tail:].lstrip()
+    suffix = text[-tail:].lstrip() if tail else ""
+    return text[:head].rstrip() + marker + suffix
 
 
 def project_context_sections(store: ContextStore, budget_chars: int) -> list[str]:
@@ -5099,23 +5137,31 @@ def current_turn_attachment_section(
     return "\n".join(lines).strip()
 
 
-def compaction_context_sections(store: ContextStore, branch_id: str, budget_chars: int) -> str:
+def selected_compaction_documents(store: ContextStore, branch_id: str, budget_chars: int) -> list[dict[str, Any]]:
     if budget_chars <= 0:
-        return "(none)"
-    sections = []
+        return []
+    selected: list[dict[str, Any]] = []
     remaining = budget_chars
     for compaction in reversed(store.list_compactions(branch_id)):
         text = str(compaction.get("text") or "").strip()
         if not text:
             continue
         chunk = truncate_middle(text, remaining)
-        if len(chunk) > remaining and sections:
+        if len(chunk) > remaining and selected:
             break
-        sections.append(chunk)
+        selected.append({**compaction, "text": chunk})
         remaining -= len(chunk)
         if remaining <= 0:
             break
-    return "\n\n".join(reversed(sections)).strip() or "(none)"
+    return list(reversed(selected))
+
+
+def compaction_context_sections(store: ContextStore, branch_id: str, budget_chars: int) -> str:
+    sections = [
+        str(item.get("text") or "").strip()
+        for item in selected_compaction_documents(store, branch_id, budget_chars)
+    ]
+    return "\n\n".join(section for section in sections if section).strip() or "(none)"
 
 
 def archive_reference_section(store: ContextStore, branch_id: str) -> str:
@@ -5158,6 +5204,28 @@ def format_history_record(record: dict[str, Any]) -> str:
         if resource_lines:
             line += "\n  resources:\n" + "\n".join(resource_lines)
     return line
+
+
+def history_records_char_count(records: list[dict[str, Any]]) -> int:
+    return sum(len(format_history_record(record)) + 1 for record in records)
+
+
+def recent_history_tail(records: list[dict[str, Any]], budget_chars: int) -> list[dict[str, Any]]:
+    return select_history_for_budget(records, budget_chars)
+
+
+def prompt_history_records(
+    store: ContextStore,
+    branch_id: str,
+    budget_chars: int,
+    max_records: int | None = None,
+) -> tuple[list[dict[str, Any]], int, int]:
+    records = list(store.iter_history(branch_id))
+    compacted_count = min(store.compacted_history_count(branch_id), len(records))
+    live_records = records[compacted_count:]
+    selected = select_history_for_budget(live_records, budget_chars, max_records=max_records)
+    omitted_live = max(0, len(live_records) - len(selected))
+    return selected, compacted_count, omitted_live
 
 
 def select_history_for_budget(
@@ -5213,12 +5281,14 @@ def build_context_bundle(store: ContextStore, branch_id: str) -> dict[str, str]:
     source_context = source_context_sections(store, branch_id, source_budget)
     resource_context = resource_context_sections(store, branch_id, resource_budget)
     compaction_context = compaction_context_sections(store, branch_id, compaction_budget)
-    records = list(store.iter_history(branch_id))
-    history_records = select_history_for_budget(records, history_budget, max_records=history_record_limit)
-    omitted = max(0, len(records) - len(history_records))
+    history_records, compacted_count, omitted_live = prompt_history_records(
+        store, branch_id, history_budget, max_records=history_record_limit,
+    )
     history_lines = [format_history_record(item) for item in history_records]
-    if omitted:
-        history_lines.insert(0, f"- [ctxgit omitted {omitted} older raw history records; consult archives or compactions if needed]")
+    if omitted_live:
+        history_lines.insert(0, f"- [ctxgit omitted {omitted_live} older uncompacted raw history records to fit the prompt budget]")
+    if compacted_count:
+        history_lines.insert(0, f"- [ctxgit replaced {compacted_count} older raw history records with Long-history compactions above]")
     return {
         "project": project_context or "(none)",
         "branch": branch_context or "(none)",
@@ -5347,7 +5417,7 @@ def build_history_chat_prompt(
     codex_config = active_llm_provider_config(store.root)
     budget = coerce_positive_int(
         codex_config.get("infoChatBudgetCharacters") or codex_config.get("historyOnlyBudgetCharacters"),
-        min(DEFAULT_CONTEXT_BUDGET_CHARS, 45000),
+        DEFAULT_INFO_CHAT_BUDGET_CHARS,
     )
     project_budget = max(10000, budget // 3)
     branch_budget = max(10000, budget // 3)
@@ -5361,13 +5431,16 @@ def build_history_chat_prompt(
     project_context = "\n\n".join(project_context_sections(store, project_budget)).strip()
     branch_context = truncate_middle(store.context_excerpt(branch_id), branch_budget).strip()
     resource_context = resource_context_sections(store, branch_id, resource_budget)
+    compaction_context = compaction_context_sections(store, branch_id, max(8000, budget // 4))
     current_attachments = current_turn_attachment_section(store, branch_id, resource_paths)
-    records = list(store.iter_history(branch_id))
-    history_records = select_history_for_budget(records, history_budget, max_records=history_record_limit)
-    omitted = max(0, len(records) - len(history_records))
+    history_records, compacted_count, omitted_live = prompt_history_records(
+        store, branch_id, history_budget, max_records=history_record_limit,
+    )
     history_lines = [format_history_record(item) for item in history_records]
-    if omitted:
-        history_lines.insert(0, f"- [ctxgit omitted {omitted} older raw history records]")
+    if omitted_live:
+        history_lines.insert(0, f"- [ctxgit omitted {omitted_live} older uncompacted raw history records to fit the prompt budget]")
+    if compacted_count:
+        history_lines.insert(0, f"- [ctxgit replaced {compacted_count} older raw history records with summaries below]")
     archive_references = archive_reference_section(store, branch_id)
     parts = [
         "You are answering in ctxgit info-chat mode.",
@@ -5403,6 +5476,11 @@ def build_history_chat_prompt(
         "<resources>",
         resource_context,
         "</resources>",
+        "",
+        "Long-history compaction summaries currently injected:",
+        "<compactions>",
+        compaction_context,
+        "</compactions>",
         "",
     ]
     if archive_references:
@@ -6582,6 +6660,7 @@ def run_history_chat_turn(
     if normalized_resources:
         user_extra["resources"] = normalized_resources
     store.append_history(branch_id, "user", user_message, extra=user_extra)
+    store.maybe_compact_history(branch_id)
     result = call_provider_history_chat(
         selected_provider,
         root,
@@ -6926,13 +7005,51 @@ def sequence_evaluation_allows_stop(
 def sequence_history_text(
     records: list[dict[str, Any]],
     budget_chars: int,
+    *,
+    compacted_count: int = 0,
+    compaction_label: str = "compactions above",
 ) -> str:
-    selected = select_history_for_budget(records, budget_chars)
-    omitted = max(0, len(records) - len(selected))
+    compacted_count = min(max(0, compacted_count), len(records))
+    live_records = records[compacted_count:]
+    selected = select_history_for_budget(live_records, budget_chars)
+    omitted = max(0, len(live_records) - len(selected))
     lines = [format_history_record(item) for item in selected]
     if omitted:
-        lines.insert(0, f"- [ctxgit omitted {omitted} older records to fit the sequence context budget]")
+        lines.insert(0, f"- [ctxgit omitted {omitted} older uncompacted records to fit the sequence context budget]")
+    if compacted_count:
+        lines.insert(0, f"- [ctxgit replaced {compacted_count} older records with {compaction_label}]")
     return "\n".join(lines) or "(none)"
+
+
+def archive_compacted_history_count(archive_root: Path) -> int:
+    meta_path = archive_root / "branch.json"
+    if not meta_path.exists():
+        return 0
+    try:
+        return coerce_nonnegative_int(load_json(meta_path).get("lastCompactedHistoryCount"), 0)
+    except Exception:
+        return 0
+
+
+def archive_compaction_text(archive_root: Path, budget_chars: int) -> str:
+    compactions_root = archive_root / "compactions"
+    if budget_chars <= 0 or not compactions_root.exists():
+        return "(none)"
+    selected: list[str] = []
+    remaining = budget_chars
+    files = [path for path in sorted(compactions_root.rglob("*.md")) if path.is_file()]
+    for path in reversed(files):
+        text = read_text(path).strip()
+        if not text:
+            continue
+        chunk = truncate_middle(text, remaining)
+        if len(chunk) > remaining and selected:
+            break
+        selected.append(chunk)
+        remaining -= len(chunk)
+        if remaining <= 0:
+            break
+    return "\n\n".join(reversed(selected)).strip() or "(none)"
 
 
 def build_sequence_agent_prompt(
@@ -6955,14 +7072,22 @@ def build_sequence_agent_prompt(
     archive_history = store.read_history_file(archive_root / "history.jsonl")
     room_history = list(store.iter_history(branch_id))
     config = active_llm_provider_config(store.root)
-    total_budget = coerce_positive_int(
-        config.get("sequenceContextBudgetCharacters") or config.get("contextBudgetCharacters"),
-        DEFAULT_CONTEXT_BUDGET_CHARS,
+    total_budget = max(
+        coerce_positive_int(config.get("sequenceContextBudgetCharacters"), DEFAULT_SEQUENCE_CONTEXT_BUDGET_CHARS),
+        coerce_positive_int(
+            config.get("infoChatBudgetCharacters") or config.get("historyOnlyBudgetCharacters"),
+            DEFAULT_INFO_CHAT_BUDGET_CHARS,
+        ),
+        DEFAULT_SEQUENCE_CONTEXT_BUDGET_CHARS,
     )
-    source_context_budget = max(8000, int(total_budget * 0.22))
-    source_history_budget = max(14000, int(total_budget * 0.42))
-    room_history_budget = max(12000, int(total_budget * 0.30))
-    room_context_budget = max(2000, int(total_budget * 0.06))
+    source_context_budget = max(5000, int(total_budget * 0.20))
+    source_compaction_budget = max(5000, int(total_budget * 0.20))
+    source_history_budget = max(8000, int(total_budget * 0.27))
+    room_compaction_budget = max(5000, int(total_budget * 0.12))
+    room_history_budget = max(7000, int(total_budget * 0.23))
+    room_context_budget = max(1500, int(total_budget * 0.05))
+    source_compacted_count = archive_compacted_history_count(archive_root)
+    room_compacted_count = store.compacted_history_count(branch_id)
     evaluator_instruction = (
         f"You are Agent {stop_decider}, the evaluator. Give your substantive response in `assistant`, then "
         "return `sequenceEvaluation` using the required output schema. The harness, not you, "
@@ -7003,16 +7128,32 @@ def build_sequence_agent_prompt(
         "<source_context>",
         truncate_middle(read_text(archive_root / "context.md"), source_context_budget),
         "</source_context>",
+        "<source_compactions>",
+        archive_compaction_text(archive_root, source_compaction_budget),
+        "</source_compactions>",
         "<source_history>",
-        sequence_history_text(archive_history, source_history_budget),
+        sequence_history_text(
+            archive_history,
+            source_history_budget,
+            compacted_count=source_compacted_count,
+            compaction_label="source compactions above",
+        ),
         "</source_history>",
         "",
         "Sequence room context:",
         "<room_context>",
         truncate_middle(read_text(room_paths.context), room_context_budget),
         "</room_context>",
+        "<room_compactions>",
+        compaction_context_sections(store, branch_id, room_compaction_budget),
+        "</room_compactions>",
         "<room_history>",
-        sequence_history_text(room_history, room_history_budget),
+        sequence_history_text(
+            room_history,
+            room_history_budget,
+            compacted_count=room_compacted_count,
+            compaction_label="room compactions above",
+        ),
         "</room_history>",
         "",
         f"Current reply number: {reply_index + 1} of at most {maximum}.",
@@ -7075,6 +7216,7 @@ def run_sequence_room_turn(
         user_message,
         extra={"turnId": run_id, "mode": "sequence-room", "sequenceRunMode": run_mode},
     )
+    store.maybe_compact_history(branch_id)
     stopped = False
     stop_reason = ""
     evaluator_rounds = 0
@@ -7665,6 +7807,24 @@ def branch_payload(store: ContextStore, branch_id: str) -> dict[str, Any]:
     history_path = relpath(store.root, paths.history)
     context_path = relpath(store.root, paths.context)
     meta = load_json(paths.meta)
+    active_context_budget = coerce_positive_int(
+        active_llm_provider_config(store.root).get("contextBudgetCharacters"),
+        DEFAULT_CONTEXT_BUDGET_CHARS,
+    )
+    injected_compaction_paths = {
+        str(item.get("path") or "")
+        for item in selected_compaction_documents(store, branch_id, max(8000, active_context_budget // 4))
+    }
+    compaction_items = []
+    for item in store.list_compactions(branch_id):
+        compaction_items.append(
+            {
+                "title": item["title"],
+                "path": item["path"],
+                "chars": len(str(item.get("text") or "")),
+                "injected": item["path"] in injected_compaction_paths,
+            }
+        )
     payload = {
         "meta": meta,
         "archived": archived,
@@ -7681,9 +7841,7 @@ def branch_payload(store: ContextStore, branch_id: str) -> dict[str, Any]:
         "artifacts": store.list_branch_documents(branch_id, "artifacts"),
         "resources": store.list_resources(branch_id),
         "sources": store.list_sources(branch_id),
-        "compactions": [
-            {"title": item["title"], "path": item["path"]} for item in store.list_compactions(branch_id)
-        ],
+        "compactions": compaction_items,
         "archives": store.list_archives(branch_id),
         "git": {
             "historyLog": run_git(store.root, ["log", "--oneline", "--", history_path]),
@@ -7700,6 +7858,14 @@ def branch_payload(store: ContextStore, branch_id: str) -> dict[str, Any]:
     if meta.get("kind") == "sequence-room":
         payload["sequenceRoom"] = meta.get("sequenceRoom")
     return payload
+
+
+def branch_is_sequence_room(store: ContextStore, branch_id: str) -> bool:
+    try:
+        meta = load_json(store.branch_paths_for_read(branch_id).meta)
+    except Exception:
+        return False
+    return meta.get("kind") == "sequence-room"
 
 
 def internal_git_status_payload(root: Path) -> dict[str, Any]:
@@ -7865,6 +8031,32 @@ def project_file_text_payload(root: Path, path_value: str) -> dict[str, Any]:
         "text": text,
         "binary": binary,
         "truncated": truncated,
+    }
+
+
+def resolve_branch_compaction_file(store: ContextStore, branch_id: str, path_value: str) -> Path:
+    paths = store.branch_paths_for_read(branch_id)
+    if not paths.compactions.exists():
+        raise FileNotFoundError(path_value)
+    target = resolve_project_file(store.root, path_value)
+    try:
+        target.relative_to(paths.compactions.resolve())
+    except ValueError as exc:
+        raise ValueError("summary path is outside this branch compactions directory") from exc
+    if target.suffix.lower() != ".md":
+        raise ValueError("summary file must be markdown")
+    return target
+
+
+def branch_compaction_payload(store: ContextStore, branch_id: str, path_value: str) -> dict[str, Any]:
+    target = resolve_branch_compaction_file(store, branch_id, path_value)
+    return {
+        "branch": branch_id,
+        "path": relpath(store.root, target),
+        "name": target.name,
+        "text": read_text(target),
+        "size": target.stat().st_size,
+        "modifiedAt": project_file_modified_at(target),
     }
 
 
@@ -9252,6 +9444,20 @@ def make_handler(
                 except ValueError as exc:
                     self.send_json({"error": "file_read_failed", "message": str(exc)}, status=400)
                 return True
+            if parsed.path == "/api/branch/compaction":
+                try:
+                    self.send_json(
+                        branch_compaction_payload(
+                            store,
+                            (query.get("branch") or [""])[0],
+                            (query.get("path") or [""])[0],
+                        )
+                    )
+                except FileNotFoundError:
+                    self.send_json({"error": "summary_not_found", "message": "Summary file not found."}, status=404)
+                except (SystemExit, ValueError) as exc:
+                    self.send_json({"error": "summary_read_failed", "message": str(exc)}, status=400)
+                return True
             return False
 
         def handle_file_get(self, parsed: urllib.parse.ParseResult) -> None:
@@ -9984,6 +10190,34 @@ def make_handler(
                 except SystemExit as exc:
                     self.send_json({"error": "append_failed"}, status=int(exc.code or 400))
                 return
+            if parsed.path == "/api/branch/compaction":
+                branch_id = str(body.get("branch") or "")
+                path_value = str(body.get("path") or "")
+                text = str(body.get("text") or "")
+                try:
+                    target = resolve_branch_compaction_file(store, branch_id, path_value)
+                    write_text(target, text)
+                    paths = store.branch_paths(branch_id)
+                    meta = load_json(paths.meta)
+                    meta["updatedAt"] = utc_now()
+                    dump_json(paths.meta, meta)
+                    turn_commit = internal_git_commit_turn(
+                        store,
+                        kind="compaction-edit",
+                        actor="user",
+                        summary=f"Edit history summary on {branch_id}",
+                        branch_id=branch_id,
+                        metadata={"path": relpath(store.root, target)},
+                    )
+                    payload = branch_payload(store, branch_id)
+                    payload["summaryEdit"] = branch_compaction_payload(store, branch_id, relpath(store.root, target))
+                    payload["turnCommit"] = turn_commit
+                    self.send_json(payload)
+                except FileNotFoundError:
+                    self.send_json({"error": "summary_not_found", "message": "Summary file not found."}, status=404)
+                except (SystemExit, ValueError) as exc:
+                    self.send_json({"error": "summary_edit_failed", "message": str(exc)}, status=400)
+                return
             if parsed.path == "/api/history/delete":
                 branch_id = str(body.get("branch") or "")
                 try:
@@ -10243,6 +10477,22 @@ def make_handler(
                 if not text:
                     self.send_json({"error": "message_required"}, status=400)
                     return
+                if branch_is_sequence_room(store, branch_id):
+                    maximum_raw = coerce_nonnegative_int(body.get("maxAgentReplies"), 0)
+
+                    def sequence_work(progress: ProgressCallback) -> dict[str, Any]:
+                        return run_sequence_room_turn(
+                            root,
+                            store,
+                            branch_id,
+                            text,
+                            maximum_raw or None,
+                            run_mode="send",
+                            progress=progress,
+                        )
+
+                    self.send_json(jobs.create("sequence-room", sequence_work, root=root), status=202)
+                    return
                 if provider == "codex-worker" or (jobs.prefer_worker and provider in {None, "codex"}):
                     self.send_json(
                         jobs.create_worker(
@@ -10281,6 +10531,22 @@ def make_handler(
                 resources = request_resource_paths(body)
                 if not text:
                     self.send_json({"error": "message_required"}, status=400)
+                    return
+                if branch_is_sequence_room(store, branch_id):
+                    maximum_raw = coerce_nonnegative_int(body.get("maxAgentReplies"), 0)
+
+                    def sequence_work(progress: ProgressCallback) -> dict[str, Any]:
+                        return run_sequence_room_turn(
+                            root,
+                            store,
+                            branch_id,
+                            text,
+                            maximum_raw or None,
+                            run_mode="info-chat",
+                            progress=progress,
+                        )
+
+                    self.send_json(jobs.create("sequence-room", sequence_work, root=root), status=202)
                     return
                 if provider == "codex-worker" or (jobs.prefer_worker and provider in {None, "codex"}):
                     self.send_json(
@@ -10358,6 +10624,17 @@ def make_handler(
                     self.send_json({"error": "message_required"}, status=400)
                     return
                 try:
+                    if branch_is_sequence_room(store, branch_id):
+                        self.send_json(
+                            run_sequence_room_turn(
+                                root,
+                                store,
+                                branch_id,
+                                text,
+                                run_mode="send",
+                            )
+                        )
+                        return
                     self.send_json(run_chat_turn(root, store, branch_id, text, provider=provider, resource_paths=resources))
                 except ChatTimeoutError as exc:
                     self.send_json({"error": "timeout", "message": str(exc)}, status=504)
@@ -10377,6 +10654,17 @@ def make_handler(
                     self.send_json({"error": "message_required"}, status=400)
                     return
                 try:
+                    if branch_is_sequence_room(store, branch_id):
+                        self.send_json(
+                            run_sequence_room_turn(
+                                root,
+                                store,
+                                branch_id,
+                                text,
+                                run_mode="info-chat",
+                            )
+                        )
+                        return
                     self.send_json(
                         run_history_chat_turn(root, store, branch_id, text, provider=provider, resource_paths=resources)
                     )

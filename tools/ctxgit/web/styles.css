@@ -788,6 +788,13 @@ textarea {
   min-width: 0;
 }
 
+.sequence-compare h4 {
+  margin: 10px 0 4px;
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
 .sequence-compare pre {
   height: 360px;
   overflow: auto;
@@ -796,6 +803,10 @@ textarea {
   border-radius: 6px;
   padding: 10px;
   background: #f7f7f2;
+}
+
+.sequence-compare .sequence-summary-view {
+  height: 160px;
 }
 
 .tab-panel {
@@ -832,6 +843,12 @@ textarea {
 #chatTab.active.event-visible .resource-stage {
   width: 100%;
   max-width: none;
+}
+
+#summariesTab.active {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
+  overflow: hidden;
 }
 
 .chat-main {
@@ -1665,16 +1682,79 @@ textarea {
   gap: 16px;
 }
 
-.archive-layout {
+.archive-layout,
+.summary-layout {
   display: grid;
   grid-template-columns: minmax(220px, 320px) minmax(0, 1fr);
   gap: 16px;
   align-items: start;
+  min-height: 0;
+}
+
+.summary-layout {
+  height: 100%;
+  align-items: stretch;
 }
 
 .archive-list,
-.archive-viewer {
+.archive-viewer,
+.summary-list,
+.summary-editor {
   min-width: 0;
+}
+
+.summary-list {
+  max-height: 100%;
+  overflow: auto;
+}
+
+.summary-editor {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  gap: 10px;
+  min-height: 0;
+}
+
+.summary-toolbar {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.summary-toolbar h2 {
+  margin: 0 0 4px;
+  font-size: 16px;
+}
+
+#summarySaveButton {
+  min-width: 112px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+  padding: 7px 10px;
+}
+
+#summarySaveButton:disabled {
+  color: var(--muted);
+  cursor: not-allowed;
+}
+
+#summaryEditor {
+  width: 100%;
+  height: 100%;
+  min-height: min(560px, calc(100vh - 230px));
+  resize: none;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  padding: 12px;
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  line-height: 1.45;
 }
 
 .archive-heading {

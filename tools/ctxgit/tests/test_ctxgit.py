@@ -27,6 +27,11 @@ SPEC.loader.exec_module(ctxgit)
 
 
 class CtxgitTest(unittest.TestCase):
+    def test_truncate_middle_respects_small_budget(self) -> None:
+        self.assertEqual(ctxgit.truncate_middle("abcdef", 0), "")
+        self.assertEqual(ctxgit.truncate_middle("abcdef", 3), "abc")
+        self.assertLessEqual(len(ctxgit.truncate_middle("abcdef" * 20, 30)), 30)
+
     def test_new_turn_id_uses_timestamp_code(self) -> None:
         turn_id = ctxgit.new_turn_id()
 
@@ -555,6 +560,79 @@ class CtxgitTest(unittest.TestCase):
             self.assertEqual(default_project["path"], str(first.resolve()))
             self.assertIn("second_only", [branch["id"] for branch in branches["branches"]])
 
+    def test_info_chat_start_on_sequence_room_routes_to_sequence_runner(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.init()
+            store.create_branch("one")
+            store.create_branch("two")
+            store.create_sequence_room(
+                ["one", "two"], "room", "Room", ["", ""],
+                ["info-chat", "info-chat"], 4,
+            )
+            project_state = ctxgit.ProjectState(root)
+            handler = ctxgit.make_handler(project_state, auth_required=False)
+            calls: list[dict[str, str]] = []
+            original = ctxgit.run_sequence_room_turn
+
+            def fake_sequence_room_turn(_root, fake_store, branch_id, user_message, max_agent_replies=None, run_mode="send", progress=None):
+                calls.append({"branch": branch_id, "text": user_message, "runMode": run_mode})
+                return ctxgit.branch_payload(fake_store, branch_id)
+
+            ctxgit.run_sequence_room_turn = fake_sequence_room_turn
+            try:
+                with ctxgit.ReusableThreadingHTTPServer(("127.0.0.1", 0), handler) as server:
+                    thread = threading.Thread(target=server.serve_forever, daemon=True)
+                    thread.start()
+                    base_url = f"http://127.0.0.1:{server.server_port}"
+                    try:
+                        request = urllib.request.Request(
+                            f"{base_url}/api/info-chat/start",
+                            data=json.dumps({"branch": "room", "text": "Run the room."}).encode("utf-8"),
+                            headers={"Content-Type": "application/json"},
+                            method="POST",
+                        )
+                        with urllib.request.urlopen(request, timeout=5) as response:
+                            status = response.status
+                            payload = json.loads(response.read().decode("utf-8"))
+                        for _ in range(30):
+                            with urllib.request.urlopen(f"{base_url}/api/job?id={urllib.parse.quote(payload['id'])}", timeout=5) as response:
+                                job = json.loads(response.read().decode("utf-8"))
+                            if job.get("status") == "done":
+                                break
+                            time.sleep(0.1)
+
+                        request = urllib.request.Request(
+                            f"{base_url}/api/chat/start",
+                            data=json.dumps({"branch": "room", "text": "Run the writable room."}).encode("utf-8"),
+                            headers={"Content-Type": "application/json"},
+                            method="POST",
+                        )
+                        with urllib.request.urlopen(request, timeout=5) as response:
+                            chat_status = response.status
+                            chat_payload = json.loads(response.read().decode("utf-8"))
+                        for _ in range(30):
+                            with urllib.request.urlopen(f"{base_url}/api/job?id={urllib.parse.quote(chat_payload['id'])}", timeout=5) as response:
+                                job = json.loads(response.read().decode("utf-8"))
+                            if job.get("status") == "done":
+                                break
+                            time.sleep(0.1)
+                    finally:
+                        server.shutdown()
+                        thread.join(timeout=5)
+            finally:
+                ctxgit.run_sequence_room_turn = original
+
+            self.assertEqual(status, 202)
+            self.assertEqual(payload["kind"], "sequence-room")
+            self.assertEqual(calls[0]["branch"], "room")
+            self.assertEqual(calls[0]["runMode"], "info-chat")
+            self.assertEqual(chat_status, 202)
+            self.assertEqual(chat_payload["kind"], "sequence-room")
+            self.assertEqual(calls[1]["branch"], "room")
+            self.assertEqual(calls[1]["runMode"], "send")
+
     def test_serve_defaults_to_no_auth_with_auth_opt_in(self) -> None:
         parser = ctxgit.build_parser()
 
@@ -572,7 +650,9 @@ class CtxgitTest(unittest.TestCase):
             store = ctxgit.ContextStore(root)
             store.init()
             store.append_history("initial", "user", "hello")
-            self.assertIn(".ctxgit/git/", (root / ".gitignore").read_text())
+            gitignore = (root / ".gitignore").read_text()
+            self.assertIn(".ctxgit/.env", gitignore)
+            self.assertNotIn(".ctxgit/git/", gitignore)
 
             turn = ctxgit.internal_git_commit_turn(
                 store,
@@ -830,6 +910,9 @@ class CtxgitTest(unittest.TestCase):
             store.append_history("critic", "user", "evaluation background")
             ctxgit.write_text(store.branch_paths("writer").context, "# Writer\n\nWrite releases.\n")
             ctxgit.write_text(store.branch_paths("critic").context, "# Critic\n\nEvaluate releases.\n")
+            writer_compactions = store.branch_paths("writer").compactions
+            writer_compactions.mkdir(parents=True, exist_ok=True)
+            ctxgit.write_text(writer_compactions / "writer-summary.md", "Archived writer summary.")
 
             store.create_sequence_room(
                 ["writer", "critic"],
@@ -842,6 +925,7 @@ class CtxgitTest(unittest.TestCase):
             payload = ctxgit.branch_payload(store, "room")
             self.assertEqual(payload["meta"]["kind"], "sequence-room")
             self.assertEqual([item["sourceBranch"] for item in payload["sequenceRoom"]["participants"]], ["writer", "critic"])
+            self.assertEqual(payload["sequenceRoom"]["stopDecider"], 2)
             self.assertEqual(payload["history"], [])
             store.update_sequence_speaking_order(
                 "room",
@@ -915,7 +999,13 @@ class CtxgitTest(unittest.TestCase):
 
             comparison = store.sequence_participant_comparison("room", 1)
             self.assertIn("Write releases", comparison["snapshot"]["context"])
+            self.assertIn("Archived writer summary", comparison["snapshot"]["summaries"][0]["text"])
+            self.assertIn("Archived writer summary", comparison["current"]["summaries"][0]["text"])
             ctxgit.write_text(store.branch_paths("writer").context, "# Writer\n\nUpdated source.\n")
+            ctxgit.write_text(writer_compactions / "writer-summary.md", "Updated writer summary.")
+            changed_comparison = store.sequence_participant_comparison("room", 1)
+            self.assertIn("Archived writer summary", changed_comparison["snapshot"]["summaries"][0]["text"])
+            self.assertIn("Updated writer summary", changed_comparison["current"]["summaries"][0]["text"])
             store.update_sequence_participant(
                 "room",
                 1,
@@ -925,6 +1015,7 @@ class CtxgitTest(unittest.TestCase):
             )
             updated = store.sequence_participant_comparison("room", 1)
             self.assertIn("Updated source", updated["snapshot"]["context"])
+            self.assertIn("Updated writer summary", updated["snapshot"]["summaries"][0]["text"])
             self.assertEqual(updated["participant"]["systemPrompt"], "New writer role.")
             self.assertEqual(updated["participant"]["accessMode"], "info-chat")
 
@@ -1945,6 +2036,156 @@ class CtxgitTest(unittest.TestCase):
             bundle = ctxgit.build_context_bundle(store, "AItrust")
             self.assertIn("History Compaction: AItrust", bundle["compactions"])
 
+    def test_info_chat_prompt_uses_compaction_summary_and_live_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("AItrust")
+            for index in range(14):
+                store.append_history("AItrust", "user", f"old message {index} " + ("x" * 80))
+
+            path = store.maybe_compact_history("AItrust", threshold=300, keep_tail=260, use_ai=False)
+
+            self.assertIsNotNone(path)
+            prompt = ctxgit.build_history_chat_prompt(store, "AItrust", "What remains?")
+            self.assertIn("Long-history compaction summaries currently injected", prompt)
+            self.assertIn("History Compaction: AItrust", prompt)
+            self.assertIn("ctxgit replaced", prompt)
+            self.assertIn("old message 13", prompt)
+
+    def test_history_compaction_prompt_uses_full_record_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.init()
+            config = ctxgit.load_json(root / ".ctxgit" / "config.json")
+            config["llm"]["provider"] = "claude"
+            ctxgit.dump_json(root / ".ctxgit" / "config.json", config)
+            sentinel = "FULL_RECORD_MIDDLE_SENTINEL"
+            records = [
+                {
+                    "createdAt": "2026-06-22T00:00:00Z",
+                    "role": "user",
+                    "text": ("a" * 900) + sentinel + ("b" * 900),
+                }
+            ]
+            captured: dict[str, str] = {}
+            original = ctxgit.call_claude_prompt
+            try:
+                def fake_call_claude_prompt(_root, prompt, **_kwargs):
+                    captured["prompt"] = prompt
+                    return {"assistant": "summary"}
+
+                ctxgit.call_claude_prompt = fake_call_claude_prompt
+                ctxgit.call_provider_history_compaction(root, store, "AItrust", records)
+            finally:
+                ctxgit.call_claude_prompt = original
+
+            self.assertIn(sentinel, captured["prompt"])
+            self.assertNotIn("[... truncated ...]", captured["prompt"])
+
+    def test_sequence_prompt_uses_source_compactions_and_live_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("one")
+            store.create_branch("two")
+            for index in range(20):
+                store.append_history("one", "assistant", f"ONE-{index}-" + ("a" * 140))
+                store.append_history("two", "assistant", f"TWO-{index}-" + ("b" * 140))
+            store.maybe_compact_history("one", threshold=600, keep_tail=360, use_ai=False)
+            store.create_sequence_room(
+                ["one", "two"], "room", "Room", ["", ""],
+                ["info-chat", "info-chat"], 4,
+            )
+            store.append_history("room", "user", "Current room request")
+            participant = store.sequence_room_config("room")["participants"][0]
+
+            prompt = ctxgit.build_sequence_agent_prompt(
+                store,
+                "room",
+                participant,
+                reply_index=0,
+                maximum=4,
+                stop_decider=None,
+                evaluator_rounds=0,
+                minimum_evaluator_rounds=2,
+                acceptance_criteria=ctxgit.DEFAULT_SEQUENCE_ACCEPTANCE_CRITERIA,
+                pending_required_changes=[],
+            )
+
+            self.assertIn("<source_compactions>", prompt)
+            self.assertIn("History Compaction: one", prompt)
+            self.assertIn("ctxgit replaced", prompt)
+            self.assertIn("ONE-19", prompt)
+            self.assertNotIn("TWO-19", prompt)
+
+    def test_sequence_prompt_uses_room_compactions_and_live_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("one")
+            store.create_branch("two")
+            store.create_sequence_room(
+                ["one", "two"], "room", "Room", ["", ""],
+                ["info-chat", "info-chat"], 4,
+            )
+            for index in range(20):
+                store.append_history("room", "assistant", f"ROOM-{index}-" + ("r" * 140))
+            store.maybe_compact_history("room", threshold=600, keep_tail=360, use_ai=False)
+            participant = store.sequence_room_config("room")["participants"][0]
+
+            prompt = ctxgit.build_sequence_agent_prompt(
+                store,
+                "room",
+                participant,
+                reply_index=0,
+                maximum=4,
+                stop_decider=None,
+                evaluator_rounds=0,
+                minimum_evaluator_rounds=2,
+                acceptance_criteria=ctxgit.DEFAULT_SEQUENCE_ACCEPTANCE_CRITERIA,
+                pending_required_changes=[],
+            )
+
+            self.assertIn("<room_compactions>", prompt)
+            self.assertIn("History Compaction: room", prompt)
+            self.assertIn("room compactions above", prompt)
+            self.assertIn("ROOM-19", prompt)
+
+    def test_sequence_participant_update_copies_existing_source_compaction_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("one")
+            store.create_branch("two")
+            store.create_sequence_room(
+                ["one", "two"], "room", "Room", ["", ""],
+                ["info-chat", "info-chat"], 4,
+            )
+            for index in range(20):
+                store.append_history("one", "assistant", f"UPDATED-ONE-{index}-" + ("u" * 3000))
+
+            original = ctxgit.call_provider_history_compaction
+            try:
+                ctxgit.call_provider_history_compaction = lambda *_args, **_kwargs: (
+                    "# History Compaction: one\n\n## Durable Memory\n\n- Updated source summary."
+                )
+                store.maybe_compact_history("one")
+            finally:
+                ctxgit.call_provider_history_compaction = original
+
+            store.update_sequence_participant("room", 1, update_snapshot=True)
+
+            archive_root = store.branch_paths("room").archives / "one"
+            archived_meta = ctxgit.load_json(archive_root / "branch.json")
+            archived_compaction = "\n".join(
+                path.read_text(encoding="utf-8")
+                for path in sorted((archive_root / "compactions").glob("*.md"))
+            )
+            self.assertGreater(archived_meta["lastCompactedHistoryCount"], 0)
+            self.assertIn("Updated source summary", archived_compaction)
+
     def test_history_compaction_uses_ai_when_available(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2816,7 +3057,9 @@ class CtxgitTest(unittest.TestCase):
             self.assertEqual([item["id"] for item in store.list_branches()], ["legacy"])
             self.assertFalse((root / "contexts" / "AGENTS.md").exists())
             self.assertFalse((root / "contexts" / "branches" / "initial").exists())
-            self.assertFalse((root / ".gitignore").exists())
+            gitignore = (root / ".gitignore").read_text()
+            self.assertIn(".ctxgit/.env", gitignore)
+            self.assertNotIn(".ctxgit/git/", gitignore)
 
     def test_project_open_does_not_upgrade_existing_project(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2831,7 +3074,9 @@ class CtxgitTest(unittest.TestCase):
             self.assertTrue(payload["initialized"])
             self.assertFalse((root / "contexts" / "AGENTS.md").exists())
             self.assertFalse((root / "contexts" / "branches" / "initial").exists())
-            self.assertFalse((root / ".gitignore").exists())
+            gitignore = (root / ".gitignore").read_text()
+            self.assertIn(".ctxgit/.env", gitignore)
+            self.assertNotIn(".ctxgit/git/", gitignore)
 
     def test_serve_root_ignores_tool_repo_without_explicit_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2879,12 +3124,24 @@ class CtxgitTest(unittest.TestCase):
             self.assertEqual(payload["path"], str(root.resolve()))
             self.assertTrue(payload["gitInitialized"])
 
-    def test_init_command_creates_git_by_default(self) -> None:
+    def test_init_command_does_not_create_git_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 code = ctxgit.main(["--root", str(root), "init"])
+
+            self.assertEqual(code, 0)
+            self.assertFalse((root / ".git").exists())
+            self.assertTrue((root / ".ctxgit" / "config.json").exists())
+            self.assertTrue((root / "contexts" / "branches" / "initial" / "history.jsonl").exists())
+
+    def test_init_command_creates_git_when_requested(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = ctxgit.main(["--root", str(root), "init", "--git"])
 
             self.assertEqual(code, 0)
             self.assertTrue((root / ".git").exists())

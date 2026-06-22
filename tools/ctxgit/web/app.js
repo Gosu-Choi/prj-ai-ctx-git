@@ -31,6 +31,7 @@ const state = {
   sequenceOrder: [],
   sequenceEvaluator: null,
   sequenceOrderOpen: false,
+  activeSummaryPath: "",
 };
 
 const CONTEXT_CHAT_KEY = "__contexts__";
@@ -129,6 +130,12 @@ const els = {
   eventMeta: document.querySelector("#eventMeta"),
   eventList: document.querySelector("#eventList"),
   reportView: document.querySelector("#reportView"),
+  summaryList: document.querySelector("#summaryList"),
+  summaryTitle: document.querySelector("#summaryTitle"),
+  summaryMeta: document.querySelector("#summaryMeta"),
+  summaryStatus: document.querySelector("#summaryStatus"),
+  summaryEditor: document.querySelector("#summaryEditor"),
+  summarySaveButton: document.querySelector("#summarySaveButton"),
   filePathForm: document.querySelector("#filePathForm"),
   fileUpButton: document.querySelector("#fileUpButton"),
   fileRefreshButton: document.querySelector("#fileRefreshButton"),
@@ -173,6 +180,8 @@ const els = {
   sequenceUpdateMaxReplies: document.querySelector("#sequenceUpdateMaxReplies"),
   sequenceUpdateMinEvaluatorRounds: document.querySelector("#sequenceUpdateMinEvaluatorRounds"),
   sequenceUpdateAcceptanceCriteria: document.querySelector("#sequenceUpdateAcceptanceCriteria"),
+  sequenceSnapshotSummaryView: document.querySelector("#sequenceSnapshotSummaryView"),
+  sequenceCurrentSummaryView: document.querySelector("#sequenceCurrentSummaryView"),
   sequenceSnapshotView: document.querySelector("#sequenceSnapshotView"),
   sequenceCurrentView: document.querySelector("#sequenceCurrentView"),
   sequenceUpdateSnapshot: document.querySelector("#sequenceUpdateSnapshot"),
@@ -1799,7 +1808,8 @@ function renderSequenceOrderPicker() {
   if (!state.sequenceOrder.includes(Number(state.sequenceEvaluator))) {
     state.sequenceEvaluator = null;
   }
-  els.sequenceOrderButton.textContent = `Order ${state.sequenceOrder.join(" → ")}`;
+  const evaluatorLabel = state.sequenceEvaluator ? ` · Eval ${state.sequenceEvaluator}` : " · No evaluator";
+  els.sequenceOrderButton.textContent = `Order ${state.sequenceOrder.join(" → ")}${evaluatorLabel}`;
   els.sequenceOrderSelected.innerHTML = state.sequenceOrder
     .map((order, index) => {
       const participant = participants.find((item) => Number(item.order) === Number(order));
@@ -2907,6 +2917,7 @@ function renderBranch(payload) {
       )
       .join("") || '<div class="muted">No research notes yet.</div>';
   renderArchives(payload.archives || []);
+  renderSummaries(payload.compactions || []);
   renderBranchResourceStage();
   restoreActiveDraft();
   updateComposerState();
@@ -2956,9 +2967,100 @@ function renderContextChat(payload) {
   }
   els.researchList.innerHTML = '<div class="muted">Top-level context chat has no branch documents.</div>';
   renderArchives([]);
+  renderSummaries([]);
   renderBranchResourceStage();
   restoreActiveDraft();
   updateComposerState();
+}
+
+function setSummaryStatus(message, kind = "") {
+  if (!els.summaryStatus) return;
+  els.summaryStatus.textContent = message;
+  els.summaryStatus.className = `settings-status ${kind}`.trim();
+}
+
+function renderSummaries(compactions) {
+  if (!els.summaryList) return;
+  const summaries = Array.isArray(compactions) ? compactions : [];
+  const hasActive = summaries.some((item) => item.path === state.activeSummaryPath);
+  if (!hasActive) state.activeSummaryPath = "";
+  if (!summaries.length) {
+    els.summaryList.innerHTML = '<div class="muted">No history summaries yet.</div>';
+    els.summaryTitle.textContent = "History Summaries";
+    els.summaryMeta.textContent = "No compaction summary has been created for this branch yet.";
+    els.summaryEditor.value = "";
+    els.summaryEditor.disabled = true;
+    els.summarySaveButton.disabled = true;
+    setSummaryStatus("");
+    return;
+  }
+  els.summaryList.innerHTML = summaries
+    .map((item) => {
+      const injected = item.injected ? "Injected" : "Stored";
+      const chars = Number(item.chars || 0).toLocaleString();
+      return `
+        <button class="nav-item ${item.path === state.activeSummaryPath ? "active" : ""}" data-summary-path="${escapeHtml(item.path || "")}" type="button">
+          <span class="nav-title">${escapeHtml(item.title || "history summary")}</span>
+          <span class="nav-meta">${escapeHtml(injected)} · ${escapeHtml(chars)} chars</span>
+          <span class="nav-meta">${escapeHtml(item.path || "")}</span>
+        </button>
+      `;
+    })
+    .join("");
+  els.summaryList.querySelectorAll("[data-summary-path]").forEach((button) => {
+    button.addEventListener("click", () => loadSummary(button.dataset.summaryPath));
+  });
+  els.summaryEditor.disabled = !state.activeSummaryPath;
+  els.summarySaveButton.disabled = !state.activeSummaryPath || state.payload?.archived === true;
+  const summariesTabActive = document.querySelector("#summariesTab")?.classList.contains("active");
+  if (!state.activeSummaryPath && summariesTabActive) {
+    const firstInjected = summaries.find((item) => item.injected) || summaries[0];
+    if (firstInjected?.path) {
+      loadSummary(firstInjected.path).catch((error) => setSummaryStatus(`Summary load failed: ${error.message}`, "error"));
+    }
+  }
+}
+
+async function loadSummary(path) {
+  if (!state.activeBranch || !path) return;
+  state.activeSummaryPath = path;
+  renderSummaries(state.payload?.compactions || []);
+  setSummaryStatus("Loading summary...");
+  const payload = await api(`/api/branch/compaction?branch=${encodeURIComponent(state.activeBranch)}&path=${encodeURIComponent(path)}`);
+  if (state.activeSummaryPath !== path) return;
+  els.summaryTitle.textContent = payload.name || "History Summary";
+  els.summaryMeta.textContent = `${payload.branch || state.activeBranch} · ${payload.path || path} · ${Number(payload.size || 0).toLocaleString()} bytes`;
+  els.summaryEditor.value = payload.text || "";
+  els.summaryEditor.disabled = false;
+  els.summarySaveButton.disabled = state.payload?.archived === true;
+  setSummaryStatus("");
+}
+
+async function saveSummary() {
+  if (!state.activeBranch || !state.activeSummaryPath) return;
+  els.summarySaveButton.disabled = true;
+  setSummaryStatus("Saving summary...");
+  try {
+    const payload = await api("/api/branch/compaction", {
+      method: "POST",
+      body: JSON.stringify({
+        branch: state.activeBranch,
+        path: state.activeSummaryPath,
+        text: els.summaryEditor.value,
+      }),
+    });
+    const activePath = payload.summaryEdit?.path || state.activeSummaryPath;
+    renderBranch(payload);
+    state.activeSummaryPath = activePath;
+    await loadSummary(activePath);
+    setSummaryStatus("Saved.", "ok");
+  } catch (error) {
+    setSummaryStatus(`Save failed: ${error.message}`, "error");
+  } finally {
+    if (state.activeSummaryPath && state.payload?.archived !== true) {
+      els.summarySaveButton.disabled = false;
+    }
+  }
 }
 
 function renderArchives(archives) {
@@ -3604,6 +3706,7 @@ function selectTab(tab) {
   button.classList.add("active");
   panel.classList.add("active");
   if (tab === "chat") scrollChatToBottom();
+  if (tab === "summaries") renderSummaries(state.payload?.compactions || []);
   if (tab === "files") loadProjectFiles().catch(() => {});
 }
 
@@ -3626,6 +3729,8 @@ els.branchGraphButton.addEventListener("click", () => {
     els.branchGraphStatus.className = "settings-status error";
   });
 });
+
+els.summarySaveButton.addEventListener("click", saveSummary);
 
 els.graphRefreshButton.addEventListener("click", () => {
   loadBranchGraph().catch((error) => {
@@ -3907,8 +4012,23 @@ async function loadSequenceParticipantComparison() {
   els.sequenceUpdateMaxReplies.value = data.sequenceRoom?.defaultMaxAgentReplies || 6;
   els.sequenceUpdateMinEvaluatorRounds.value = data.sequenceRoom?.minimumEvaluatorRounds || 2;
   els.sequenceUpdateAcceptanceCriteria.value = (data.sequenceRoom?.acceptanceCriteria || []).join("\n");
+  const formatSummaries = (side) =>
+    (side.summaries || [])
+      .map((item) =>
+        [
+          `# ${item.title || "summary"}`,
+          item.path || "",
+          "",
+          item.text || "",
+        ]
+          .filter((line, index) => index !== 1 || line)
+          .join("\n"),
+      )
+      .join("\n\n---\n\n");
   const formatSide = (side) =>
     `CONTEXT\n${side.context || ""}\n\nHISTORY\n${(side.history || []).map((item) => `${item.role}: ${item.text}`).join("\n\n")}`;
+  els.sequenceSnapshotSummaryView.textContent = formatSummaries(data.snapshot);
+  els.sequenceCurrentSummaryView.textContent = data.current?.exists ? formatSummaries(data.current) : "";
   els.sequenceSnapshotView.textContent = formatSide(data.snapshot);
   els.sequenceCurrentView.textContent = data.current?.exists ? formatSide(data.current) : "Source branch is missing.";
   els.sequenceUpdateSnapshot.checked = false;
