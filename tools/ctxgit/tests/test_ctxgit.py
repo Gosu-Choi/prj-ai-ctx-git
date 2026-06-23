@@ -1474,6 +1474,13 @@ class CtxgitTest(unittest.TestCase):
             first = store.append_history("source", "user", "First", extra={"turnId": first_turn})
             ctxgit.write_text(root / "contexts" / "branches" / "source" / "context.md", "# Source\n\nAt first.\n")
             store.add_note("source", "Old Note", "Old body")
+            source_paths = store.branch_paths("source")
+            source_paths.compactions.mkdir(parents=True, exist_ok=True)
+            ctxgit.write_text(source_paths.compactions / "old-summary.md", "Old conversation summary.")
+            source_meta = ctxgit.load_json(source_paths.meta)
+            source_meta["lastCompactedHistoryCount"] = 1
+            source_meta["lastCompactionPath"] = "contexts/branches/source/compactions/old-summary.md"
+            ctxgit.dump_json(source_paths.meta, source_meta)
             first_commit = ctxgit.internal_git_commit_turn(
                 store,
                 kind="chat",
@@ -1553,10 +1560,13 @@ class CtxgitTest(unittest.TestCase):
             self.assertNotIn("New body", note_text)
             self.assertEqual(list(store.iter_history("context-only")), [])
             self.assertEqual((fork_root / "history.jsonl").read_text(encoding="utf-8"), "")
+            self.assertFalse((fork_root / "compactions").exists())
             meta = ctxgit.load_json(fork_root / "branch.json")
             self.assertEqual(meta["forkedFrom"], "source")
             self.assertEqual(meta["forkedAtIndex"], 0)
             self.assertTrue(meta["forkedContextOnly"])
+            self.assertNotIn("lastCompactedHistoryCount", meta)
+            self.assertNotIn("lastCompactionPath", meta)
 
     def test_fork_context_reads_non_ascii_history_from_internal_git(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -1638,6 +1638,10 @@ class ContextStore:
         meta["forkedSnapshot"] = "internal-git" if restored_from_snapshot else "current-files"
         if not include_history:
             meta["forkedContextOnly"] = True
+            if target_paths.compactions.exists():
+                shutil.rmtree(target_paths.compactions)
+            meta.pop("lastCompactedHistoryCount", None)
+            meta.pop("lastCompactionPath", None)
         meta["createdAt"] = now
         meta["updatedAt"] = now
         dump_json(target_paths.meta, meta)
