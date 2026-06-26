@@ -8199,14 +8199,18 @@ def branch_source_upload_directory(store: ContextStore, branch_id: str) -> str:
     return relpath(store.root, resources)
 
 
-def branch_source_upload_file_name(path_value: str) -> str:
+def branch_source_upload_relative_path(path_value: str) -> Path:
     rel = safe_upload_relative_path(path_value)
-    if len(rel.parts) != 1:
-        raise ValueError("branch resource upload accepts files, not folders")
+    if len(rel.parts) != 1 and not (len(rel.parts) == 2 and rel.parts[0] == "browser-data"):
+        raise ValueError("branch resource upload accepts files or browser-data files")
     if rel.suffix.lower() not in BRANCH_RESOURCE_EXTENSIONS:
         supported = ", ".join(sorted(BRANCH_RESOURCE_EXTENSIONS))
         raise ValueError(f"unsupported branch resource file type: {rel.suffix or '(none)'}; supported: {supported}")
-    return rel.name
+    return rel
+
+
+def branch_source_upload_file_name(path_value: str) -> str:
+    return branch_source_upload_relative_path(path_value).name
 
 
 def upload_branch_source_file_chunk(
@@ -8220,12 +8224,14 @@ def upload_branch_source_file_chunk(
     overwrite: bool = False,
     last_chunk: bool = False,
 ) -> dict[str, Any]:
-    file_name = branch_source_upload_file_name(path_value)
+    relative_path = branch_source_upload_relative_path(path_value)
     directory = branch_source_upload_directory(store, branch_id)
+    if len(relative_path.parts) > 1:
+        directory = str(Path(directory) / relative_path.parent)
     return upload_project_file_chunk(
         store.root,
         directory,
-        file_name,
+        relative_path.name,
         content_base64,
         offset,
         total_size,
@@ -8243,14 +8249,14 @@ def finish_branch_source_upload(store: ContextStore, branch_id: str, uploaded_pa
     resources_dir = paths.root / "resources"
     resources = []
     for path_value in uploaded_paths:
-        file_name = branch_source_upload_file_name(path_value)
-        path = (resources_dir / file_name).resolve(strict=False)
+        relative_path = branch_source_upload_relative_path(path_value)
+        path = (resources_dir / relative_path).resolve(strict=False)
         try:
             path.relative_to(resources_dir.resolve())
         except ValueError as exc:
             raise ValueError("branch resource path must stay inside resources") from exc
         if not path.exists() or not path.is_file():
-            raise ValueError(f"uploaded branch resource is missing: {file_name}")
+            raise ValueError(f"uploaded branch resource is missing: {relative_path}")
         resources.append(project_file_entry(store.root, path))
     payload = branch_payload(store, branch_id)
     payload["uploadedResources"] = resources
