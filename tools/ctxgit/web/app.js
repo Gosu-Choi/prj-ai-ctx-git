@@ -45,16 +45,19 @@ const BRANCH_RESOURCE_EXTENSIONS = new Set([
   ".heif",
   ".jpeg",
   ".jpg",
+  ".docx",
   ".json",
   ".jsonl",
   ".md",
   ".pdf",
   ".png",
+  ".pptx",
   ".svg",
   ".tif",
   ".tiff",
   ".txt",
   ".webp",
+  ".xlsx",
 ]);
 
 const els = {

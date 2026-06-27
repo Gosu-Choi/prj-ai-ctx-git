@@ -137,7 +137,8 @@ IMAGE_RESOURCE_EXTENSIONS = {
     ".tiff",
     ".webp",
 }
-BRANCH_RESOURCE_EXTENSIONS = INGEST_EXTENSIONS | IMAGE_RESOURCE_EXTENSIONS
+OFFICE_RESOURCE_EXTENSIONS = {".docx", ".xlsx", ".pptx"}
+BRANCH_RESOURCE_EXTENSIONS = INGEST_EXTENSIONS | IMAGE_RESOURCE_EXTENSIONS | OFFICE_RESOURCE_EXTENSIONS
 ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _PROJECT_ENV_LOCK = threading.RLock()
 _PROJECT_ENV_ORIGINAL: dict[str, str | None] = {}
@@ -5052,6 +5053,8 @@ def resource_kind_for_path(path: Path) -> str:
         return "image"
     if suffix == ".pdf":
         return "pdf"
+    if suffix in OFFICE_RESOURCE_EXTENSIONS:
+        return suffix.lstrip(".")
     if suffix in {".md", ".txt", ".json", ".jsonl"}:
         return "text"
     return suffix.lstrip(".") or "file"
@@ -6583,6 +6586,7 @@ def run_chat_turn(
         if normalized_resources:
             user_extra["resources"] = normalized_resources
         store.append_history(branch_id, "user", user_message, extra=user_extra)
+    markdown_before = markdown_file_snapshot(root)
     result = call_provider_chat(
         selected_provider,
         root,
@@ -6593,6 +6597,7 @@ def run_chat_turn(
         resource_paths=normalized_resources,
         progress=progress,
     )
+    direct_markdown_refs = changed_markdown_file_refs(root, markdown_before, markdown_file_snapshot(root))
     artifact_refs = []
     emit_progress(progress, "Saving assistant output")
     for artifact in result.get("artifacts", []):
@@ -6605,6 +6610,8 @@ def run_chat_turn(
             continue
         path = store.add_artifact(branch_id, title, body, kind=kind)
         artifact_refs.append({"kind": kind, "title": title, "path": relpath(root, path)})
+    seen_artifact_paths = {str(item.get("path") or "") for item in artifact_refs}
+    artifact_refs.extend(item for item in direct_markdown_refs if item.get("path") not in seen_artifact_paths)
     assistant = str(result.get("assistant") or "").strip()
     if not assistant:
         assistant = "(No assistant message returned.)"
@@ -7993,6 +8000,47 @@ def project_file_entry(root: Path, path: Path) -> dict[str, Any]:
         "size": size,
         "modifiedAt": project_file_modified_at(path),
     }
+
+
+def markdown_file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def markdown_file_snapshot(root: Path) -> dict[str, str]:
+    root = root.resolve()
+    snapshot: dict[str, str] = {}
+    for path in sorted(root.rglob("*.md")):
+        try:
+            rel = path.relative_to(root)
+        except ValueError:
+            continue
+        if should_skip_project_sync_path(rel):
+            continue
+        if not path.is_file():
+            continue
+        try:
+            snapshot[rel.as_posix()] = markdown_file_digest(path)
+        except OSError:
+            continue
+    return snapshot
+
+
+def changed_markdown_file_refs(root: Path, before: dict[str, str], after: dict[str, str]) -> list[dict[str, str]]:
+    refs: list[dict[str, str]] = []
+    for path in sorted(after):
+        before_digest = before.get(path)
+        if before_digest is None:
+            kind = "created-md"
+        elif before_digest != after[path]:
+            kind = "modified-md"
+        else:
+            continue
+        refs.append({"kind": kind, "title": Path(path).name, "path": path})
+    return refs
 
 
 def project_files_payload(root: Path, path_value: str | None) -> dict[str, Any]:

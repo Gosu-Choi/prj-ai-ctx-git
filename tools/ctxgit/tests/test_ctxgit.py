@@ -389,6 +389,28 @@ class CtxgitTest(unittest.TestCase):
             self.assertEqual(payload["uploadedResources"][0]["path"], "contexts/branches/source/resources/image.png")
             self.assertTrue((root / "contexts/branches/source/resources/image.png").exists())
 
+    def test_branch_resource_upload_accepts_office_files_without_ingest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("source")
+
+            ctxgit.upload_branch_source_file_chunk(
+                store,
+                "source",
+                "deck.pptx",
+                base64.b64encode(b"pptx bytes").decode("ascii"),
+                0,
+                10,
+                last_chunk=True,
+            )
+            payload = ctxgit.finish_branch_source_upload(store, "source", ["deck.pptx"])
+
+            self.assertEqual(payload["uploadedResources"][0]["path"], "contexts/branches/source/resources/deck.pptx")
+            self.assertTrue((root / "contexts/branches/source/resources/deck.pptx").exists())
+            self.assertEqual(ctxgit.resource_kind_for_path(root / "deck.pptx"), "pptx")
+            self.assertFalse((root / "contexts/branches/source/resources/deck.pptx.meta.json").exists())
+
     def test_branch_resource_upload_rejects_unsupported_resource(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2461,6 +2483,29 @@ class CtxgitTest(unittest.TestCase):
             self.assertEqual(captured["resource_paths"], [rel])
             self.assertEqual(payload["history"][-2]["resources"], [rel])
             self.assertIn(rel, ctxgit.format_history_record(payload["history"][-2]))
+
+    def test_chat_turn_links_created_and_modified_markdown_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("AItrust")
+            existing = root / "notes.md"
+            existing.write_text("before\n", encoding="utf-8")
+            original = ctxgit.call_codex_chat
+            try:
+                def fake_chat(*_args, **_kwargs):
+                    existing.write_text("after\n", encoding="utf-8")
+                    (root / "draft.md").write_text("# Draft\n", encoding="utf-8")
+                    return {"assistant": "Updated markdown files.", "artifacts": [], "approvalRequests": []}
+
+                ctxgit.call_codex_chat = fake_chat
+                payload = ctxgit.run_chat_turn(root, store, "AItrust", "Write markdown.")
+            finally:
+                ctxgit.call_codex_chat = original
+
+            artifacts = payload["history"][-1]["artifacts"]
+            self.assertIn({"kind": "created-md", "title": "draft.md", "path": "draft.md"}, artifacts)
+            self.assertIn({"kind": "modified-md", "title": "notes.md", "path": "notes.md"}, artifacts)
 
     def test_history_chat_turn_records_assistant_without_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
