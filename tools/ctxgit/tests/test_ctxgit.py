@@ -1048,6 +1048,48 @@ class CtxgitTest(unittest.TestCase):
                 ("branch:critic", "branch:room", "sequence 2"),
             ])
 
+    def test_sequence_room_send_writes_in_room_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("writer")
+            store.create_branch("critic")
+            store.create_sequence_room(
+                ["writer", "critic"],
+                "room",
+                "Room",
+                ["Write.", "Critique."],
+                ["send", "send"],
+                4,
+            )
+            store.update_sequence_speaking_order("room", [1, 2], evaluator_order=None, update_evaluator=True)
+            calls: list[dict[str, object]] = []
+            original_call = ctxgit.call_provider_prompt
+
+            def fake_call(*args, **kwargs):
+                calls.append({"args": args, "kwargs": kwargs})
+                cwd = Path(kwargs["cwd"])
+                (cwd / f"agent-{len(calls)}.md").write_text(f"# Agent {len(calls)}\n", encoding="utf-8")
+                return {"assistant": f"Agent {len(calls)} wrote in workspace."}
+
+            ctxgit.call_provider_prompt = fake_call
+            try:
+                result = ctxgit.run_sequence_room_turn(root, store, "room", "Collaborate.", run_mode="send")
+            finally:
+                ctxgit.call_provider_prompt = original_call
+
+            workspace = root / "contexts" / "branches" / "room" / "workspace"
+            self.assertEqual([Path(call["kwargs"]["cwd"]) for call in calls], [workspace, workspace])
+            self.assertTrue((workspace / "agent-1.md").exists())
+            self.assertTrue((workspace / "agent-2.md").exists())
+            self.assertFalse((root / "contexts" / "branches" / "writer" / "agent-1.md").exists())
+            self.assertIn("Never create, edit, move, or delete files in the source branch directory.", calls[0]["args"][2])
+            self.assertIn("contexts/branches/room/workspace", calls[0]["args"][2])
+            self.assertIn(
+                {"kind": "created-md", "title": "agent-1.md", "path": "contexts/branches/room/workspace/agent-1.md"},
+                result["history"][1]["artifacts"],
+            )
+
     def test_sequence_evaluation_defaults_to_continue_when_invalid_or_changes_remain(self) -> None:
         criteria = list(ctxgit.DEFAULT_SEQUENCE_ACCEPTANCE_CRITERIA)
         invalid, valid = ctxgit.normalize_sequence_evaluation(None, criteria)

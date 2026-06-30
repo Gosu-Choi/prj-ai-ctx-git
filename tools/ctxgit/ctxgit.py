@@ -3050,6 +3050,8 @@ class ContextStore:
             tags=["sequence-room"],
         )
         paths = self.branch_paths(safe_target)
+        workspace = paths.root / "workspace"
+        workspace.mkdir(parents=True, exist_ok=True)
         participants = []
         for index, source_id in enumerate(safe_sources):
             archive = self.archive_source_branch(safe_target, source_id)
@@ -3086,7 +3088,8 @@ class ContextStore:
             f"# {title or safe_target}\n\n## Sequence Room\n\n"
             + "".join(f"- Agent {index + 1}: `{source_id}`\n" for index, source_id in enumerate(safe_sources))
             + f"- Speaking order: {' → '.join(str(index + 1) for index in range(len(safe_sources)))}\n"
-            f"- Maximum agent replies: {max_agent_replies}\n",
+            f"- Maximum agent replies: {max_agent_replies}\n"
+            f"- Shared workspace: `{relpath(self.root, workspace)}`\n",
         )
         write_text(paths.history, "")
         self.write_index()
@@ -6328,6 +6331,7 @@ def call_codex_prompt(
     prompt: str,
     *,
     writable: bool,
+    cwd: Path | None = None,
     progress: ProgressCallback | None = None,
     output_schema: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -6337,6 +6341,7 @@ def call_codex_prompt(
         raise RuntimeError(status["message"])
     config = read_llm_config(root).get("codex", {})
     timeout_seconds = coerce_positive_int(config.get("timeoutSeconds"), 900)
+    workdir = (cwd or root).resolve()
     with tempfile.TemporaryDirectory(prefix="ctxgit-codex-raw-") as tmp:
         tmp_path = Path(tmp)
         schema_path = tmp_path / "output.schema.json"
@@ -6348,9 +6353,12 @@ def call_codex_prompt(
         cmd.extend(["--ask-for-approval", "never", "exec"])
         if progress:
             cmd.append("--json")
+        sandbox = codex_sandbox_mode(config) if writable else "read-only"
+        if writable and workdir != root.resolve():
+            sandbox = "workspace-write"
         cmd.extend([
-            "--cd", str(root),
-            "--sandbox", codex_sandbox_mode(config) if writable else "read-only",
+            "--cd", str(workdir),
+            "--sandbox", sandbox,
             "--output-schema", str(schema_path),
             "--output-last-message", str(output_path),
         ])
@@ -6362,11 +6370,11 @@ def call_codex_prompt(
             emit_progress(progress, "Codex is working")
             if progress:
                 completed = run_process_with_progress(
-                    cmd, root, timeout_seconds, progress, stdin_text=prompt
+                    cmd, workdir, timeout_seconds, progress, stdin_text=prompt
                 )
             else:
                 completed = subprocess.run(
-                    cmd, cwd=root, check=False, text=True, encoding="utf-8",
+                    cmd, cwd=workdir, check=False, text=True, encoding="utf-8",
                     errors="replace", input=prompt, capture_output=True,
                     timeout=timeout_seconds,
                 )
@@ -6547,17 +6555,19 @@ def call_provider_prompt(
     prompt: str,
     *,
     writable: bool,
+    cwd: Path | None = None,
     progress: ProgressCallback | None = None,
     output_schema: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    workdir = (cwd or root).resolve()
     if provider == "claude":
         return call_claude_prompt(
-            root, prompt, cwd=root, writable=writable,
+            root, prompt, cwd=workdir, writable=writable,
             progress=progress, output_schema=output_schema,
         )
     if provider == "codex":
         return call_codex_prompt(
-            root, prompt, writable=writable,
+            root, prompt, writable=writable, cwd=workdir,
             progress=progress, output_schema=output_schema,
         )
     raise RuntimeError(f"Unsupported chat provider: {provider}")
@@ -7063,6 +7073,51 @@ def archive_compaction_text(archive_root: Path, budget_chars: int) -> str:
     return "\n\n".join(reversed(selected)).strip() or "(none)"
 
 
+def sequence_workspace_dir(store: ContextStore, branch_id: str) -> Path:
+    paths = store.branch_paths(branch_id)
+    workspace = paths.root / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    return workspace
+
+
+def sequence_workspace_context(store: ContextStore, branch_id: str, budget_chars: int) -> str:
+    if budget_chars <= 0:
+        return "(none)"
+    workspace = sequence_workspace_dir(store, branch_id)
+    files = [path for path in sorted(workspace.rglob("*")) if path.is_file()]
+    if not files:
+        return "(empty)"
+    lines = [
+        "Shared sequence-room workspace files. These files are visible to all agents in this room.",
+        f"Workspace path: `{relpath(store.root, workspace)}`",
+        "",
+    ]
+    remaining = budget_chars - len("\n".join(lines))
+    for path in files:
+        if remaining <= 0:
+            break
+        rel = relpath(store.root, path)
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+        header = f"## `{rel}` ({size} bytes)"
+        body = ""
+        if path.suffix.lower() in {".md", ".txt", ".json", ".jsonl"}:
+            try:
+                body = read_text(path).strip()
+            except Exception:
+                body = ""
+        chunk = header
+        if body:
+            chunk += "\n\n" + truncate_middle(body, max(0, remaining - len(header) - 20))
+        if len(chunk) > remaining and len(lines) > 3:
+            break
+        lines.extend([chunk, ""])
+        remaining -= len(chunk) + 2
+    return truncate_middle("\n".join(lines).strip(), budget_chars) or "(none)"
+
+
 def build_sequence_agent_prompt(
     store: ContextStore,
     branch_id: str,
@@ -7095,7 +7150,8 @@ def build_sequence_agent_prompt(
     source_compaction_budget = max(5000, int(total_budget * 0.20))
     source_history_budget = max(8000, int(total_budget * 0.27))
     room_compaction_budget = max(5000, int(total_budget * 0.12))
-    room_history_budget = max(7000, int(total_budget * 0.23))
+    room_history_budget = max(7000, int(total_budget * 0.20))
+    room_workspace_budget = max(4000, int(total_budget * 0.08))
     room_context_budget = max(1500, int(total_budget * 0.05))
     source_compacted_count = archive_compacted_history_count(archive_root)
     room_compacted_count = store.compacted_history_count(branch_id)
@@ -7130,6 +7186,9 @@ def build_sequence_agent_prompt(
         f"You are Agent {order}. Speak only as Agent {order}; do not write another agent's response.",
         "Use only your private archived source context/history and this room's conversation supplied below.",
         "Do not infer or load other branches unless the user explicitly asks you to inspect one.",
+        "Your source branch is a read-only identity and memory source. Never create, edit, move, or delete files in the source branch directory.",
+        f"If you create or edit files, write only inside this sequence room shared workspace: `{relpath(store.root, sequence_workspace_dir(store, branch_id))}`.",
+        "Treat that shared workspace as the collaborative work area for all agents in this room.",
         "Your persistent role instruction follows and must be obeyed on every reply:",
         "<persistent_system_prompt>",
         str(participant.get("systemPrompt") or "(no additional role prompt)"),
@@ -7158,6 +7217,9 @@ def build_sequence_agent_prompt(
         "<room_compactions>",
         compaction_context_sections(store, branch_id, room_compaction_budget),
         "</room_compactions>",
+        "<shared_workspace>",
+        sequence_workspace_context(store, branch_id, room_workspace_budget),
+        "</shared_workspace>",
         "<room_history>",
         sequence_history_text(
             room_history,
@@ -7228,6 +7290,7 @@ def run_sequence_room_turn(
         extra={"turnId": run_id, "mode": "sequence-room", "sequenceRunMode": run_mode},
     )
     store.maybe_compact_history(branch_id)
+    workspace = sequence_workspace_dir(store, branch_id)
     stopped = False
     stop_reason = ""
     evaluator_rounds = 0
@@ -7257,14 +7320,23 @@ def run_sequence_room_turn(
             if stop_decider is not None and order == stop_decider
             else None
         )
+        markdown_before = markdown_file_snapshot(root)
         result = call_provider_prompt(
             selected_provider,
             root,
             prompt,
             writable=effective_access == "send",
+            cwd=workspace,
             progress=progress,
             output_schema=output_schema,
         )
+        workspace_rel = relpath(root, workspace)
+        workspace_prefix = workspace_rel.rstrip("/") + "/"
+        workspace_markdown_refs = [
+            item
+            for item in changed_markdown_file_refs(root, markdown_before, markdown_file_snapshot(root))
+            if str(item.get("path") or "").startswith(workspace_prefix)
+        ]
         text = str(result.get("assistant") or "").strip()
         evaluation = None
         evaluation_valid = False
@@ -7299,6 +7371,7 @@ def run_sequence_room_turn(
                 "sequenceReply": reply_index + 1,
                 "sequenceAccessMode": effective_access,
                 "provider": selected_provider,
+                "artifacts": workspace_markdown_refs,
                 **(
                     {
                         "sequenceEvaluation": evaluation,
