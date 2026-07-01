@@ -6409,6 +6409,29 @@ def parse_claude_result(raw: str) -> dict[str, Any]:
     return parse_chat_result(raw)
 
 
+def claude_structured_output_retry_failed(stdout: str, stderr: str) -> bool:
+    detail = "\n".join(part for part in [stdout.strip(), stderr.strip()] if part)
+    if not detail:
+        return False
+    if (
+        "error_max_structured_output_retries" in detail
+        or "Failed to provide valid structured output after" in detail
+    ):
+        return True
+    with contextlib.suppress(json.JSONDecodeError):
+        payload = json.loads(detail)
+        if isinstance(payload, dict):
+            if payload.get("subtype") == "error_max_structured_output_retries":
+                return True
+            errors = payload.get("errors")
+            if isinstance(errors, list) and any(
+                "Failed to provide valid structured output after" in str(error)
+                for error in errors
+            ):
+                return True
+    return False
+
+
 def claude_tools(*, writable: bool, web_search: bool) -> str:
     tools = ["Read", "Glob", "Grep"]
     if writable:
@@ -6435,42 +6458,79 @@ def call_claude_prompt(
     config = read_llm_config(root).get("claude", {})
     timeout_seconds = coerce_positive_int(config.get("timeoutSeconds"), 900)
     schema = output_schema or chat_output_schema()
-    cmd = resolve_claude_command(root)
     tools = claude_tools(writable=writable, web_search=config.get("webSearch") is not False)
-    cmd.extend([
-        "-p",
-        "--output-format", "json",
-        "--json-schema", json.dumps(schema, ensure_ascii=False, separators=(",", ":")),
-        "--no-session-persistence",
-        "--permission-mode", "auto" if writable else "bypassPermissions",
-        "--tools", tools,
-        "--allowedTools", tools,
-        "--append-system-prompt",
-        (
-            "You are running inside ctxgit. Do not push, publish, deploy, or modify files outside "
-            "the current working directory and explicitly added directories. Respect the requested "
-            "read-only or writable mode. Return the required structured output."
-        ),
-    ])
-    model = str(config.get("model") or "opus").strip()
-    if model:
-        cmd.extend(["--model", model])
-    for path in external_writable_dirs(root, approved_external_paths or []):
-        cmd.extend(["--add-dir", str(path)])
+
+    def build_cmd(*, strict_schema: bool) -> list[str]:
+        command = resolve_claude_command(root)
+        command.extend([
+            "-p",
+            "--output-format", "json",
+        ])
+        if strict_schema:
+            command.extend([
+                "--json-schema", json.dumps(schema, ensure_ascii=False, separators=(",", ":")),
+            ])
+        command.extend([
+            "--no-session-persistence",
+            "--permission-mode", "auto" if writable else "bypassPermissions",
+            "--tools", tools,
+            "--allowedTools", tools,
+            "--append-system-prompt",
+            (
+                "You are running inside ctxgit. Do not push, publish, deploy, or modify files outside "
+                "the current working directory and explicitly added directories. Respect the requested "
+                "read-only or writable mode. Return the required structured output."
+            ),
+        ])
+        model = str(config.get("model") or "opus").strip()
+        if model:
+            command.extend(["--model", model])
+        for path in external_writable_dirs(root, approved_external_paths or []):
+            command.extend(["--add-dir", str(path)])
+        return command
+
+    def run_claude(command: list[str], stdin_text: str) -> subprocess.CompletedProcess[str]:
+        if progress:
+            return run_process_with_progress(
+                command, cwd, timeout_seconds, progress, stdin_text=stdin_text
+            )
+        return subprocess.run(
+            command, cwd=cwd, check=False, text=True, encoding="utf-8", errors="replace",
+            input=stdin_text, capture_output=True, timeout=timeout_seconds,
+        )
+
+    cmd = build_cmd(strict_schema=True)
     try:
         emit_progress(progress, "Claude Code is working")
-        if progress:
-            completed = run_process_with_progress(
-                cmd, cwd, timeout_seconds, progress, stdin_text=prompt
-            )
-        else:
-            completed = subprocess.run(
-                cmd, cwd=cwd, check=False, text=True, encoding="utf-8", errors="replace",
-                input=prompt, capture_output=True, timeout=timeout_seconds,
-            )
+        completed = run_claude(cmd, prompt)
     except subprocess.TimeoutExpired as exc:
         raise ChatTimeoutError(f"Claude Code timed out after {timeout_seconds} seconds") from exc
     raw = completed.stdout.strip()
+    if completed.returncode != 0 and claude_structured_output_retry_failed(raw, completed.stderr):
+        fallback_cmd = build_cmd(strict_schema=False)
+        fallback_prompt = "\n".join([
+            prompt,
+            "",
+            "Claude Code structured output validation failed for the previous attempt.",
+            "Retry without the CLI JSON schema validator, but return JSON only.",
+            "The JSON object must conform to this schema:",
+            json.dumps(schema, ensure_ascii=False, indent=2),
+        ])
+        try:
+            emit_progress(progress, "Retrying Claude Code without strict schema validation")
+            fallback_completed = run_claude(fallback_cmd, fallback_prompt)
+        except subprocess.TimeoutExpired as exc:
+            raise ChatTimeoutError(f"Claude Code fallback timed out after {timeout_seconds} seconds") from exc
+        fallback_raw = fallback_completed.stdout.strip()
+        if fallback_completed.returncode != 0:
+            detail = fallback_completed.stderr.strip() or fallback_raw or completed.stderr.strip() or raw
+            raise RuntimeError(detail or f"Claude Code failed with exit code {fallback_completed.returncode}")
+        emit_progress(progress, "Parsing Claude Code response")
+        parsed = parse_claude_result(fallback_raw)
+        parsed["provider"] = "claude"
+        parsed["command"] = fallback_cmd + ["<prompt via stdin>"]
+        parsed["structuredOutputFallback"] = True
+        return parsed
     if completed.returncode != 0:
         detail = completed.stderr.strip() or raw
         raise RuntimeError(detail or f"Claude Code failed with exit code {completed.returncode}")

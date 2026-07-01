@@ -3038,6 +3038,66 @@ class CtxgitTest(unittest.TestCase):
         self.assertEqual(parsed["assistant"], "Claude answer")
         self.assertEqual(parsed["artifacts"], [])
 
+    def test_claude_structured_output_failure_falls_back_to_relaxed_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("AItrust")
+
+            class Completed:
+                def __init__(self, stdout: str = "", stderr: str = "", returncode: int = 0):
+                    self.returncode = returncode
+                    self.stdout = stdout
+                    self.stderr = stderr
+
+            seen: list[tuple[list[str], dict[str, Any]]] = []
+            original = ctxgit.subprocess.run
+            try:
+                def fake_run(cmd, **kwargs):
+                    if "auth" in cmd and "status" in cmd:
+                        return Completed(stdout="Logged in using Claude")
+                    seen.append((cmd, kwargs))
+                    if len(seen) == 1:
+                        return Completed(
+                            stdout=json.dumps(
+                                {
+                                    "type": "result",
+                                    "subtype": "error_max_structured_output_retries",
+                                    "is_error": True,
+                                    "errors": [
+                                        "Failed to provide valid structured output after 5 attempts"
+                                    ],
+                                }
+                            ),
+                            returncode=1,
+                        )
+                    return Completed(
+                        stdout=json.dumps(
+                            {
+                                "type": "result",
+                                "result": json.dumps(
+                                    {
+                                        "assistant": "fallback answer",
+                                        "artifacts": [],
+                                        "approvalRequests": [],
+                                    }
+                                ),
+                            }
+                        )
+                    )
+
+                ctxgit.subprocess.run = fake_run
+                result = ctxgit.call_claude_chat(root, store, "AItrust", "Please answer.")
+            finally:
+                ctxgit.subprocess.run = original
+
+            self.assertEqual(result["assistant"], "fallback answer")
+            self.assertIs(result["structuredOutputFallback"], True)
+            self.assertEqual(len(seen), 2)
+            self.assertIn("--json-schema", seen[0][0])
+            self.assertNotIn("--json-schema", seen[1][0])
+            self.assertIn("Retry without the CLI JSON schema validator", seen[1][1]["input"])
+
     def test_provider_models_are_normalized_and_validated(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
