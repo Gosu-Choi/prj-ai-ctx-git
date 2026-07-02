@@ -4525,6 +4525,7 @@ def default_llm_config() -> dict[str, Any]:
             "bin": "claude",
             "model": "opus",
             "webSearch": True,
+            "strictStructuredOutput": False,
             "sandbox": DEFAULT_CODEX_SANDBOX,
             "timeoutSeconds": 900,
             "contextBudgetCharacters": DEFAULT_CONTEXT_BUDGET_CHARS,
@@ -6499,7 +6500,8 @@ def call_claude_prompt(
             input=stdin_text, capture_output=True, timeout=timeout_seconds,
         )
 
-    cmd = build_cmd(strict_schema=True)
+    strict_structured_output = config.get("strictStructuredOutput") is True
+    cmd = build_cmd(strict_schema=strict_structured_output)
     try:
         emit_progress(progress, "Claude Code is working")
         completed = run_claude(cmd, prompt)

@@ -3043,6 +3043,9 @@ class CtxgitTest(unittest.TestCase):
             root = Path(tmp)
             store = ctxgit.ContextStore(root)
             store.create_branch("AItrust")
+            config = ctxgit.load_json(root / ".ctxgit/config.json")
+            config.setdefault("llm", {}).setdefault("claude", {})["strictStructuredOutput"] = True
+            ctxgit.dump_json(root / ".ctxgit/config.json", config)
 
             class Completed:
                 def __init__(self, stdout: str = "", stderr: str = "", returncode: int = 0):
@@ -3097,6 +3100,46 @@ class CtxgitTest(unittest.TestCase):
             self.assertIn("--json-schema", seen[0][0])
             self.assertNotIn("--json-schema", seen[1][0])
             self.assertIn("Retry without the CLI JSON schema validator", seen[1][1]["input"])
+
+    def test_claude_chat_does_not_use_strict_schema_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("AItrust")
+
+            class Completed:
+                def __init__(self, stdout: str = "", stderr: str = "", returncode: int = 0):
+                    self.returncode = returncode
+                    self.stdout = stdout
+                    self.stderr = stderr
+
+            seen: list[list[str]] = []
+            original = ctxgit.subprocess.run
+            try:
+                def fake_run(cmd, **_kwargs):
+                    if "auth" in cmd and "status" in cmd:
+                        return Completed(stdout="Logged in using Claude")
+                    seen.append(cmd)
+                    return Completed(
+                        stdout=json.dumps(
+                            {
+                                "type": "result",
+                                "result": json.dumps(
+                                    {"assistant": "ok", "artifacts": [], "approvalRequests": []}
+                                ),
+                            }
+                        )
+                    )
+
+                ctxgit.subprocess.run = fake_run
+                result = ctxgit.call_claude_chat(root, store, "AItrust", "Please answer.")
+            finally:
+                ctxgit.subprocess.run = original
+
+            self.assertEqual(result["assistant"], "ok")
+            self.assertEqual(len(seen), 1)
+            self.assertIn("--output-format", seen[0])
+            self.assertNotIn("--json-schema", seen[0])
 
     def test_provider_models_are_normalized_and_validated(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
