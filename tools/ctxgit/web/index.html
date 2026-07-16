@@ -120,10 +120,11 @@
               <input id="webSearchInput" type="checkbox" />
               <span>Web search</span>
             </label>
-            <label class="checkbox-label">
-              <input id="subagentsInput" type="checkbox" />
-              <span>Subagents (Claude)</span>
-            </label>
+            <label for="orchestrationInput">Orchestration (Claude)</label>
+            <select id="orchestrationInput">
+              <option value="legacy">Legacy · single agent</option>
+              <option value="omc">OMC · subagents + team</option>
+            </select>
             <label for="timeoutSecondsInput">Timeout seconds</label>
             <div class="settings-row">
               <input id="timeoutSecondsInput" min="1" step="1" type="number" />
@@ -314,6 +315,17 @@
         </section>
       </main>
     </div>
+
+    <dialog id="orchestrationDialog" class="orchestration-dialog">
+      <div class="orchestration-head">
+        <div>
+          <div id="orchestrationTitle" class="orchestration-title">Orchestration</div>
+          <div id="orchestrationSubtitle" class="orchestration-subtitle"></div>
+        </div>
+        <button type="button" onclick="this.closest('dialog').close()">Close</button>
+      </div>
+      <div id="orchestrationBody" class="orchestration-body"></div>
+    </dialog>
 
     <dialog id="sequenceRoomDialog" class="sequence-dialog">
       <form id="sequenceRoomForm" method="dialog">

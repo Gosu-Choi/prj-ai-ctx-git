@@ -2081,3 +2081,189 @@ textarea {
     min-height: 42px;
   }
 }
+
+/* Orchestration log: how the agents produced one output */
+.orchestration-button {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent);
+  border-radius: 20px;
+  padding: 1px 8px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.orchestration-button:hover {
+  background: var(--accent);
+  color: #fff;
+}
+
+.orchestration-dialog {
+  width: min(920px, 92vw);
+  max-height: 86vh;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 0;
+  background: var(--panel);
+  color: var(--text);
+}
+
+.orchestration-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.4);
+}
+
+.orchestration-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--line);
+  position: sticky;
+  top: 0;
+  background: var(--panel);
+}
+
+.orchestration-title {
+  font-size: 16px;
+  font-weight: 750;
+}
+
+.orchestration-subtitle {
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+.orchestration-body {
+  padding: 14px 16px 18px;
+  overflow-y: auto;
+  max-height: calc(86vh - 60px);
+}
+
+.orch-task {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 12px;
+  background: var(--bg);
+}
+
+.orch-task-label {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+
+.orch-flow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+
+.orch-chip {
+  font-size: 12px;
+  font-weight: 700;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  border-radius: 20px;
+  padding: 3px 10px;
+  white-space: nowrap;
+}
+
+.orch-arrow {
+  color: var(--muted);
+}
+
+.orch-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 10px;
+}
+
+.orch-entry {
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: var(--panel);
+}
+
+.orch-entry.orch-delegation {
+  border-left-color: var(--warn);
+  margin-left: 22px;
+}
+
+.orch-entry.orch-failed {
+  border-left-color: #a33;
+}
+
+.orch-entry-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.orch-seq {
+  font-weight: 700;
+  color: var(--muted);
+  min-width: 18px;
+}
+
+.orch-role {
+  font-weight: 750;
+}
+
+.orch-stage {
+  color: var(--muted);
+}
+
+.orch-badge {
+  font-size: 10px;
+  font-weight: 700;
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  padding: 1px 7px;
+  color: var(--muted);
+}
+
+.orch-duration {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.orch-block {
+  margin-top: 6px;
+}
+
+.orch-block summary {
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+
+.orch-block pre {
+  margin: 6px 0 0;
+  padding: 8px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  white-space: pre-wrap;
+  word-break: normal;
+  overflow-x: auto;
+  font-size: 12px;
+  max-height: 320px;
+  overflow-y: auto;
+}

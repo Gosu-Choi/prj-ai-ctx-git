@@ -62,6 +62,8 @@ if str(_MODULE_DIR) not in sys.path:
 from orchestration import (  # noqa: E402
     LEAD_ORCHESTRATION_PROTOCOL,
     WORKER_RUNTIME_OVERRIDE,
+    Transcript,
+    delegation_from_event,
     resolve_agent,
     AgentReply,
     AgentRequest,
@@ -4617,7 +4619,6 @@ def default_llm_config() -> dict[str, Any]:
             "model": "opus",
             "webSearch": True,
             "strictStructuredOutput": True,
-            "subagents": False,
             "sandbox": DEFAULT_CODEX_SANDBOX,
             "timeoutSeconds": 900,
             "contextBudgetCharacters": DEFAULT_CONTEXT_BUDGET_CHARS,
@@ -4685,8 +4686,13 @@ def write_provider_config(root: Path, updates: dict[str, Any]) -> dict[str, Any]
         next_provider["timeoutSeconds"] = timeout_seconds
     if "webSearch" in updates:
         next_provider["webSearch"] = updates.get("webSearch") is True
-    if "subagents" in updates:
-        next_provider["subagents"] = updates.get("subagents") is True
+    if "orchestration" in updates:
+        mode = str(updates.get("orchestration") or "").strip().lower()
+        if mode not in ORCHESTRATION_MODES:
+            raise ValueError(f"orchestration must be one of: {', '.join(sorted(ORCHESTRATION_MODES))}")
+        next_provider["orchestration"] = mode
+        # keep the old boolean consistent for anything still reading it
+        next_provider["subagents"] = mode == "omc"
     if "sandbox" in updates:
         sandbox = str(updates.get("sandbox") or "").strip()
         if sandbox not in ALLOWED_CODEX_SANDBOXES:
@@ -4786,7 +4792,7 @@ def claude_login_status(root: Path) -> dict[str, Any]:
             "loginCommand": "claude auth login", "resolvedCommand": " ".join(resolve_claude_command(root)),
             "model": str(config.get("model") or "opus"),
             "webSearch": config.get("webSearch") is not False,
-            "subagents": config.get("subagents") is True,
+            "orchestration": orchestration_mode(root),
             "sandbox": str(config.get("sandbox") or DEFAULT_CODEX_SANDBOX),
             "timeoutSeconds": coerce_positive_int(config.get("timeoutSeconds"), 900),
             "envFiles": env_status.get("files", []),
@@ -4807,7 +4813,7 @@ def claude_login_status(root: Path) -> dict[str, Any]:
         "resolvedCommand": " ".join(resolve_claude_command(root)),
         "model": str(config.get("model") or "opus"),
         "webSearch": config.get("webSearch") is not False,
-        "subagents": config.get("subagents") is True,
+        "orchestration": orchestration_mode(root),
         "sandbox": str(config.get("sandbox") or DEFAULT_CODEX_SANDBOX),
         "timeoutSeconds": coerce_positive_int(config.get("timeoutSeconds"), 900),
         "auth": auth,
@@ -6635,7 +6641,7 @@ def call_claude_prompt(
     config = read_llm_config(root).get("claude", {})
     timeout_seconds = coerce_positive_int(config.get("timeoutSeconds"), 900)
     schema = output_schema or chat_output_schema()
-    subagents_enabled = config.get("subagents") is True
+    subagents_enabled = orchestration_mode(root) == "omc"
     tools = claude_tools(
         writable=writable,
         web_search=config.get("webSearch") is not False,
@@ -6741,6 +6747,68 @@ def call_claude_prompt(
     return parsed
 
 
+ORCHESTRATION_MODES = {"omc", "legacy"}
+
+
+def orchestration_mode(root: Path) -> str:
+    """Which orchestration a claude turn uses.
+
+    `omc` gives the lead subagents plus the team pipeline; `legacy` is the plain
+    single-agent behaviour ctxgit had before any of that existed.
+    """
+    config = read_llm_config(root).get("claude", {})
+    mode = str(config.get("orchestration") or "").strip().lower()
+    if mode in ORCHESTRATION_MODES:
+        return mode
+    # Back-compat with the original boolean toggle.
+    return "omc" if config.get("subagents") is True else "legacy"
+
+
+def orchestration_log_path(store: ContextStore, branch_id: str, turn_id: str) -> Path:
+    directory = store.branch_paths(branch_id).root / "orchestration"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / f"{turn_id}.json"
+
+
+def save_orchestration_log(
+    store: ContextStore, branch_id: str, transcript: Transcript
+) -> str | None:
+    """Persist a turn's transcript and return its project-relative path."""
+    if not transcript.entries:
+        return None
+    path = orchestration_log_path(store, branch_id, transcript.turn_id)
+    dump_json(path, transcript.to_dict())
+    return relpath(store.root, path)
+
+
+def delegation_recording_progress(
+    transcript: Transcript, progress: ProgressCallback | None
+) -> ProgressCallback:
+    """Tee progress events, keeping the delegations for the transcript.
+
+    A lead agent's hand-offs to subagents only exist as streamed events, so this is
+    the only place a chat or sequence-room turn can capture them.
+    """
+
+    def wrapped(message: str) -> None:
+        delegation = delegation_from_event(message)
+        if delegation:
+            transcript.record(
+                "delegation",
+                role=delegation["role"],
+                label="delegation",
+                reply=delegation["description"],
+                meta={"description": delegation["description"]},
+            )
+        if progress:
+            progress(message)
+
+    cancelled = getattr(progress, "cancelled", None)
+    if cancelled is not None:
+        wrapped.cancelled = cancelled  # type: ignore[attr-defined]
+    return wrapped
+
+
 def call_claude_agent(
     root: Path,
     request: AgentRequest,
@@ -6836,6 +6904,9 @@ def run_team_pipeline_turn(
         branch_id, "user", user_message, extra={"turnId": turn_id, "mode": "team-pipeline"},
     )
     workspace = sequence_workspace_dir(store, branch_id)
+    transcript = Transcript(
+        turn_id=turn_id, branch=branch_id, mode="team-pipeline", task=user_message
+    )
 
     def call_agent(request: AgentRequest) -> AgentReply:
         return call_claude_agent(root, request, cwd=workspace, progress=progress)
@@ -6847,7 +6918,9 @@ def run_team_pipeline_turn(
         call_agent=call_agent,
         progress=progress,
         max_parallel=coerce_positive_int(max_parallel, 4),
+        transcript=transcript,
     )
+    orchestration_log = save_orchestration_log(store, branch_id, transcript)
 
     state = result.state
     verdict = (result.verify or {}).get("verdict") or "n/a"
@@ -6886,6 +6959,7 @@ def run_team_pipeline_turn(
             "mode": "team-pipeline",
             "provider": "claude",
             "artifacts": artifact_refs,
+            **({"orchestrationLog": orchestration_log} if orchestration_log else {}),
             "teamPipeline": {
                 "phase": state.phase,
                 "stopReason": result.stop_reason,
@@ -7034,6 +7108,7 @@ def run_chat_turn(
             user_extra["resources"] = normalized_resources
         store.append_history(branch_id, "user", user_message, extra=user_extra)
     markdown_before = markdown_file_snapshot(root)
+    transcript = Transcript(turn_id=turn_id, branch=branch_id, mode="chat", task=user_message)
     result = call_provider_chat(
         selected_provider,
         root,
@@ -7042,8 +7117,9 @@ def run_chat_turn(
         user_message,
         approved_external_paths=approved_external_paths,
         resource_paths=normalized_resources,
-        progress=progress,
+        progress=delegation_recording_progress(transcript, progress),
     )
+    orchestration_log = save_orchestration_log(store, branch_id, transcript)
     direct_markdown_refs = changed_markdown_file_refs(root, markdown_before, markdown_file_snapshot(root))
     artifact_refs = []
     emit_progress(progress, "Saving assistant output")
@@ -7077,6 +7153,7 @@ def run_chat_turn(
             "turnId": turn_id,
             "artifacts": artifact_refs,
             "approvalRequests": approval_requests,
+            **({"orchestrationLog": orchestration_log} if orchestration_log else {}),
         },
     )
     turn_commit = internal_git_commit_turn(
@@ -7728,6 +7805,11 @@ def run_sequence_room_turn(
     )
     store.maybe_compact_history(branch_id)
     workspace = sequence_workspace_dir(store, branch_id)
+    transcript = Transcript(
+        turn_id=run_id, branch=branch_id, mode="sequence-room", task=user_message
+    )
+    # Deterministic from run_id, so each reply can point at the log written below.
+    orchestration_log = relpath(root, orchestration_log_path(store, branch_id, run_id))
     stopped = False
     stop_reason = ""
     evaluator_rounds = 0
@@ -7764,7 +7846,7 @@ def run_sequence_room_turn(
             prompt,
             writable=effective_access == "send",
             cwd=workspace,
-            progress=progress,
+            progress=delegation_recording_progress(transcript, progress),
             output_schema=output_schema,
         )
         workspace_rel = relpath(root, workspace)
@@ -7809,6 +7891,7 @@ def run_sequence_room_turn(
                 "sequenceAccessMode": effective_access,
                 "provider": selected_provider,
                 "artifacts": workspace_markdown_refs,
+                "orchestrationLog": orchestration_log,
                 **(
                     {
                         "sequenceEvaluation": evaluation,
@@ -7818,6 +7901,21 @@ def run_sequence_room_turn(
                     if stop_decider is not None and order == stop_decider
                     else {}
                 ),
+            },
+        )
+        transcript.record(
+            "stage",
+            role=f"agent-{order}",
+            stage="sequence-reply",
+            label=f"reply-{reply_index + 1}",
+            prompt=prompt,
+            reply=text,
+            meta={
+                "order": order,
+                "sourceBranch": source_id,
+                "accessMode": effective_access,
+                "isEvaluator": stop_decider is not None and order == stop_decider,
+                **({"evaluation": evaluation} if evaluation else {}),
             },
         )
         emit_progress(progress, f"Sequence reply {reply_index + 1} saved")
@@ -7839,6 +7937,7 @@ def run_sequence_room_turn(
             if stop_decider is None
             else "Maximum agent replies reached before the completion criteria passed."
         )
+    save_orchestration_log(store, branch_id, transcript)
     turn_commit = internal_git_commit_turn(
         store,
         kind="sequence-room-turn",
@@ -9952,6 +10051,22 @@ def make_handler(
                 except SystemExit as exc:
                     self.send_json({"error": "branch_not_found"}, status=int(exc.code or 404))
                 return True
+            if parsed.path == "/api/orchestration":
+                branch_id = str(query.get("branch", [""])[0])
+                turn_id = str(query.get("turn", [""])[0])
+                if not branch_id or not turn_id:
+                    self.send_json({"error": "branch_and_turn_required"}, status=400)
+                    return
+                try:
+                    path = orchestration_log_path(store, branch_id, turn_id)
+                except SystemExit as exc:
+                    self.send_json({"error": "branch_invalid"}, status=int(exc.code or 400))
+                    return
+                if not path.exists():
+                    self.send_json({"error": "orchestration_log_not_found"}, status=404)
+                    return
+                self.send_json(load_json(path))
+                return
             if parsed.path == "/api/sequence-room/participant":
                 try:
                     self.send_json(

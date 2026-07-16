@@ -48,6 +48,7 @@ from .protocol import (
     handoff_template,
     worker_preamble,
 )
+from .transcript import Transcript, delegation_from_event
 from .stages import (
     ASSIGNABLE_ROLES,
     DEFAULT_MAX_PARALLEL,
@@ -67,6 +68,8 @@ __all__ = [
     "AgentRequest",
     "PipelineResult",
     "run_team_pipeline",
+    "Transcript",
+    "delegation_from_event",
     "DEFAULT_MAX_FIX_ATTEMPTS",
     "DEFAULT_MAX_ITERATIONS",
     "LEAD_ORCHESTRATION_PROTOCOL",

@@ -79,9 +79,9 @@ class ClaudeCommandTest(unittest.TestCase):
             self.assertIn("--verbose", cmd)
             self.assertIn("--json-schema", cmd)
 
-    def test_subagents_toggle_gates_task_agents_and_protocol(self) -> None:
+    def test_orchestration_mode_gates_task_agents_and_protocol(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root, store = self._project(tmp, subagents=True)
+            root, store = self._project(tmp, orchestration="omc")
             cmd = self._capture_chat_command(root, store, "b1")
             self.assertIn("Task", cmd[cmd.index("--tools") + 1])
             self.assertIn("--agents", cmd)
@@ -91,7 +91,7 @@ class ClaudeCommandTest(unittest.TestCase):
             self.assertIn("orchestrate a team of subagents", cmd[cmd.index("--append-system-prompt") + 1])
 
         with tempfile.TemporaryDirectory() as tmp:
-            root, store = self._project(tmp, subagents=False)
+            root, store = self._project(tmp, orchestration="legacy")
             cmd = self._capture_chat_command(root, store, "b1")
             self.assertNotIn("Task", cmd[cmd.index("--tools") + 1])
             self.assertNotIn("--agents", cmd)
@@ -377,6 +377,173 @@ class TeamPipelineTurnTest(unittest.TestCase):
             self.assertEqual(assistant["teamPipeline"]["phase"], orch.PHASE_FAILED)
             self.assertEqual(assistant["teamPipeline"]["fixAttempts"], 4)
             self.assertIn("Outstanding", assistant["text"])
+
+
+class OrchestrationLogTest(unittest.TestCase):
+    """The record of how the agents produced an output."""
+
+    def _project(self, tmp: str, mode: str = "omc"):
+        root = Path(tmp)
+        store = ctxgit.ContextStore(root)
+        store.init(create_initial_branch=False)
+        store.create_branch("b1")
+        ctxgit.write_provider_config(root, {"provider": "claude", "orchestration": mode})
+        return root, store
+
+    def test_mode_resolves_and_falls_back_to_the_old_boolean(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = self._project(tmp, mode="legacy")
+            self.assertEqual(ctxgit.orchestration_mode(root), "legacy")
+
+            config_path = root / ".ctxgit" / "config.json"
+            config = json.loads(config_path.read_text())
+            config["llm"]["claude"]["orchestration"] = "omc"
+            config_path.write_text(json.dumps(config))
+            self.assertEqual(ctxgit.orchestration_mode(root), "omc")
+
+            # a config written before the mode existed still works
+            del config["llm"]["claude"]["orchestration"]
+            config["llm"]["claude"]["subagents"] = True
+            config_path.write_text(json.dumps(config))
+            self.assertEqual(ctxgit.orchestration_mode(root), "omc")
+
+    def test_invalid_mode_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = self._project(tmp)
+            with self.assertRaises(ValueError):
+                ctxgit.write_provider_config(root, {"provider": "claude", "orchestration": "nope"})
+
+    def test_team_turn_records_every_stage_and_links_it_from_history(self) -> None:
+        original = ctxgit.call_claude_agent
+
+        def fake_agent(root, request, *, cwd, progress=None):
+            if request.label == "team-plan":
+                return orch.AgentReply(
+                    data={
+                        "summary": "s",
+                        "tasks": [
+                            {"id": "t1", "title": "a", "brief": "b", "acceptance": "c", "role": "executor"}
+                        ],
+                    }
+                )
+            if request.label == "team-prd":
+                return orch.AgentReply(data={"acceptanceCriteria": ["x"], "outOfScope": []})
+            if request.label == "team-verify":
+                return orch.AgentReply(data={"verdict": "PASS", "evidence": "e", "requiredChanges": []})
+            return orch.AgentReply(text="executor did it")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            ctxgit.call_claude_agent = fake_agent
+            try:
+                ctxgit.run_team_pipeline_turn(root, store, "b1", "Build it")
+            finally:
+                ctxgit.call_claude_agent = original
+
+            assistant = [item for item in store.iter_history("b1") if item["role"] == "assistant"][-1]
+            self.assertIn("orchestrationLog", assistant)
+            log = json.loads((root / assistant["orchestrationLog"]).read_text())
+            self.assertEqual(log["mode"], "team-pipeline")
+            self.assertEqual(log["turnId"], assistant["turnId"])
+            roles = [entry["role"] for entry in log["entries"]]
+            self.assertEqual(roles, ["planner", "analyst", "executor", "verifier"])
+            stages = [entry["stage"] for entry in log["entries"]]
+            self.assertEqual(stages, ["team-plan", "team-prd", "team-exec", "team-verify"])
+            # both sides of each exchange are kept, which is the point
+            for entry in log["entries"]:
+                self.assertTrue(entry["prompt"])
+                self.assertTrue(entry["reply"])
+
+    def test_a_failed_worker_is_still_recorded(self) -> None:
+        original = ctxgit.call_claude_agent
+
+        def fake_agent(root, request, *, cwd, progress=None):
+            if request.label == "team-plan":
+                return orch.AgentReply(
+                    data={
+                        "summary": "s",
+                        "tasks": [
+                            {"id": "t1", "title": "a", "brief": "b", "acceptance": "c", "role": "executor"}
+                        ],
+                    }
+                )
+            if request.label == "team-prd":
+                return orch.AgentReply(data={"acceptanceCriteria": ["x"], "outOfScope": []})
+            if request.label == "team-verify":
+                return orch.AgentReply(data={"verdict": "PASS", "evidence": "e", "requiredChanges": []})
+            raise RuntimeError("worker exploded")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            ctxgit.call_claude_agent = fake_agent
+            try:
+                ctxgit.run_team_pipeline_turn(root, store, "b1", "Build it")
+            finally:
+                ctxgit.call_claude_agent = original
+
+            assistant = [item for item in store.iter_history("b1") if item["role"] == "assistant"][-1]
+            log = json.loads((root / assistant["orchestrationLog"]).read_text())
+            failed = [entry for entry in log["entries"] if entry["meta"].get("failed")]
+            self.assertEqual(len(failed), 1)
+            self.assertIn("worker exploded", failed[0]["reply"])
+
+    def test_chat_turn_captures_lead_delegations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            original = ctxgit.subprocess.run
+
+            def fake_run(cmd, **kwargs):
+                if "auth" in cmd and "status" in cmd:
+                    return FakeCompleted(stdout="Logged in")
+                return FakeCompleted(stdout=structured_result({"assistant": "done", "artifacts": [], "approvalRequests": []}))
+
+            # the lead's delegations only exist as streamed events
+            original_progress = ctxgit.run_process_with_progress
+
+            def fake_stream(cmd, cwd, timeout, progress, stdin_text=None, event_formatter=None):
+                progress("Delegating to subagent: researcher · market size")
+                progress("Delegating to subagent: executor · write the file")
+                return FakeCompleted(
+                    stdout=structured_result({"assistant": "done", "artifacts": [], "approvalRequests": []})
+                )
+
+            ctxgit.subprocess.run = fake_run
+            ctxgit.run_process_with_progress = fake_stream
+            try:
+                ctxgit.run_chat_turn(root, store, "b1", "do it", provider="claude", progress=lambda _m: None)
+            finally:
+                ctxgit.subprocess.run = original
+                ctxgit.run_process_with_progress = original_progress
+
+            assistant = [item for item in store.iter_history("b1") if item["role"] == "assistant"][-1]
+            self.assertIn("orchestrationLog", assistant)
+            log = json.loads((root / assistant["orchestrationLog"]).read_text())
+            self.assertEqual([entry["kind"] for entry in log["entries"]], ["delegation", "delegation"])
+            self.assertEqual([entry["role"] for entry in log["entries"]], ["researcher", "executor"])
+
+    def test_delegation_parser_ignores_other_events(self) -> None:
+        from orchestration.transcript import delegation_from_event
+
+        self.assertEqual(
+            delegation_from_event("Delegating to subagent: verifier · check the deck"),
+            {"role": "verifier", "description": "check the deck"},
+        )
+        self.assertEqual(
+            delegation_from_event("Delegating to subagent: planner"),
+            {"role": "planner", "description": ""},
+        )
+        self.assertIsNone(delegation_from_event("Using tool: Write · /x.html"))
+        self.assertIsNone(delegation_from_event("Claude Code is working"))
+
+    def test_long_prompts_are_excerpted_not_dropped(self) -> None:
+        from orchestration.transcript import excerpt
+
+        short = excerpt("hello")
+        self.assertEqual(short, "hello")
+        long_text = "x" * 9000
+        trimmed = excerpt(long_text, 100)
+        self.assertLess(len(trimmed), 400)
+        self.assertIn("omitted", trimmed)
 
 
 class SequenceInterjectionTest(unittest.TestCase):

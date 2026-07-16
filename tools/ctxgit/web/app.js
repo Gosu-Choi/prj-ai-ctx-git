@@ -110,7 +110,11 @@ const els = {
   providerInput: document.querySelector("#providerInput"),
   providerModelInput: document.querySelector("#providerModelInput"),
   webSearchInput: document.querySelector("#webSearchInput"),
-  subagentsInput: document.querySelector("#subagentsInput"),
+  orchestrationInput: document.querySelector("#orchestrationInput"),
+  orchestrationDialog: document.querySelector("#orchestrationDialog"),
+  orchestrationTitle: document.querySelector("#orchestrationTitle"),
+  orchestrationSubtitle: document.querySelector("#orchestrationSubtitle"),
+  orchestrationBody: document.querySelector("#orchestrationBody"),
   timeoutSecondsInput: document.querySelector("#timeoutSecondsInput"),
   sandboxInput: document.querySelector("#sandboxInput"),
   saveProviderButton: document.querySelector("#saveProviderButton"),
@@ -1720,6 +1724,86 @@ function closeBranchMenus() {
   document.querySelectorAll(".branch-row.open").forEach((row) => row.classList.remove("open"));
 }
 
+const ORCHESTRATION_STAGE_LABEL = {
+  "team-plan": "Plan",
+  "team-prd": "Acceptance criteria",
+  "team-exec": "Execute",
+  "team-verify": "Verify",
+  "team-fix": "Fix",
+  "sequence-reply": "Room reply",
+};
+
+function orchestrationDuration(ms) {
+  const value = Number(ms || 0);
+  if (!Number.isFinite(value) || value <= 0) return "";
+  return value >= 1000 ? `${(value / 1000).toFixed(1)}s` : `${value}ms`;
+}
+
+function renderOrchestrationEntry(entry) {
+  const stage = ORCHESTRATION_STAGE_LABEL[entry.stage] || entry.stage || entry.kind;
+  const meta = entry.meta || {};
+  const badges = [];
+  if (entry.model) badges.push(entry.model);
+  if (meta.isEvaluator) badges.push("evaluator");
+  if (meta.writable === false) badges.push("read-only");
+  if (meta.failed) badges.push("failed");
+  const duration = orchestrationDuration(entry.duration_ms);
+  const isDelegation = entry.kind === "delegation";
+  return `
+    <li class="orch-entry ${isDelegation ? "orch-delegation" : ""} ${meta.failed ? "orch-failed" : ""}">
+      <div class="orch-entry-head">
+        <span class="orch-seq">${entry.seq}</span>
+        <span class="orch-role">${escapeHtml(entry.role || "agent")}</span>
+        <span class="orch-stage">${escapeHtml(isDelegation ? "delegated" : stage)}</span>
+        ${badges.map((item) => `<span class="orch-badge">${escapeHtml(item)}</span>`).join("")}
+        ${duration ? `<span class="orch-duration">${escapeHtml(duration)}</span>` : ""}
+      </div>
+      ${
+        entry.prompt
+          ? `<details class="orch-block"><summary>asked</summary><pre>${escapeHtml(entry.prompt)}</pre></details>`
+          : ""
+      }
+      ${
+        entry.reply
+          ? `<details class="orch-block" open><summary>answered</summary><pre>${escapeHtml(entry.reply)}</pre></details>`
+          : ""
+      }
+    </li>
+  `;
+}
+
+async function showOrchestrationLog(turnId) {
+  const branch = activeChatKey();
+  if (!branch || !turnId) return;
+  els.orchestrationTitle.textContent = "Orchestration";
+  els.orchestrationSubtitle.textContent = "Loading…";
+  els.orchestrationBody.innerHTML = "";
+  if (!els.orchestrationDialog.open) els.orchestrationDialog.showModal();
+  try {
+    const log = await api(
+      `/api/orchestration?branch=${encodeURIComponent(branch)}&turn=${encodeURIComponent(turnId)}`,
+    );
+    const entries = Array.isArray(log.entries) ? log.entries : [];
+    const stages = entries.filter((item) => item.kind === "stage").length;
+    const delegations = entries.filter((item) => item.kind === "delegation").length;
+    const total = entries.reduce((sum, item) => sum + Number(item.duration_ms || 0), 0);
+    const roles = [...new Set(entries.map((item) => item.role).filter(Boolean))];
+    els.orchestrationTitle.textContent = `Orchestration · ${log.mode || "turn"}`;
+    els.orchestrationSubtitle.textContent =
+      `${entries.length} step(s) · ${stages} stage(s)` +
+      (delegations ? ` · ${delegations} delegation(s)` : "") +
+      (total ? ` · ${orchestrationDuration(total)} of agent time` : "");
+    els.orchestrationBody.innerHTML = `
+      ${log.task ? `<div class="orch-task"><span class="orch-task-label">Goal</span><pre>${escapeHtml(log.task)}</pre></div>` : ""}
+      <div class="orch-flow">${roles.map((role) => `<span class="orch-chip">${escapeHtml(role)}</span>`).join('<span class="orch-arrow">→</span>')}</div>
+      <ol class="orch-list">${entries.map(renderOrchestrationEntry).join("")}</ol>
+    `;
+  } catch (error) {
+    els.orchestrationSubtitle.textContent = "";
+    els.orchestrationBody.innerHTML = `<div class="muted">기록을 불러오지 못했습니다: ${escapeHtml(error.message)}</div>`;
+  }
+}
+
 function closeMessageMenus() {
   document.querySelectorAll(".message-options.open").forEach((item) => item.classList.remove("open"));
 }
@@ -2033,7 +2117,7 @@ function renderGit(status) {
 function renderProvider(status) {
   state.provider = status;
   const webSearch = status.webSearch === false ? "off" : "on";
-  const subagents = status.subagents === true ? "on" : "off";
+  const orchestration = status.orchestration === "omc" ? "omc" : "legacy";
   const timeoutSeconds = status.timeoutSeconds || 900;
   const sandbox = status.sandbox || "workspace-write";
   const model = status.model || "";
@@ -2058,7 +2142,7 @@ function renderProvider(status) {
     <div>Provider: <strong>${escapeHtml(status.provider || "codex")}</strong></div>
     <div class="muted">Model: ${escapeHtml(model || "provider default")}</div>
     <div>${escapeHtml(status.message || status.status || "")}</div>
-    <div class="muted">Web search: ${webSearch} · Subagents: ${subagents} · Timeout: ${escapeHtml(String(timeoutSeconds))}s</div>
+    <div class="muted">Web search: ${webSearch} · Orchestration: ${orchestration} · Timeout: ${escapeHtml(String(timeoutSeconds))}s</div>
     <div class="muted">Brave search: ${escapeHtml(braveStatus)}</div>
     <div class="muted">Sandbox: ${escapeHtml(sandbox)}</div>
     <div class="muted">External writes: approval required</div>
@@ -2075,7 +2159,7 @@ function renderProvider(status) {
     }
   `;
   els.webSearchInput.checked = webSearch === "on";
-  els.subagentsInput.checked = subagents === "on";
+  els.orchestrationInput.value = orchestration;
   els.providerInput.value = status.provider || "codex";
   els.providerModelInput.value = model;
   els.timeoutSecondsInput.value = timeoutSeconds;
@@ -2544,7 +2628,8 @@ function updateComposerState() {
       ? "Stop"
       : "Info chat";
   const claudeProvider = (state.provider?.provider || "codex") === "claude";
-  els.teamButton.hidden = contextMode;
+  const omcMode = state.provider?.orchestration === "omc";
+  els.teamButton.hidden = contextMode || !omcMode;
   els.teamButton.disabled = disabled || Boolean(running) || !claudeProvider;
   els.teamButton.textContent = archived ? "Archived" : running ? "Busy" : "Team";
   els.teamButton.title = claudeProvider
@@ -2815,6 +2900,17 @@ function renderBranch(payload) {
                   <span class="message-number">${index + 1}</span>
                   <span>${escapeHtml(message.createdAt)}</span>
                   ${
+                    message.orchestrationLog
+                      ? `<button
+                            class="orchestration-button"
+                            data-orchestration-turn="${escapeHtml(message.turnId || "")}"
+                            type="button"
+                            title="Show how the agents produced this"
+                            aria-label="Show orchestration"
+                          >⛓ agents</button>`
+                      : ""
+                  }
+                  ${
                     archived
                       ? ""
                       : `<span class="message-options">
@@ -2875,6 +2971,12 @@ function renderBranch(payload) {
   );
   els.messageList.querySelectorAll("[data-approval]").forEach((button) => {
     button.addEventListener("click", () => decideApproval(button));
+  });
+  els.messageList.querySelectorAll("[data-orchestration-turn]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      showOrchestrationLog(button.dataset.orchestrationTurn || "");
+    });
   });
   els.messageList.querySelectorAll("[data-message-options]").forEach((button) => {
     button.addEventListener("click", (event) => {
@@ -4403,7 +4505,7 @@ els.providerSettings.addEventListener("submit", async (event) => {
           model: els.providerModelInput.value.trim(),
           timeoutSeconds,
           webSearch: els.webSearchInput.checked,
-          subagents: els.subagentsInput.checked,
+          orchestration: els.orchestrationInput.value,
           sandbox: els.sandboxInput.value,
         }),
       }),

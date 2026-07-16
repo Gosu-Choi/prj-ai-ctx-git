@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import time
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -37,6 +39,7 @@ from .pipeline import (
     transition_team_phase,
 )
 from .protocol import handoff_template, worker_preamble
+from .transcript import KIND_STAGE, Transcript
 
 #: Which specialists each stage draws on. Ported from SKILL.md's stage routing table.
 STAGE_ROUTING: dict[str, dict[str, list[str]]] = {
@@ -428,6 +431,45 @@ def run_fix_stage(
     return state, tasks
 
 
+def _recording(call_agent: CallAgent, transcript: Optional[Transcript]) -> CallAgent:
+    """Wrap call_agent so each stage call lands in the transcript."""
+    if transcript is None:
+        return call_agent
+
+    def recorded(request: AgentRequest) -> AgentReply:
+        started = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        clock = time.monotonic()
+        try:
+            reply = call_agent(request)
+        except Exception as exc:  # noqa: BLE001 - a failed worker is part of the story
+            transcript.record(
+                KIND_STAGE,
+                role=request.role,
+                stage=(request.label or "").split(":")[0],
+                label=request.label,
+                started_at=started,
+                duration_ms=int((time.monotonic() - clock) * 1000),
+                prompt=request.prompt,
+                reply=f"[worker failed] {exc}",
+                meta={"writable": request.writable, "failed": True},
+            )
+            raise
+        transcript.record(
+            KIND_STAGE,
+            role=request.role,
+            stage=(request.label or "").split(":")[0],
+            label=request.label,
+            started_at=started,
+            duration_ms=int((time.monotonic() - clock) * 1000),
+            prompt=request.prompt,
+            reply=reply.text or (json.dumps(reply.data, ensure_ascii=False, indent=2) if reply.data else ""),
+            meta={"writable": request.writable, "structured": reply.data is not None},
+        )
+        return reply
+
+    return recorded
+
+
 def run_team_pipeline(
     *,
     task: str,
@@ -437,6 +479,7 @@ def run_team_pipeline(
     progress: Optional[Progress] = None,
     max_parallel: int = DEFAULT_MAX_PARALLEL,
     max_iterations: Optional[int] = None,
+    transcript: Optional[Transcript] = None,
 ) -> PipelineResult:
     """Drive plan -> prd -> exec -> verify -> (fix -> exec -> verify)* to a terminal phase.
 
@@ -444,6 +487,7 @@ def run_team_pipeline(
     bound decide when the run stops — this function never invents its own exit.
     """
     workspace.mkdir(parents=True, exist_ok=True)
+    call_agent = _recording(call_agent, transcript)
     state = init_team_pipeline_state(
         str(workspace), session_id, project_path=str(workspace), max_iterations=max_iterations
     )
