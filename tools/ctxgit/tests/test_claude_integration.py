@@ -88,7 +88,10 @@ class ClaudeCommandTest(unittest.TestCase):
             agents = json.loads(cmd[cmd.index("--agents") + 1])
             self.assertEqual(len(agents), 19)
             self.assertIn("planner", agents)
-            self.assertIn("orchestrate a team of subagents", cmd[cmd.index("--append-system-prompt") + 1])
+            self.assertIn(
+                orch.LEAD_ORCHESTRATION_PROTOCOL.strip(),
+                cmd[cmd.index("--append-system-prompt") + 1],
+            )
 
         with tempfile.TemporaryDirectory() as tmp:
             root, store = self._project(tmp, orchestration="legacy")
@@ -96,7 +99,8 @@ class ClaudeCommandTest(unittest.TestCase):
             self.assertNotIn("Task", cmd[cmd.index("--tools") + 1])
             self.assertNotIn("--agents", cmd)
             self.assertNotIn(
-                "orchestrate a team of subagents", cmd[cmd.index("--append-system-prompt") + 1]
+                orch.LEAD_ORCHESTRATION_PROTOCOL.strip(),
+                cmd[cmd.index("--append-system-prompt") + 1],
             )
 
     def _run_stage_agent(self, root: Path, seen: list, stdout: str, **request_kwargs):

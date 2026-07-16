@@ -184,6 +184,26 @@ class SubagentLibraryTest(unittest.TestCase):
             self.assertEqual(agents["verifier"]["prompt"], "Be brutal.")
             self.assertIn("house-style", agents)
 
+    def test_protocol_only_points_at_roles_that_exist(self) -> None:
+        # Pointing the lead at a role that is not in the roster just wastes a turn.
+        # The protocol once told it to delegate to `researcher`, which does not exist.
+        # Only backticked names are delegation targets; the prose around them is prose.
+        import re
+
+        with tempfile.TemporaryDirectory() as tmp:
+            roster = set(orch.build_subagents(Path(tmp), writable=True))
+
+        targets = set(re.findall(r"`([a-z][a-z-]+)`", orch.LEAD_ORCHESTRATION_PROTOCOL))
+        self.assertTrue(targets, "protocol should name delegation targets")
+        for role in targets:
+            self.assertIn(role, roster, f"protocol points at a role that does not exist: {role}")
+
+        # The roster summary the lead is shown must be real too.
+        from orchestration.protocol import ROLE_SUMMARY
+
+        for role in re.findall(r"([a-z][a-z-]+) \(", ROLE_SUMMARY):
+            self.assertIn(role, roster, f"role summary names a role that does not exist: {role}")
+
     def test_frontmatter_parser_keeps_body_with_dashes(self) -> None:
         meta, body = orch.parse_agent_markdown(
             "---\nname: t\ndescription: d\n---\n\nBody\n\n| a | b |\n|---|---|\n| 1 | 2 |\n"
