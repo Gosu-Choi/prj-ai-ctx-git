@@ -59,7 +59,13 @@ _MODULE_DIR = Path(__file__).resolve().parent
 if str(_MODULE_DIR) not in sys.path:
     sys.path.insert(0, str(_MODULE_DIR))
 
-from orchestration import LEAD_ORCHESTRATION_PROTOCOL, build_subagents_json  # noqa: E402
+from orchestration import (  # noqa: E402
+    LEAD_ORCHESTRATION_PROTOCOL,
+    AgentReply,
+    AgentRequest,
+    build_subagents_json,
+    run_team_pipeline,
+)
 
 
 BRAVE_WEB_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
@@ -6703,6 +6709,177 @@ def call_claude_prompt(
     return parsed
 
 
+def call_claude_agent(
+    root: Path,
+    request: AgentRequest,
+    *,
+    cwd: Path,
+    progress: ProgressCallback | None = None,
+) -> AgentReply:
+    """Run one team-pipeline stage as a Claude Code session pinned to that role.
+
+    The role's prompt and model tier come from the agent library, so `--agent` is
+    what makes this an `executor` or a `verifier`. Workers are not given Task: per
+    OMC's worker contract they do the assigned job directly.
+    """
+    status = claude_login_status(root)
+    if not status["ok"]:
+        raise RuntimeError(status["message"])
+    config = read_llm_config(root).get("claude", {})
+    timeout_seconds = coerce_positive_int(config.get("timeoutSeconds"), 900)
+    web_search = config.get("webSearch") is not False
+    writable = bool(request.writable)
+    tools = claude_tools(writable=writable, web_search=web_search)
+
+    command = resolve_claude_command(root)
+    command.extend([
+        "-p",
+        "--output-format", "stream-json",
+        "--verbose",
+        "--no-session-persistence",
+        "--permission-mode", "auto" if writable else "bypassPermissions",
+        "--tools", tools,
+        "--allowedTools", tools,
+        "--agents", build_subagents_json(root, writable=writable, web_search=web_search),
+        "--agent", request.role,
+        "--append-system-prompt",
+        (
+            "You are running inside ctxgit as a team pipeline worker. Work only inside the "
+            "current working directory. Do not push, publish, or deploy."
+        ),
+    ])
+    if request.schema:
+        command.extend([
+            "--json-schema",
+            json.dumps(request.schema, ensure_ascii=False, separators=(",", ":")),
+        ])
+    # No --model: the role's own tier from the agent library decides.
+
+    if progress:
+        completed = run_process_with_progress(
+            command, cwd, timeout_seconds, progress,
+            stdin_text=request.prompt,
+            event_formatter=claude_stream_progress,
+        )
+    else:
+        completed = subprocess.run(
+            command, cwd=cwd, check=False, text=True, encoding="utf-8", errors="replace",
+            input=request.prompt, capture_output=True, timeout=timeout_seconds,
+        )
+
+    raw = (completed.stdout or "").strip()
+    if completed.returncode != 0:
+        detail = (completed.stderr or "").strip() or raw
+        raise RuntimeError(
+            detail or f"Claude Code agent {request.role} failed with exit code {completed.returncode}"
+        )
+    payload = claude_final_result_payload(raw) or {}
+    structured = payload.get("structured_output")
+    return AgentReply(
+        text=str(payload.get("result") or "").strip(),
+        data=structured if isinstance(structured, dict) else None,
+    )
+
+
+def run_team_pipeline_turn(
+    root: Path,
+    store: ContextStore,
+    branch_id: str,
+    user_message: str,
+    max_parallel: int | None = None,
+    progress: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    """Run a deterministic team pipeline for one branch turn."""
+    if str(read_llm_config(root).get("provider") or "codex") != "claude":
+        raise ValueError("team pipeline requires the claude provider")
+    turn_id = new_turn_id()
+    emit_progress(progress, "Recording user message")
+    store.append_history(
+        branch_id, "user", user_message, extra={"turnId": turn_id, "mode": "team-pipeline"},
+    )
+    workspace = sequence_workspace_dir(store, branch_id)
+
+    def call_agent(request: AgentRequest) -> AgentReply:
+        return call_claude_agent(root, request, cwd=workspace, progress=progress)
+
+    result = run_team_pipeline(
+        task=user_message,
+        workspace=workspace,
+        session_id=turn_id,
+        call_agent=call_agent,
+        progress=progress,
+        max_parallel=coerce_positive_int(max_parallel, 4),
+    )
+
+    state = result.state
+    verdict = (result.verify or {}).get("verdict") or "n/a"
+    lines = [
+        f"Team pipeline finished in phase **{state.phase}** ({result.stop_reason or 'no reason given'}).",
+        "",
+        f"- verification: {verdict}",
+        f"- tasks: {state.execution.tasks_completed}/{state.execution.tasks_total}"
+        + (f" ({state.execution.tasks_failed} failed)" if state.execution.tasks_failed else ""),
+        f"- fix rounds: {state.fix_loop.attempt}/{state.fix_loop.max_attempts}",
+        f"- phases: {' -> '.join(entry.phase for entry in state.phase_history)}",
+    ]
+    if result.summary:
+        lines.extend(["", "## Plan", result.summary])
+    required = (result.verify or {}).get("requiredChanges") or []
+    if required:
+        lines.extend(["", "## Outstanding", *[f"- {item}" for item in required]])
+
+    artifact_refs = [
+        {"kind": kind, "title": Path(path).name, "path": relpath(root, Path(path))}
+        for kind, path in (
+            ("team-plan", state.artifacts.plan_path),
+            ("team-prd", state.artifacts.prd_path),
+            ("team-verify", state.artifacts.verify_report_path),
+        )
+        if path
+    ]
+
+    emit_progress(progress, "Saving assistant output")
+    store.append_history(
+        branch_id,
+        "assistant",
+        "\n".join(lines),
+        extra={
+            "turnId": turn_id,
+            "mode": "team-pipeline",
+            "provider": "claude",
+            "artifacts": artifact_refs,
+            "teamPipeline": {
+                "phase": state.phase,
+                "stopReason": result.stop_reason,
+                "verdict": verdict,
+                "tasksTotal": state.execution.tasks_total,
+                "tasksCompleted": state.execution.tasks_completed,
+                "tasksFailed": state.execution.tasks_failed,
+                "fixAttempts": state.fix_loop.attempt,
+                "phaseHistory": [entry.phase for entry in state.phase_history],
+            },
+        },
+    )
+    turn_commit = internal_git_commit_turn(
+        store,
+        kind="team-pipeline-turn",
+        actor="user+agents",
+        summary=f"Team pipeline turn on {branch_id}",
+        branch_id=branch_id,
+        turn_id=turn_id,
+        metadata={
+            "phase": state.phase,
+            "stopReason": result.stop_reason,
+            "verdict": verdict,
+            "fixAttempts": state.fix_loop.attempt,
+        },
+    )
+    emit_progress(progress, "Refreshing branch view")
+    payload = branch_payload(store, branch_id)
+    payload["turnCommit"] = turn_commit
+    return payload
+
+
 def call_claude_chat(
     root: Path,
     store: ContextStore,
@@ -10329,6 +10506,24 @@ def make_handler(
                         progress=progress,
                     )
                 self.send_json(jobs.create("sequence-room", sequence_work, root=root), status=202)
+                return
+            if parsed.path == "/api/team/start":
+                branch_id = str(body.get("branch") or "")
+                text = str(body.get("text") or "").strip()
+                max_parallel = int(body.get("maxParallel") or 0)
+                if not text:
+                    self.send_json({"error": "message_required"}, status=400)
+                    return
+                def team_work(progress: ProgressCallback) -> dict[str, Any]:
+                    return run_team_pipeline_turn(
+                        root,
+                        store,
+                        branch_id,
+                        text,
+                        max_parallel=max_parallel or None,
+                        progress=progress,
+                    )
+                self.send_json(jobs.create("team-pipeline", team_work, root=root), status=202)
                 return
             if parsed.path == "/api/sequence-room/interject":
                 branch_id = str(body.get("branch") or "")

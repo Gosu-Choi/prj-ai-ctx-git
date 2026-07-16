@@ -167,6 +167,7 @@ const els = {
   sendButton: document.querySelector("#sendButton"),
   contextResetButton: document.querySelector("#contextResetButton"),
   historyChatButton: document.querySelector("#historyChatButton"),
+  teamButton: document.querySelector("#teamButton"),
   refreshButton: document.querySelector("#refreshButton"),
   sequenceRoomCreateButton: document.querySelector("#sequenceRoomCreateButton"),
   sequenceRoomUpdateButton: document.querySelector("#sequenceRoomUpdateButton"),
@@ -2542,6 +2543,13 @@ function updateComposerState() {
     : running
       ? "Stop"
       : "Info chat";
+  const claudeProvider = (state.provider?.provider || "codex") === "claude";
+  els.teamButton.hidden = contextMode;
+  els.teamButton.disabled = disabled || Boolean(running) || !claudeProvider;
+  els.teamButton.textContent = archived ? "Archived" : running ? "Busy" : "Team";
+  els.teamButton.title = claudeProvider
+    ? "Run the deterministic team pipeline: plan → prd → exec → verify → fix"
+    : "Team pipeline requires the Claude provider";
 }
 
 function renderActiveBranchJob() {
@@ -4157,6 +4165,7 @@ async function sendComposerMessage({ mode, runningAction = "stop" }) {
   const isChat = mode === "chat";
   const isResearch = mode === "research";
   const isInfoChat = mode === "info-chat";
+  const isTeam = mode === "team";
   if (state.startingBranches[branch]) {
     window.alert(
       isContextChat
@@ -4165,7 +4174,7 @@ async function sendComposerMessage({ mode, runningAction = "stop" }) {
     );
     return;
   }
-  const requestedMode = isContextChat ? "context-chat" : isResearch ? "research" : isInfoChat ? "info-chat" : "chat";
+  const requestedMode = isContextChat ? "context-chat" : isResearch ? "research" : isTeam ? "team" : isInfoChat ? "info-chat" : "chat";
   state.startingBranches[branch] = requestedMode;
   markBranchActivity(branch);
   updateComposerState();
@@ -4211,6 +4220,15 @@ async function sendComposerMessage({ mode, runningAction = "stop" }) {
         "/api/research/start",
         { branch, text, provider: "hybrid", resources: turnResourcePaths },
         { branch, mode: "research", title: "리서치 시작 중" },
+      );
+      clearDraft(branch);
+      return;
+    }
+    if (isTeam) {
+      await startTrackedJob(
+        "/api/team/start",
+        { branch, text },
+        { branch, mode: "team", title: "Team pipeline running" },
       );
       clearDraft(branch);
       return;
@@ -4403,6 +4421,10 @@ els.providerSettings.addEventListener("submit", async (event) => {
 
 els.historyChatButton.addEventListener("click", async () => {
   await sendComposerMessage({ mode: "info-chat", runningAction: "stop" });
+});
+
+els.teamButton.addEventListener("click", async () => {
+  await sendComposerMessage({ mode: "team", runningAction: "stop" });
 });
 
 function setBranchDirButton(branchId) {
