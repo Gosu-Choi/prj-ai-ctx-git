@@ -63,7 +63,7 @@ from orchestration import (  # noqa: E402
     LEAD_ORCHESTRATION_PROTOCOL,
     WORKER_RUNTIME_OVERRIDE,
     Transcript,
-    delegation_from_event,
+    delegations_from_event,
     resolve_agent,
     AgentReply,
     AgentRequest,
@@ -6079,6 +6079,22 @@ def claude_stream_progress(line: str) -> str:
         return ""
     message = event.get("message") if isinstance(event.get("message"), dict) else {}
     content = message.get("content") if isinstance(message.get("content"), list) else []
+
+    # A parallel batch arrives as several tool_use blocks in ONE message, so reporting
+    # only the first would hide the fan-out that is the whole point.
+    delegations: list[str] = []
+    for part in content:
+        if not isinstance(part, dict) or part.get("type") != "tool_use":
+            continue
+        if str(part.get("name") or "") in ("Task", "Agent"):
+            tool_input = part.get("input") if isinstance(part.get("input"), dict) else {}
+            subagent = str(tool_input.get("subagent_type") or "subagent")
+            description = str(tool_input.get("description") or tool_input.get("prompt") or "").strip()
+            detail = f" · {compact_progress_text(description, 80)}" if description else ""
+            delegations.append(f"{subagent}{detail}")
+    if delegations:
+        return "Delegating to subagent: " + " ;; ".join(delegations)
+
     for part in content:
         if not isinstance(part, dict):
             continue
@@ -6088,12 +6104,6 @@ def claude_stream_progress(line: str) -> str:
             if name == "StructuredOutput":
                 # Internal plumbing used to emit the required structured output.
                 return ""
-            if name in ("Task", "Agent"):
-                tool_input = part.get("input") if isinstance(part.get("input"), dict) else {}
-                subagent = str(tool_input.get("subagent_type") or "subagent")
-                description = str(tool_input.get("description") or tool_input.get("prompt") or "").strip()
-                detail = f" · {compact_progress_text(description, 80)}" if description else ""
-                return f"Delegating to subagent: {subagent}{detail}"
             return f"Using tool: {name}{_claude_tool_detail(part.get('input'))}"
         if part_type == "text":
             text = str(part.get("text") or "").strip()
@@ -6791,8 +6801,7 @@ def delegation_recording_progress(
     """
 
     def wrapped(message: str) -> None:
-        delegation = delegation_from_event(message)
-        if delegation:
+        for delegation in delegations_from_event(message):
             transcript.record(
                 "delegation",
                 role=delegation["role"],

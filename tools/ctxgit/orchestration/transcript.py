@@ -97,15 +97,25 @@ class Transcript:
         }
 
 
-def delegation_from_event(message: str) -> Optional[dict[str, str]]:
-    """Pull a subagent delegation out of a progress line.
+#: Separates delegations that the lead dispatched together in one message.
+DELEGATION_SEPARATOR = " ;; "
 
-    The lead agent's delegations only exist as streamed events, so this is the one
-    place they can be captured for chat and sequence-room turns.
+
+def delegations_from_event(message: str) -> list[dict[str, str]]:
+    """Pull every subagent delegation out of a progress line.
+
+    The lead's delegations only exist as streamed events, so this is the one place a
+    chat or sequence-room turn can capture them. A parallel batch arrives as several
+    delegations in a single line, and all of them matter.
     """
     prefix = "Delegating to subagent: "
     if not message.startswith(prefix):
-        return None
-    remainder = message[len(prefix):]
-    role, _, description = remainder.partition(" · ")
-    return {"role": role.strip(), "description": description.strip()}
+        return []
+    results: list[dict[str, str]] = []
+    for chunk in message[len(prefix):].split(DELEGATION_SEPARATOR):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        role, _, description = chunk.partition(" · ")
+        results.append({"role": role.strip(), "description": description.strip()})
+    return results

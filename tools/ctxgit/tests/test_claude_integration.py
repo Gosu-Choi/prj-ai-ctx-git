@@ -260,11 +260,34 @@ class ClaudeStreamParsingTest(unittest.TestCase):
                     {
                         "type": "tool_use",
                         "name": "Agent",
-                        "input": {"subagent_type": "researcher", "description": "market size"},
+                        "input": {"subagent_type": "explore", "description": "market size"},
                     }
                 )
             ),
-            "Delegating to subagent: researcher · market size",
+            "Delegating to subagent: explore · market size",
+        )
+        # Regression: a parallel batch arrives as several tool_use blocks in ONE message.
+        # Reporting only the first hid the fan-out from the log and the modal.
+        batch = json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "dispatching"},
+                        {"type": "tool_use", "name": "Agent", "input": {"subagent_type": "executor", "description": "a.md"}},
+                        {"type": "tool_use", "name": "Agent", "input": {"subagent_type": "executor", "description": "b.md"}},
+                        {"type": "tool_use", "name": "Agent", "input": {"subagent_type": "writer", "description": "c.md"}},
+                    ]
+                },
+            }
+        )
+        line = ctxgit.claude_stream_progress(batch)
+        from orchestration.transcript import delegations_from_event
+
+        self.assertEqual(len(delegations_from_event(line)), 3)
+        self.assertEqual(
+            [item["role"] for item in delegations_from_event(line)],
+            ["executor", "executor", "writer"],
         )
         self.assertEqual(ctxgit.claude_stream_progress(event({"type": "text", "text": "working"})), "working")
         # internal plumbing and noise stay out of the event log
@@ -525,19 +548,30 @@ class OrchestrationLogTest(unittest.TestCase):
             self.assertEqual([entry["kind"] for entry in log["entries"]], ["delegation", "delegation"])
             self.assertEqual([entry["role"] for entry in log["entries"]], ["researcher", "executor"])
 
-    def test_delegation_parser_ignores_other_events(self) -> None:
-        from orchestration.transcript import delegation_from_event
+    def test_delegation_parser_handles_batches_and_ignores_other_events(self) -> None:
+        from orchestration.transcript import delegations_from_event
 
         self.assertEqual(
-            delegation_from_event("Delegating to subagent: verifier · check the deck"),
-            {"role": "verifier", "description": "check the deck"},
+            delegations_from_event("Delegating to subagent: verifier · check the deck"),
+            [{"role": "verifier", "description": "check the deck"}],
         )
         self.assertEqual(
-            delegation_from_event("Delegating to subagent: planner"),
-            {"role": "planner", "description": ""},
+            delegations_from_event("Delegating to subagent: planner"),
+            [{"role": "planner", "description": ""}],
         )
-        self.assertIsNone(delegation_from_event("Using tool: Write · /x.html"))
-        self.assertIsNone(delegation_from_event("Claude Code is working"))
+        # a parallel batch: every one of them counts
+        self.assertEqual(
+            delegations_from_event(
+                "Delegating to subagent: executor · a ;; executor · b ;; writer · c"
+            ),
+            [
+                {"role": "executor", "description": "a"},
+                {"role": "executor", "description": "b"},
+                {"role": "writer", "description": "c"},
+            ],
+        )
+        self.assertEqual(delegations_from_event("Using tool: Write · /x.html"), [])
+        self.assertEqual(delegations_from_event("Claude Code is working"), [])
 
     def test_long_prompts_are_excerpted_not_dropped(self) -> None:
         from orchestration.transcript import excerpt
