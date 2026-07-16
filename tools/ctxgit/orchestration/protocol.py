@@ -47,6 +47,29 @@ Delegate to amplify quality and parallelism, not for its own sake.
 """
 
 
+#: Appended to every pipeline worker's system prompt.
+#:
+#: The vendored role prompts were written for OMC's runtime, so they tell agents to
+#: save plans under `.omc/plans/`, to interview a user, and to use tools ctxgit does
+#: not grant. Left alone a planner burns its turn trying to persist a plan file
+#: outside the workspace and returns an empty task list, which aborts the run. The
+#: prompts stay pristine; this override reconciles them with ctxgit at call time.
+WORKER_RUNTIME_OVERRIDE = (
+    "You are running inside ctxgit as a team pipeline worker.\n"
+    "- Your role prompt was written for a different runtime. Ignore any instruction in it "
+    "to save plans, PRDs, or reports under `.omc/` paths, to interview a user, or to use "
+    "tools you have not been granted. There is no interactive user here, and ctxgit "
+    "persists every artifact for you.\n"
+    "- Work only inside the current working directory. Never read or write outside it, and "
+    "never push, publish, or deploy.\n"
+    "- When a structured output schema is required, it REPLACES your role prompt's "
+    "Output_Format and Final_Response_Contract sections. The structured output is then your "
+    "ONLY deliverable: put the substance in its fields, never in prose or a fenced code "
+    "block. A field that should hold a list must hold that list — do not describe the list "
+    "in another field instead."
+)
+
+
 def worker_preamble(role: str, brief: str, acceptance: str) -> str:
     """Contract injected into every pipeline-spawned worker.
 

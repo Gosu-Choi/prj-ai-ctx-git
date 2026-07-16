@@ -61,6 +61,8 @@ if str(_MODULE_DIR) not in sys.path:
 
 from orchestration import (  # noqa: E402
     LEAD_ORCHESTRATION_PROTOCOL,
+    WORKER_RUNTIME_OVERRIDE,
+    resolve_agent,
     AgentReply,
     AgentRequest,
     build_subagents_json,
@@ -6746,11 +6748,12 @@ def call_claude_agent(
     cwd: Path,
     progress: ProgressCallback | None = None,
 ) -> AgentReply:
-    """Run one team-pipeline stage as a Claude Code session pinned to that role.
+    """Run one team-pipeline stage as the given role.
 
-    The role's prompt and model tier come from the agent library, so `--agent` is
-    what makes this an `executor` or a `verifier`. Workers are not given Task: per
-    OMC's worker contract they do the assigned job directly.
+    The role's prompt, tool scope, and model tier are injected rather than selected
+    with Claude Code's `--agent` flag: pinning a session agent makes `--json-schema`
+    be silently ignored, and the stages depend on structured output. Workers are not
+    given Task — per OMC's worker contract they do the assigned job directly.
     """
     status = claude_login_status(root)
     if not status["ok"]:
@@ -6759,7 +6762,11 @@ def call_claude_agent(
     timeout_seconds = coerce_positive_int(config.get("timeoutSeconds"), 900)
     web_search = config.get("webSearch") is not False
     writable = bool(request.writable)
-    tools = claude_tools(writable=writable, web_search=web_search)
+
+    agent = resolve_agent(root, request.role, writable=writable, web_search=web_search)
+    if not agent:
+        raise RuntimeError(f"unknown pipeline role: {request.role}")
+    tools = ",".join(agent["tools"])
 
     command = resolve_claude_command(root)
     command.extend([
@@ -6770,20 +6777,17 @@ def call_claude_agent(
         "--permission-mode", "auto" if writable else "bypassPermissions",
         "--tools", tools,
         "--allowedTools", tools,
-        "--agents", build_subagents_json(root, writable=writable, web_search=web_search),
-        "--agent", request.role,
         "--append-system-prompt",
-        (
-            "You are running inside ctxgit as a team pipeline worker. Work only inside the "
-            "current working directory. Do not push, publish, or deploy."
-        ),
+        f"{agent['prompt']}\n\n{WORKER_RUNTIME_OVERRIDE}",
     ])
     if request.schema:
         command.extend([
             "--json-schema",
             json.dumps(request.schema, ensure_ascii=False, separators=(",", ":")),
         ])
-    # No --model: the role's own tier from the agent library decides.
+    model = str(agent.get("model") or config.get("model") or "").strip()
+    if model:
+        command.extend(["--model", model])
 
     if progress:
         completed = run_process_with_progress(
@@ -6805,6 +6809,10 @@ def call_claude_agent(
         )
     payload = claude_final_result_payload(raw) or {}
     structured = payload.get("structured_output")
+    if request.schema and not isinstance(structured, dict):
+        raise RuntimeError(
+            f"role {request.role} returned no structured output for stage {request.label or '?'}"
+        )
     return AgentReply(
         text=str(payload.get("result") or "").strip(),
         data=structured if isinstance(structured, dict) else None,

@@ -148,3 +148,20 @@ def build_subagents_json(
     """Value for `claude --agents`."""
     agents = build_subagents(root, writable=writable, web_search=web_search)
     return json.dumps(agents, ensure_ascii=False, separators=(",", ":"))
+
+
+def resolve_agent(
+    root: Path,
+    role: str,
+    *,
+    writable: bool,
+    web_search: bool = True,
+) -> Optional[dict[str, Any]]:
+    """Look up one role's prompt, tools, and model tier.
+
+    Used to run a role as the session itself. Claude Code's `--agent` flag would be
+    the obvious way to do that, but pinning a session agent makes it silently ignore
+    `--json-schema` — no error, just no structured output — so a stage that needs
+    structured data has to inject the role's prompt instead.
+    """
+    return build_subagents(root, writable=writable, web_search=web_search).get(role)

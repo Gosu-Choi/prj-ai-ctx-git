@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from .agents import (
     build_subagents,
+    resolve_agent,
     build_subagents_json,
     load_project_agents,
     load_vendored_agents,
@@ -41,7 +42,12 @@ from .pipeline import (
     state_to_dict,
     transition_team_phase,
 )
-from .protocol import LEAD_ORCHESTRATION_PROTOCOL, handoff_template, worker_preamble
+from .protocol import (
+    LEAD_ORCHESTRATION_PROTOCOL,
+    WORKER_RUNTIME_OVERRIDE,
+    handoff_template,
+    worker_preamble,
+)
 from .stages import (
     ASSIGNABLE_ROLES,
     DEFAULT_MAX_PARALLEL,
@@ -64,6 +70,7 @@ __all__ = [
     "DEFAULT_MAX_FIX_ATTEMPTS",
     "DEFAULT_MAX_ITERATIONS",
     "LEAD_ORCHESTRATION_PROTOCOL",
+    "WORKER_RUNTIME_OVERRIDE",
     "PHASE_CANCELLED",
     "PHASE_COMPLETE",
     "PHASE_EXEC",
@@ -76,6 +83,7 @@ __all__ = [
     "TeamPipelineState",
     "TransitionResult",
     "build_subagents",
+    "resolve_agent",
     "build_subagents_json",
     "handoff_template",
     "has_required_artifacts_for_phase",

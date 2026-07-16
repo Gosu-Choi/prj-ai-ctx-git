@@ -99,51 +99,80 @@ class ClaudeCommandTest(unittest.TestCase):
                 "orchestrate a team of subagents", cmd[cmd.index("--append-system-prompt") + 1]
             )
 
-    def test_stage_agent_is_pinned_by_role_and_denied_task(self) -> None:
+    def _run_stage_agent(self, root: Path, seen: list, stdout: str, **request_kwargs):
+        original = ctxgit.subprocess.run
+
+        def fake_run(cmd, **_kwargs):
+            if "auth" in cmd and "status" in cmd:
+                return FakeCompleted(stdout="Logged in")
+            seen.append(cmd)
+            return FakeCompleted(stdout=stdout)
+
+        ctxgit.subprocess.run = fake_run
+        try:
+            return ctxgit.call_claude_agent(root, orch.AgentRequest(**request_kwargs), cwd=root)
+        finally:
+            ctxgit.subprocess.run = original
+
+    def test_stage_injects_the_role_prompt_instead_of_pinning_an_agent(self) -> None:
+        # Regression guard: `--agent` makes Claude Code silently ignore --json-schema,
+        # which left the planner returning prose and no tasks. The role has to be
+        # injected as a system prompt instead.
         with tempfile.TemporaryDirectory() as tmp:
             root, _ = self._project(tmp)
             seen: list[list[str]] = []
-            original = ctxgit.subprocess.run
-
-            def fake_run(cmd, **_kwargs):
-                if "auth" in cmd and "status" in cmd:
-                    return FakeCompleted(stdout="Logged in")
-                seen.append(cmd)
-                return FakeCompleted(
-                    stdout=json.dumps(
-                        {
-                            "type": "result",
-                            "result": "raw text",
-                            "structured_output": {"verdict": "PASS"},
-                        }
-                    )
-                )
-
-            ctxgit.subprocess.run = fake_run
-            try:
-                reply = ctxgit.call_claude_agent(
-                    root,
-                    orch.AgentRequest(
-                        role="verifier",
-                        prompt="check it",
-                        writable=True,
-                        schema={"type": "object"},
-                        label="team-verify",
-                    ),
-                    cwd=root,
-                )
-            finally:
-                ctxgit.subprocess.run = original
+            reply = self._run_stage_agent(
+                root,
+                seen,
+                json.dumps(
+                    {"type": "result", "result": "raw text", "structured_output": {"verdict": "PASS"}}
+                ),
+                role="verifier",
+                prompt="check it",
+                writable=True,
+                schema={"type": "object"},
+                label="team-verify",
+            )
 
             cmd = seen[0]
-            self.assertEqual(cmd[cmd.index("--agent") + 1], "verifier")
+            self.assertNotIn("--agent", cmd)
             self.assertIn("--json-schema", cmd)
-            # a worker never re-delegates
+            system_prompt = cmd[cmd.index("--append-system-prompt") + 1]
+            self.assertIn("You are Verifier", system_prompt)
+            self.assertIn("ctxgit", system_prompt)
+            # the role's tier from the agent library picks the model
+            self.assertEqual(cmd[cmd.index("--model") + 1], "sonnet")
+            # verifier declares disallowedTools: Write, Edit — and no worker re-delegates
             self.assertNotIn("Task", cmd[cmd.index("--tools") + 1])
-            # the role's own tier from the agent library decides the model
-            self.assertNotIn("--model", cmd)
+            self.assertNotIn("Write", cmd[cmd.index("--tools") + 1])
             self.assertEqual(reply.data, {"verdict": "PASS"})
             self.assertEqual(reply.text, "raw text")
+
+    def test_missing_structured_output_is_an_error_not_an_empty_result(self) -> None:
+        # The silent version of this cost a whole pipeline run: no structured output
+        # became "0 tasks planned" and an aborted pipeline.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = self._project(tmp)
+            with self.assertRaises(RuntimeError) as caught:
+                self._run_stage_agent(
+                    root,
+                    [],
+                    json.dumps({"type": "result", "subtype": "success", "result": "prose only"}),
+                    role="planner",
+                    prompt="plan it",
+                    writable=False,
+                    schema={"type": "object"},
+                    label="team-plan",
+                )
+            self.assertIn("no structured output", str(caught.exception))
+
+    def test_unknown_role_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = self._project(tmp)
+            with self.assertRaises(RuntimeError):
+                self._run_stage_agent(
+                    root, [], "", role="nope", prompt="p", writable=True, label="x"
+                )
 
     def test_stage_agent_raises_on_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

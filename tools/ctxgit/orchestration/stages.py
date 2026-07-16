@@ -66,6 +66,9 @@ PLAN_SCHEMA: dict[str, Any] = {
         "summary": {"type": "string"},
         "tasks": {
             "type": "array",
+            # A plan with no tasks aborts the run, so make the schema reject it rather
+            # than relying on the planner's goodwill.
+            "minItems": 1,
             "items": {
                 "type": "object",
                 "additionalProperties": False,
@@ -87,7 +90,7 @@ PRD_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
     "required": ["acceptanceCriteria", "outOfScope"],
     "properties": {
-        "acceptanceCriteria": {"type": "array", "items": {"type": "string"}},
+        "acceptanceCriteria": {"type": "array", "minItems": 1, "items": {"type": "string"}},
         "outOfScope": {"type": "array", "items": {"type": "string"}},
     },
 }
@@ -196,7 +199,10 @@ def run_plan_stage(
                     "Decompose this goal into independent tasks that separate workers can do in "
                     "parallel. Assign each task the most suitable role from: "
                     + ", ".join(ASSIGNABLE_ROLES)
-                    + ". Every task needs a concrete acceptance bar. Do not implement anything.",
+                    + ". Every task needs a concrete acceptance bar. Do not implement anything, "
+                    "and do not try to save a plan file — ctxgit writes the plan from your "
+                    "structured output. The `tasks` array IS your deliverable: returning it "
+                    "empty aborts the run.",
                 ]
             ),
         )
