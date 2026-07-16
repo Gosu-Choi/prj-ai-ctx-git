@@ -53,6 +53,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+# ctxgit.py is loaded both as a script and directly by file path (tests), so make
+# sure its own directory is importable before pulling in the local packages.
+_MODULE_DIR = Path(__file__).resolve().parent
+if str(_MODULE_DIR) not in sys.path:
+    sys.path.insert(0, str(_MODULE_DIR))
+
+from orchestration import LEAD_ORCHESTRATION_PROTOCOL, build_subagents_json  # noqa: E402
+
 
 BRAVE_WEB_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
 BRAVE_LLM_CONTEXT_URL = "https://api.search.brave.com/res/v1/llm/context"
@@ -6572,134 +6580,6 @@ def claude_tools(*, writable: bool, web_search: bool, subagents: bool = False) -
     return ",".join(tools)
 
 
-# Role-specialized subagent library offered when the subagent toggle is on. The
-# lead agent orchestrates these via the Task tool (see the orchestration protocol
-# in call_claude_prompt). A project can add or override any of these with markdown
-# files under contexts/agents/. Entries carry a private "_needs_write" flag so
-# write-capable roles are withheld in read-only mode.
-BUILTIN_SUBAGENTS: dict[str, dict[str, Any]] = {
-    "planner": {
-        "description": (
-            "Decomposes a complex or ambiguous task into a concrete delegation plan: the subtasks, "
-            "which specialist handles each, dependencies, and the acceptance bar. Use before large, "
-            "multi-part work."
-        ),
-        "prompt": (
-            "You are a planning subagent. Given a goal, produce a concise, concrete plan: (1) break it "
-            "into independent subtasks, (2) assign each to a specialist role (researcher / implementer / "
-            "reviewer / verifier), (3) note dependencies and a clear acceptance bar (what 'done' means). "
-            "Do not do the work — return the plan only. Be specific and realistic."
-        ),
-        "tools": ["Read", "Grep", "Glob"],
-    },
-    "researcher": {
-        "description": (
-            "Read-only investigation: searches and reads files and web sources, then reports findings "
-            "with evidence. Use for parallel research."
-        ),
-        "prompt": (
-            "You are a read-only research subagent. Investigate the delegated question thoroughly by "
-            "reading and searching (files and, when useful, the web). Report concise findings with "
-            "concrete evidence and source pointers, and state uncertainty explicitly. Do not modify files."
-        ),
-        "tools": ["Read", "Grep", "Glob", "WebSearch", "WebFetch"],
-    },
-    "implementer": {
-        "description": (
-            "Does the actual work: writes/edits files, builds artifacts, runs commands. Use for a "
-            "self-contained build or edit subtask."
-        ),
-        "prompt": (
-            "You are an implementation subagent. Carry out the delegated build/edit subtask precisely "
-            "within the current working directory. Make the change, check that it does what was asked "
-            "(run or inspect the result), and report exactly what you changed and how you verified it. "
-            "Stay strictly within the assigned scope."
-        ),
-        "tools": ["Read", "Grep", "Glob", "Edit", "Write", "Bash"],
-        "_needs_write": True,
-    },
-    "reviewer": {
-        "description": (
-            "Adversarial quality gate: reviews an output for correctness, completeness, and defects, and "
-            "returns a pass/fail verdict with required changes. Use before finalizing substantial work."
-        ),
-        "prompt": (
-            "You are a critical reviewer subagent — a quality gate. Adversarially inspect the specified "
-            "output against the goal and acceptance criteria: look for correctness errors, missing pieces, "
-            "and quality problems. Return a clear verdict — PASS, or FAIL with a numbered list of concrete "
-            "required changes. Be specific and skeptical; never rubber-stamp. Read-only: do not fix it yourself."
-        ),
-        "tools": ["Read", "Grep", "Glob"],
-    },
-    "verifier": {
-        "description": (
-            "Verifies that an artifact actually works by exercising it (render / run / recompute), reporting "
-            "observed behavior versus expected. Use for anything that can be run, rendered, or checked."
-        ),
-        "prompt": (
-            "You are a verification subagent. Actually exercise the artifact — render the page, run the "
-            "code or command, recompute the numbers — and report what you OBSERVED versus what was expected, "
-            "citing concrete evidence (output, dimensions, values). Do not edit files; report defects for the "
-            "implementer to fix."
-        ),
-        "tools": ["Read", "Grep", "Glob", "Bash"],
-        "_needs_write": True,
-    },
-}
-
-
-def claude_subagents_json(root: Path, *, writable: bool) -> str:
-    agents: dict[str, dict[str, Any]] = {}
-    for name, entry in BUILTIN_SUBAGENTS.items():
-        if entry.get("_needs_write") and not writable:
-            # Withhold write/run-capable roles when the session is read-only.
-            continue
-        agents[name] = {key: value for key, value in entry.items() if not key.startswith("_")}
-    agents.update(load_project_subagents(root))  # project files override built-ins by name
-    return json.dumps(agents, ensure_ascii=False, separators=(",", ":"))
-
-
-def parse_agent_markdown(text: str) -> tuple[dict[str, str], str]:
-    """Parse an agent .md file with optional `---` YAML-ish frontmatter."""
-    if text.startswith("---"):
-        parts = text.split("---", 2)
-        if len(parts) >= 3:
-            meta: dict[str, str] = {}
-            for line in parts[1].splitlines():
-                if ":" in line:
-                    key, value = line.split(":", 1)
-                    meta[key.strip()] = value.strip()
-            return meta, parts[2].strip()
-    return {}, text.strip()
-
-
-def load_project_subagents(root: Path) -> dict[str, dict[str, Any]]:
-    agents_dir = root / "contexts" / "agents"
-    if not agents_dir.is_dir():
-        return {}
-    result: dict[str, dict[str, Any]] = {}
-    for path in sorted(agents_dir.glob("*.md")):
-        try:
-            meta, body = parse_agent_markdown(path.read_text(encoding="utf-8"))
-        except OSError:
-            continue
-        name = str(meta.get("name") or path.stem).strip()
-        if not name or not body:
-            continue
-        entry: dict[str, Any] = {
-            "description": str(meta.get("description") or f"Project subagent {name}."),
-            "prompt": body,
-        }
-        tools_raw = str(meta.get("tools") or "").strip()
-        if tools_raw:
-            entry["tools"] = [item.strip() for item in re.split(r"[,\s]+", tools_raw) if item.strip()]
-        model_raw = str(meta.get("model") or "").strip()
-        if model_raw:
-            entry["model"] = model_raw
-        result[name] = entry
-    return result
-
-
 def call_claude_prompt(
     root: Path,
     prompt: str,
@@ -6729,26 +6609,7 @@ def call_claude_prompt(
         "read-only or writable mode. Return the required structured output."
     )
     if subagents_enabled:
-        system_prompt += (
-            "\n\nYou can orchestrate a team of subagents via the Task tool to produce higher-quality"
-            " results. Orchestrate ADAPTIVELY — match effort to the task; never over-engineer a trivial"
-            " request. Available specialists: planner (decomposes complex work), researcher (read-only"
-            " investigation), implementer (writes/edits/builds), reviewer (adversarial quality gate),"
-            " verifier (exercises artifacts to confirm they work)."
-            "\nProtocol:"
-            "\n1. Assess the task's complexity and whether it splits into independent parts. Trivial or"
-            " purely conversational tasks: just answer directly, no delegation."
-            "\n2. Plan: for genuinely complex or ambiguous work, delegate to `planner` first to get a"
-            " decomposition and acceptance bar."
-            "\n3. Delegate in parallel: dispatch independent subtasks to the right specialist"
-            " (`researcher` for investigation, `implementer` for edits/building). Run at most 3-4"
-            " concurrently; give each a precise, self-contained brief with its acceptance bar."
-            "\n4. Quality gate: before finalizing any substantial output, delegate a review to `reviewer`"
-            " (and `verifier` for artifacts that can be rendered/run/recomputed). If they return required"
-            " changes, fix and re-check. Do NOT finalize until the review passes."
-            "\n5. Synthesize the results into your own answer — you own the final result."
-            "\nDelegate to amplify quality and parallelism, not for its own sake."
-        )
+        system_prompt += LEAD_ORCHESTRATION_PROTOCOL
 
     def build_cmd(*, strict_schema: bool) -> list[str]:
         command = resolve_claude_command(root)
@@ -6773,7 +6634,14 @@ def call_claude_prompt(
             system_prompt,
         ])
         if subagents_enabled:
-            command.extend(["--agents", claude_subagents_json(root, writable=writable)])
+            command.extend([
+                "--agents",
+                build_subagents_json(
+                    root,
+                    writable=writable,
+                    web_search=config.get("webSearch") is not False,
+                ),
+            ])
         model = str(config.get("model") or "opus").strip()
         if model:
             command.extend(["--model", model])
