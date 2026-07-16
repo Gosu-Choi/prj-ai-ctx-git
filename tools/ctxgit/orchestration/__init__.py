@@ -42,9 +42,25 @@ from .pipeline import (
     transition_team_phase,
 )
 from .protocol import LEAD_ORCHESTRATION_PROTOCOL, handoff_template, worker_preamble
+from .stages import (
+    ASSIGNABLE_ROLES,
+    DEFAULT_MAX_PARALLEL,
+    STAGE_ROUTING,
+    AgentReply,
+    AgentRequest,
+    PipelineResult,
+    run_team_pipeline,
+)
 
 __all__ = [
     "ALLOWED",
+    "ASSIGNABLE_ROLES",
+    "DEFAULT_MAX_PARALLEL",
+    "STAGE_ROUTING",
+    "AgentReply",
+    "AgentRequest",
+    "PipelineResult",
+    "run_team_pipeline",
     "DEFAULT_MAX_FIX_ATTEMPTS",
     "DEFAULT_MAX_ITERATIONS",
     "LEAD_ORCHESTRATION_PROTOCOL",

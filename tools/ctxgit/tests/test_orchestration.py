@@ -192,5 +192,150 @@ class SubagentLibraryTest(unittest.TestCase):
         self.assertIn("|---|---|", body)
 
 
+def _plan_reply(tasks: list[dict]) -> orch.AgentReply:
+    return orch.AgentReply(data={"summary": "plan", "tasks": tasks})
+
+
+class TeamPipelineRunnerTest(unittest.TestCase):
+    """The runner drives stages; the state machine decides when the run stops."""
+
+    def _fake_call(self, verdicts: list[dict], calls: list[tuple[str, str]], tasks: list[dict]):
+        verdict_iter = iter(verdicts)
+
+        def call_agent(request: orch.AgentRequest) -> orch.AgentReply:
+            calls.append((request.role, request.label))
+            if request.label == "team-plan":
+                return _plan_reply(tasks)
+            if request.label == "team-prd":
+                return orch.AgentReply(data={"acceptanceCriteria": ["works"], "outOfScope": []})
+            if request.label == "team-verify":
+                return orch.AgentReply(data=next(verdict_iter))
+            return orch.AgentReply(text=f"{request.role} done")
+
+        return call_agent
+
+    def test_pipeline_completes_after_fix_rounds(self) -> None:
+        tasks = [
+            {"id": "t1", "title": "page", "brief": "b", "acceptance": "a", "role": "executor"},
+            {"id": "t2", "title": "style", "brief": "b", "acceptance": "a", "role": "designer"},
+        ]
+        calls: list[tuple[str, str]] = []
+        verdicts = [
+            {"verdict": "FAIL", "evidence": "e", "requiredChanges": ["fix one"]},
+            {"verdict": "PASS", "evidence": "fresh output", "requiredChanges": []},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "ws"
+            result = orch.run_team_pipeline(
+                task="build it",
+                workspace=workspace,
+                session_id="s1",
+                call_agent=self._fake_call(verdicts, calls, tasks),
+                max_parallel=2,
+            )
+            self.assertEqual(result.state.phase, orch.PHASE_COMPLETE)
+            self.assertFalse(result.state.active)
+            self.assertEqual(result.state.fix_loop.attempt, 1)
+            self.assertEqual(result.verify["verdict"], "PASS")
+            phases = [entry.phase for entry in result.state.phase_history]
+            self.assertEqual(
+                phases,
+                [
+                    orch.PHASE_PLAN,
+                    orch.PHASE_PRD,
+                    orch.PHASE_EXEC,
+                    orch.PHASE_VERIFY,
+                    orch.PHASE_FIX,
+                    orch.PHASE_EXEC,
+                    orch.PHASE_VERIFY,
+                    orch.PHASE_COMPLETE,
+                ],
+            )
+            # artifacts and handoffs are on disk for the next stage / a resume
+            self.assertTrue(Path(result.state.artifacts.plan_path).exists())
+            self.assertTrue(Path(result.state.artifacts.prd_path).exists())
+            self.assertTrue(Path(result.state.artifacts.verify_report_path).exists())
+            self.assertTrue((workspace / ".team" / "handoffs" / "team-plan.md").exists())
+
+    def test_planner_task_roles_are_routed_to_workers(self) -> None:
+        tasks = [
+            {"id": "t1", "title": "code", "brief": "b", "acceptance": "a", "role": "executor"},
+            {"id": "t2", "title": "ui", "brief": "b", "acceptance": "a", "role": "designer"},
+            {"id": "t3", "title": "tests", "brief": "b", "acceptance": "a", "role": "test-engineer"},
+        ]
+        calls: list[tuple[str, str]] = []
+        verdicts = [{"verdict": "PASS", "evidence": "ok", "requiredChanges": []}]
+        with tempfile.TemporaryDirectory() as tmp:
+            orch.run_team_pipeline(
+                task="build it",
+                workspace=Path(tmp) / "ws",
+                session_id="s2",
+                call_agent=self._fake_call(verdicts, calls, tasks),
+            )
+        roles = {role for role, _ in calls}
+        self.assertEqual({"planner", "analyst", "executor", "designer", "test-engineer", "verifier"}, roles)
+
+    def test_unending_failures_stop_at_the_fix_loop_bound(self) -> None:
+        tasks = [{"id": "t1", "title": "x", "brief": "b", "acceptance": "a", "role": "executor"}]
+        calls: list[tuple[str, str]] = []
+        verdicts = [{"verdict": "FAIL", "evidence": "e", "requiredChanges": ["again"]}] * 10
+        with tempfile.TemporaryDirectory() as tmp:
+            result = orch.run_team_pipeline(
+                task="never passes",
+                workspace=Path(tmp) / "ws",
+                session_id="s3",
+                call_agent=self._fake_call(verdicts, calls, tasks),
+            )
+        self.assertEqual(result.state.phase, orch.PHASE_FAILED)
+        self.assertFalse(result.state.active)
+        self.assertEqual(result.state.fix_loop.attempt, 4)  # 3 allowed, 4th trips the bound
+        self.assertIn("Fix loop exceeded", result.stop_reason)
+
+    def test_empty_plan_aborts_without_running_workers(self) -> None:
+        # `failed` is reserved for "verification could not be satisfied" by the ported
+        # transition table, so an abort before verify is a hard, non-resumable stop.
+        calls: list[tuple[str, str]] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            result = orch.run_team_pipeline(
+                task="nothing to do",
+                workspace=Path(tmp) / "ws",
+                session_id="s4",
+                call_agent=self._fake_call([], calls, []),
+            )
+        self.assertEqual(result.state.phase, orch.PHASE_CANCELLED)
+        self.assertFalse(result.state.active)
+        self.assertFalse(result.state.cancel.preserve_for_resume)
+        self.assertEqual(result.stop_reason, "planner returned no tasks")
+        self.assertEqual([role for role, _ in calls], ["planner"])
+
+    def test_a_dead_worker_is_counted_failed_not_fatal(self) -> None:
+        tasks = [
+            {"id": "t1", "title": "ok", "brief": "b", "acceptance": "a", "role": "executor"},
+            {"id": "t2", "title": "boom", "brief": "b", "acceptance": "a", "role": "executor"},
+        ]
+
+        def call_agent(request: orch.AgentRequest) -> orch.AgentReply:
+            if request.label == "team-plan":
+                return _plan_reply(tasks)
+            if request.label == "team-prd":
+                return orch.AgentReply(data={"acceptanceCriteria": ["a"], "outOfScope": []})
+            if request.label == "team-verify":
+                return orch.AgentReply(data={"verdict": "PASS", "evidence": "ok", "requiredChanges": []})
+            if request.label == "team-exec:t2":
+                raise RuntimeError("worker crashed")
+            return orch.AgentReply(text="done")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = orch.run_team_pipeline(
+                task="build it",
+                workspace=Path(tmp) / "ws",
+                session_id="s5",
+                call_agent=call_agent,
+            )
+        self.assertEqual(result.state.phase, orch.PHASE_COMPLETE)
+        self.assertEqual(result.state.execution.tasks_failed, 1)
+        self.assertEqual(result.state.execution.tasks_completed, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
