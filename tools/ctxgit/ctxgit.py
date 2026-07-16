@@ -158,8 +158,8 @@ _PROJECT_ENV_LOCK = threading.RLock()
 _PROJECT_ENV_ORIGINAL: dict[str, str | None] = {}
 _INTERNAL_GIT_LOCKS: dict[str, threading.RLock] = {}
 _INTERNAL_GIT_LOCKS_GUARD = threading.RLock()
-_HISTORY_APPEND_LOCKS: dict[str, threading.RLock] = {}
-_HISTORY_APPEND_LOCKS_GUARD = threading.RLock()
+_FILE_WRITE_LOCKS: dict[str, threading.RLock] = {}
+_FILE_WRITE_LOCKS_GUARD = threading.RLock()
 
 
 class ChatTimeoutError(RuntimeError):
@@ -237,7 +237,33 @@ def load_json(path: Path) -> dict[str, Any]:
 
 
 def dump_json(path: Path, data: dict[str, Any]) -> None:
-    write_text(path, json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True) + "\n")
+    """Write JSON by atomic replace.
+
+    Metadata files are read by other threads (a sequence-room turn and a live
+    interjection both touch the same branch), and a plain truncate-then-write lets a
+    reader see an empty file. Replace is atomic, so a reader gets either the old
+    file or the new one.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
+    handle = tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        dir=str(path.parent),
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    )
+    try:
+        with handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(handle.name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(handle.name)
+        raise
 
 
 def parse_env_assignment(line: str) -> tuple[str, str] | None:
@@ -393,13 +419,14 @@ def internal_git_lock(root: Path) -> threading.RLock:
         return lock
 
 
-def history_append_lock(path: Path) -> threading.RLock:
+def file_write_lock(path: Path) -> threading.RLock:
+    """Serialize writers to one file across threads (history appends, metadata updates)."""
     key = str(path.resolve())
-    with _HISTORY_APPEND_LOCKS_GUARD:
-        lock = _HISTORY_APPEND_LOCKS.get(key)
+    with _FILE_WRITE_LOCKS_GUARD:
+        lock = _FILE_WRITE_LOCKS.get(key)
         if lock is None:
             lock = threading.RLock()
-            _HISTORY_APPEND_LOCKS[key] = lock
+            _FILE_WRITE_LOCKS[key] = lock
         return lock
 
 
@@ -2034,7 +2061,7 @@ class ContextStore:
             record.update(extra)
         if not str(record.get("id") or "").strip():
             record["id"] = new_history_record_id()
-        with history_append_lock(paths.history):
+        with file_write_lock(paths.history):
             with paths.history.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
         self.touch_branch(branch_id)
@@ -2756,9 +2783,12 @@ class ContextStore:
 
     def touch_branch(self, branch_id: str) -> None:
         paths = self.branch_paths(branch_id)
-        meta = load_json(paths.meta)
-        meta["updatedAt"] = utc_now()
-        dump_json(paths.meta, meta)
+        # Read-modify-write: hold the file's lock so a concurrent writer on the same
+        # branch cannot lose this update.
+        with file_write_lock(paths.meta):
+            meta = load_json(paths.meta)
+            meta["updatedAt"] = utc_now()
+            dump_json(paths.meta, meta)
         self.write_index()
 
     def write_index(self) -> None:

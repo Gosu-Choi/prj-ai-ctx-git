@@ -1,0 +1,493 @@
+"""Tests for the Claude integration layer in ctxgit.py.
+
+Covers the seams between ctxgit and the orchestration package: how the claude
+command is built, how streamed output is parsed, the team-pipeline turn, sequence
+interjection, and revealing a branch directory. The model is always faked — these
+assert our own wiring, not Claude's behavior.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from pathlib import Path
+
+MODULE_PATH = Path(__file__).resolve().parents[1] / "ctxgit.py"
+SPEC = importlib.util.spec_from_file_location("ctxgit", MODULE_PATH)
+assert SPEC and SPEC.loader
+ctxgit = importlib.util.module_from_spec(SPEC)
+sys.modules["ctxgit"] = ctxgit
+SPEC.loader.exec_module(ctxgit)
+
+import orchestration as orch  # noqa: E402  (ctxgit.py puts tools/ctxgit on sys.path)
+
+
+class FakeCompleted:
+    def __init__(self, stdout: str = "", stderr: str = "", returncode: int = 0) -> None:
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode
+
+
+def structured_result(payload: dict) -> str:
+    return json.dumps({"type": "result", "subtype": "success", "structured_output": payload})
+
+
+class ClaudeCommandTest(unittest.TestCase):
+    """What we actually hand to the claude CLI."""
+
+    def _capture_chat_command(self, root: Path, store, branch: str) -> list[str]:
+        seen: list[list[str]] = []
+        original = ctxgit.subprocess.run
+
+        def fake_run(cmd, **_kwargs):
+            if "auth" in cmd and "status" in cmd:
+                return FakeCompleted(stdout="Logged in")
+            seen.append(cmd)
+            return FakeCompleted(
+                stdout=structured_result(
+                    {"assistant": "ok", "artifacts": [], "approvalRequests": []}
+                )
+            )
+
+        ctxgit.subprocess.run = fake_run
+        try:
+            ctxgit.call_claude_chat(root, store, branch, "do the thing")
+        finally:
+            ctxgit.subprocess.run = original
+        return seen[0]
+
+    def _project(self, tmp: str, **provider):
+        root = Path(tmp)
+        store = ctxgit.ContextStore(root)
+        store.init(create_initial_branch=False)
+        store.create_branch("b1")
+        ctxgit.write_provider_config(root, {"provider": "claude", **provider})
+        return root, store
+
+    def test_chat_streams_and_forces_strict_schema_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            cmd = self._capture_chat_command(root, store, "b1")
+            self.assertIn("--output-format", cmd)
+            self.assertEqual(cmd[cmd.index("--output-format") + 1], "stream-json")
+            self.assertIn("--verbose", cmd)
+            self.assertIn("--json-schema", cmd)
+
+    def test_subagents_toggle_gates_task_agents_and_protocol(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp, subagents=True)
+            cmd = self._capture_chat_command(root, store, "b1")
+            self.assertIn("Task", cmd[cmd.index("--tools") + 1])
+            self.assertIn("--agents", cmd)
+            agents = json.loads(cmd[cmd.index("--agents") + 1])
+            self.assertEqual(len(agents), 19)
+            self.assertIn("planner", agents)
+            self.assertIn("orchestrate a team of subagents", cmd[cmd.index("--append-system-prompt") + 1])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp, subagents=False)
+            cmd = self._capture_chat_command(root, store, "b1")
+            self.assertNotIn("Task", cmd[cmd.index("--tools") + 1])
+            self.assertNotIn("--agents", cmd)
+            self.assertNotIn(
+                "orchestrate a team of subagents", cmd[cmd.index("--append-system-prompt") + 1]
+            )
+
+    def test_stage_agent_is_pinned_by_role_and_denied_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = self._project(tmp)
+            seen: list[list[str]] = []
+            original = ctxgit.subprocess.run
+
+            def fake_run(cmd, **_kwargs):
+                if "auth" in cmd and "status" in cmd:
+                    return FakeCompleted(stdout="Logged in")
+                seen.append(cmd)
+                return FakeCompleted(
+                    stdout=json.dumps(
+                        {
+                            "type": "result",
+                            "result": "raw text",
+                            "structured_output": {"verdict": "PASS"},
+                        }
+                    )
+                )
+
+            ctxgit.subprocess.run = fake_run
+            try:
+                reply = ctxgit.call_claude_agent(
+                    root,
+                    orch.AgentRequest(
+                        role="verifier",
+                        prompt="check it",
+                        writable=True,
+                        schema={"type": "object"},
+                        label="team-verify",
+                    ),
+                    cwd=root,
+                )
+            finally:
+                ctxgit.subprocess.run = original
+
+            cmd = seen[0]
+            self.assertEqual(cmd[cmd.index("--agent") + 1], "verifier")
+            self.assertIn("--json-schema", cmd)
+            # a worker never re-delegates
+            self.assertNotIn("Task", cmd[cmd.index("--tools") + 1])
+            # the role's own tier from the agent library decides the model
+            self.assertNotIn("--model", cmd)
+            self.assertEqual(reply.data, {"verdict": "PASS"})
+            self.assertEqual(reply.text, "raw text")
+
+    def test_stage_agent_raises_on_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = self._project(tmp)
+            original = ctxgit.subprocess.run
+
+            def fake_run(cmd, **_kwargs):
+                if "auth" in cmd and "status" in cmd:
+                    return FakeCompleted(stdout="Logged in")
+                return FakeCompleted(stderr="boom", returncode=1)
+
+            ctxgit.subprocess.run = fake_run
+            try:
+                with self.assertRaises(RuntimeError):
+                    ctxgit.call_claude_agent(
+                        root,
+                        orch.AgentRequest(role="executor", prompt="p", writable=True),
+                        cwd=root,
+                    )
+            finally:
+                ctxgit.subprocess.run = original
+
+
+class ClaudeStreamParsingTest(unittest.TestCase):
+    """stream-json is JSONL; the final `result` event carries the payload."""
+
+    def test_final_result_is_taken_from_a_jsonl_stream(self) -> None:
+        raw = "\n".join(
+            [
+                json.dumps({"type": "system", "subtype": "init"}),
+                json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}]}}),
+                json.dumps({"type": "result", "structured_output": {"assistant": "final"}}),
+            ]
+        )
+        payload = ctxgit.claude_final_result_payload(raw)
+        self.assertEqual(payload["structured_output"], {"assistant": "final"})
+
+    def test_single_object_output_still_parses(self) -> None:
+        raw = json.dumps({"type": "result", "structured_output": {"assistant": "final"}})
+        self.assertEqual(ctxgit.claude_final_result_payload(raw)["structured_output"], {"assistant": "final"})
+
+    def test_parse_claude_result_extracts_sequence_evaluation_from_stream(self) -> None:
+        raw = "\n".join(
+            [
+                json.dumps({"type": "assistant", "message": {"content": []}}),
+                json.dumps(
+                    {
+                        "type": "result",
+                        "structured_output": {
+                            "assistant": "body",
+                            "artifacts": [],
+                            "approvalRequests": [],
+                            "sequenceEvaluation": {"decision": "continue"},
+                        },
+                    }
+                ),
+            ]
+        )
+        parsed = ctxgit.parse_claude_result(raw)
+        self.assertEqual(parsed["assistant"], "body")
+        self.assertEqual(parsed["sequenceEvaluation"], {"decision": "continue"})
+
+    def test_non_json_output_falls_back_to_raw_text(self) -> None:
+        parsed = ctxgit.parse_claude_result("just prose, not json")
+        self.assertEqual(parsed["assistant"], "just prose, not json")
+        self.assertEqual(parsed["artifacts"], [])
+
+    def test_stream_progress_labels_tools_and_delegation(self) -> None:
+        def event(part: dict) -> str:
+            return json.dumps({"type": "assistant", "message": {"content": [part]}})
+
+        self.assertEqual(
+            ctxgit.claude_stream_progress(
+                event({"type": "tool_use", "name": "Write", "input": {"file_path": "/x/deck.html"}})
+            ),
+            "Using tool: Write · /x/deck.html",
+        )
+        self.assertEqual(
+            ctxgit.claude_stream_progress(
+                event(
+                    {
+                        "type": "tool_use",
+                        "name": "Agent",
+                        "input": {"subagent_type": "researcher", "description": "market size"},
+                    }
+                )
+            ),
+            "Delegating to subagent: researcher · market size",
+        )
+        self.assertEqual(ctxgit.claude_stream_progress(event({"type": "text", "text": "working"})), "working")
+        # internal plumbing and noise stay out of the event log
+        self.assertEqual(
+            ctxgit.claude_stream_progress(event({"type": "tool_use", "name": "StructuredOutput", "input": {}})),
+            "",
+        )
+        self.assertEqual(ctxgit.claude_stream_progress(json.dumps({"type": "system", "subtype": "init"})), "")
+        self.assertEqual(ctxgit.claude_stream_progress("not json"), "")
+
+
+class TeamPipelineTurnTest(unittest.TestCase):
+    def _project(self, tmp: str, provider: str = "claude"):
+        root = Path(tmp)
+        store = ctxgit.ContextStore(root)
+        store.init(create_initial_branch=False)
+        store.create_branch("b1")
+        ctxgit.write_provider_config(root, {"provider": provider})
+        return root, store
+
+    def test_turn_refuses_non_claude_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp, provider="codex")
+            with self.assertRaises(ValueError):
+                ctxgit.run_team_pipeline_turn(root, store, "b1", "build it")
+
+    def test_turn_records_history_artifacts_and_pipeline_metadata(self) -> None:
+        original = ctxgit.call_claude_agent
+        verdicts = iter([{"verdict": "PASS", "evidence": "fresh output", "requiredChanges": []}])
+
+        def fake_agent(root, request, *, cwd, progress=None):
+            if request.label == "team-plan":
+                return orch.AgentReply(
+                    data={
+                        "summary": "Two tasks",
+                        "tasks": [
+                            {"id": "t1", "title": "a", "brief": "b", "acceptance": "c", "role": "executor"},
+                            {"id": "t2", "title": "d", "brief": "e", "acceptance": "f", "role": "writer"},
+                        ],
+                    }
+                )
+            if request.label == "team-prd":
+                return orch.AgentReply(data={"acceptanceCriteria": ["works"], "outOfScope": []})
+            if request.label == "team-verify":
+                return orch.AgentReply(data=next(verdicts))
+            return orch.AgentReply(text=f"{request.role} ok")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            ctxgit.call_claude_agent = fake_agent
+            try:
+                events: list[str] = []
+                ctxgit.run_team_pipeline_turn(
+                    root, store, "b1", "Build the thing", progress=events.append
+                )
+            finally:
+                ctxgit.call_claude_agent = original
+
+            history = list(store.iter_history("b1"))
+            user = [item for item in history if item["role"] == "user"][-1]
+            assistant = [item for item in history if item["role"] == "assistant"][-1]
+
+            self.assertEqual(user["mode"], "team-pipeline")
+            self.assertEqual(user["turnId"], assistant["turnId"])
+
+            meta = assistant["teamPipeline"]
+            self.assertEqual(meta["phase"], orch.PHASE_COMPLETE)
+            self.assertEqual(meta["verdict"], "PASS")
+            self.assertEqual(meta["tasksCompleted"], 2)
+            self.assertEqual(meta["fixAttempts"], 0)
+            self.assertEqual(
+                meta["phaseHistory"],
+                ["team-plan", "team-prd", "team-exec", "team-verify", "complete"],
+            )
+            self.assertEqual(
+                sorted(item["kind"] for item in assistant["artifacts"]),
+                ["team-plan", "team-prd", "team-verify"],
+            )
+            for item in assistant["artifacts"]:
+                self.assertFalse(Path(item["path"]).is_absolute())
+                self.assertTrue((root / item["path"]).exists())
+            self.assertTrue(any("team-plan" in message for message in events))
+
+    def test_turn_reports_a_failed_pipeline_instead_of_raising(self) -> None:
+        original = ctxgit.call_claude_agent
+
+        def fake_agent(root, request, *, cwd, progress=None):
+            if request.label == "team-plan":
+                return orch.AgentReply(
+                    data={
+                        "summary": "one task",
+                        "tasks": [
+                            {"id": "t1", "title": "a", "brief": "b", "acceptance": "c", "role": "executor"}
+                        ],
+                    }
+                )
+            if request.label == "team-prd":
+                return orch.AgentReply(data={"acceptanceCriteria": ["works"], "outOfScope": []})
+            if request.label == "team-verify":
+                return orch.AgentReply(
+                    data={"verdict": "FAIL", "evidence": "no", "requiredChanges": ["again"]}
+                )
+            return orch.AgentReply(text="ok")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            ctxgit.call_claude_agent = fake_agent
+            try:
+                ctxgit.run_team_pipeline_turn(root, store, "b1", "never passes")
+            finally:
+                ctxgit.call_claude_agent = original
+
+            assistant = [item for item in store.iter_history("b1") if item["role"] == "assistant"][-1]
+            self.assertEqual(assistant["teamPipeline"]["phase"], orch.PHASE_FAILED)
+            self.assertEqual(assistant["teamPipeline"]["fixAttempts"], 4)
+            self.assertIn("Outstanding", assistant["text"])
+
+
+class SequenceInterjectionTest(unittest.TestCase):
+    def _room(self, tmp: str):
+        root = Path(tmp)
+        store = ctxgit.ContextStore(root)
+        store.init(create_initial_branch=False)
+        store.create_branch("alpha")
+        store.create_branch("beta")
+        store.create_sequence_room(
+            ["alpha", "beta"],
+            "room",
+            "Room",
+            system_prompts=["", ""],
+            access_modes=["info-chat", "info-chat"],
+            max_agent_replies=4,
+        )
+        return root, store
+
+    def test_interjection_requires_a_sequence_room_and_a_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, store = self._room(tmp)
+            with self.assertRaises(ValueError):
+                store.append_sequence_interjection("alpha", "hi")
+            with self.assertRaises(ValueError):
+                store.append_sequence_interjection("room", "   ")
+
+    def test_interjection_lands_before_the_in_flight_reply(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, store = self._room(tmp)
+            store.append_history("room", "user", "kickoff", extra={"mode": "sequence-room"})
+
+            # the agent is "generating": its reply is only appended once it finishes
+            def agent_reply() -> None:
+                time.sleep(0.05)
+                store.append_history("room", "assistant", "agent reply", extra={"mode": "sequence-room"})
+
+            worker = threading.Thread(target=agent_reply)
+            worker.start()
+            record = store.append_sequence_interjection("room", "wait, focus on X", run_mode="send")
+            worker.join()
+
+            texts = [item["text"] for item in store.iter_history("room")]
+            self.assertLess(texts.index("wait, focus on X"), texts.index("agent reply"))
+            self.assertTrue(record["interjection"])
+            self.assertEqual(record["mode"], "sequence-room")
+            self.assertEqual(record["sequenceRunMode"], "send")
+
+    def test_concurrent_appends_do_not_corrupt_history_or_metadata(self) -> None:
+        # An interjection lands while a sequence-room turn is appending an agent
+        # reply, so the same branch gets concurrent writers. Both history.jsonl and
+        # branch.json must survive it.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._room(tmp)
+            errors: list[BaseException] = []
+
+            def append(index: int) -> None:
+                try:
+                    store.append_history("room", "user", f"msg-{index}", extra={"mode": "sequence-room"})
+                except BaseException as exc:  # noqa: BLE001 - a torn metadata read exits the thread
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=append, args=(i,)) for i in range(20)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+            self.assertEqual(errors, [])
+            records = list(store.iter_history("room"))
+            self.assertEqual(len(records), 20)
+            self.assertEqual({item["text"] for item in records}, {f"msg-{i}" for i in range(20)})
+            # branch.json must still be readable, not a half-written file
+            meta = json.loads((root / "contexts" / "branches" / "room" / "branch.json").read_text())
+            self.assertEqual(meta["id"], "room")
+            self.assertTrue(meta["updatedAt"])
+
+    def test_metadata_writes_are_atomic_under_concurrent_readers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._room(tmp)
+            meta_path = root / "contexts" / "branches" / "room" / "branch.json"
+            stop = threading.Event()
+            read_errors: list[BaseException] = []
+
+            def reader() -> None:
+                while not stop.is_set():
+                    try:
+                        json.loads(meta_path.read_text(encoding="utf-8"))
+                    except json.JSONDecodeError as exc:  # a torn read
+                        read_errors.append(exc)
+                    except OSError:
+                        pass
+
+            watcher = threading.Thread(target=reader)
+            watcher.start()
+            try:
+                for _ in range(50):
+                    store.touch_branch("room")
+            finally:
+                stop.set()
+                watcher.join()
+
+            self.assertEqual(read_errors, [])
+
+
+class RevealBranchDirTest(unittest.TestCase):
+    def test_open_path_uses_the_platform_file_browser(self) -> None:
+        calls: list[list[str]] = []
+
+        class FakePopen:
+            def __init__(self, args, *a, **k) -> None:
+                calls.append(args)
+
+        original_popen = ctxgit.subprocess.Popen
+        original_platform = ctxgit.sys.platform
+        ctxgit.subprocess.Popen = FakePopen
+        try:
+            ctxgit.open_path_in_file_browser(Path("/tmp/somewhere"))
+        finally:
+            ctxgit.subprocess.Popen = original_popen
+            ctxgit.sys.platform = original_platform
+
+        self.assertEqual(len(calls), 1)
+        self.assertIn("/tmp/somewhere", calls[0])
+        self.assertIn(calls[0][0], {"open", "explorer", "xdg-open"})
+
+    def test_branch_dir_resolves_within_the_project_and_rejects_traversal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.init(create_initial_branch=False)
+            store.create_branch("b1")
+
+            directory = store.branch_paths_for_read("b1").root
+            self.assertTrue(directory.is_dir())
+            self.assertTrue(ctxgit.path_is_within(root, directory))
+
+            with self.assertRaises(SystemExit):
+                store.branch_paths_for_read("../../etc")
+
+
+if __name__ == "__main__":
+    unittest.main()
