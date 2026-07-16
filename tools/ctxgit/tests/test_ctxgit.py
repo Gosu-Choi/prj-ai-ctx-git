@@ -3101,7 +3101,7 @@ class CtxgitTest(unittest.TestCase):
             self.assertNotIn("--json-schema", seen[1][0])
             self.assertIn("Retry without the CLI JSON schema validator", seen[1][1]["input"])
 
-    def test_claude_chat_does_not_use_strict_schema_by_default(self) -> None:
+    def test_claude_chat_uses_strict_schema_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             store = ctxgit.ContextStore(root)
@@ -3139,7 +3139,10 @@ class CtxgitTest(unittest.TestCase):
             self.assertEqual(result["assistant"], "ok")
             self.assertEqual(len(seen), 1)
             self.assertIn("--output-format", seen[0])
-            self.assertNotIn("--json-schema", seen[0])
+            # Streaming output so the UI can surface live intermediate events.
+            self.assertIn("stream-json", seen[0])
+            # Strict structured output is forced on by default.
+            self.assertIn("--json-schema", seen[0])
 
     def test_provider_models_are_normalized_and_validated(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

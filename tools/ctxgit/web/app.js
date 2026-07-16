@@ -110,12 +110,14 @@ const els = {
   providerInput: document.querySelector("#providerInput"),
   providerModelInput: document.querySelector("#providerModelInput"),
   webSearchInput: document.querySelector("#webSearchInput"),
+  subagentsInput: document.querySelector("#subagentsInput"),
   timeoutSecondsInput: document.querySelector("#timeoutSecondsInput"),
   sandboxInput: document.querySelector("#sandboxInput"),
   saveProviderButton: document.querySelector("#saveProviderButton"),
   providerSettingsStatus: document.querySelector("#providerSettingsStatus"),
   activeTitle: document.querySelector("#activeTitle"),
   activeMeta: document.querySelector("#activeMeta"),
+  openBranchDirButton: document.querySelector("#openBranchDirButton"),
   chatTab: document.querySelector("#chatTab"),
   chatMain: document.querySelector(".chat-main"),
   messageList: document.querySelector("#messageList"),
@@ -763,6 +765,7 @@ function clearWorkspace(message = "Select or initialize a ctxgit project.") {
   renderBranches();
   hideChatError();
   els.activeTitle.textContent = "No project selected";
+  setBranchDirButton(null);
   els.sequenceRoomUpdateButton.hidden = true;
   els.activeMeta.textContent = message;
   replaceMessageListHtml(`<div class="muted">${escapeHtml(message)}</div>`);
@@ -1704,6 +1707,7 @@ function renderBranchGraph(payload) {
 async function loadBranchGraph() {
   selectTab("graph");
   els.activeTitle.textContent = "Branch graph";
+  setBranchDirButton(null);
   els.activeMeta.textContent = "Simplified ctxgit lineage";
   els.branchGraphStatus.className = "settings-status";
   els.branchGraphStatus.textContent = "Loading graph...";
@@ -2028,6 +2032,7 @@ function renderGit(status) {
 function renderProvider(status) {
   state.provider = status;
   const webSearch = status.webSearch === false ? "off" : "on";
+  const subagents = status.subagents === true ? "on" : "off";
   const timeoutSeconds = status.timeoutSeconds || 900;
   const sandbox = status.sandbox || "workspace-write";
   const model = status.model || "";
@@ -2052,7 +2057,7 @@ function renderProvider(status) {
     <div>Provider: <strong>${escapeHtml(status.provider || "codex")}</strong></div>
     <div class="muted">Model: ${escapeHtml(model || "provider default")}</div>
     <div>${escapeHtml(status.message || status.status || "")}</div>
-    <div class="muted">Web search: ${webSearch} · Timeout: ${escapeHtml(String(timeoutSeconds))}s</div>
+    <div class="muted">Web search: ${webSearch} · Subagents: ${subagents} · Timeout: ${escapeHtml(String(timeoutSeconds))}s</div>
     <div class="muted">Brave search: ${escapeHtml(braveStatus)}</div>
     <div class="muted">Sandbox: ${escapeHtml(sandbox)}</div>
     <div class="muted">External writes: approval required</div>
@@ -2069,6 +2074,7 @@ function renderProvider(status) {
     }
   `;
   els.webSearchInput.checked = webSearch === "on";
+  els.subagentsInput.checked = subagents === "on";
   els.providerInput.value = status.provider || "codex";
   els.providerModelInput.value = model;
   els.timeoutSecondsInput.value = timeoutSeconds;
@@ -2448,6 +2454,33 @@ function activeBranchRunningJob(branch = activeChatKey()) {
   return job?.status === "running" ? job : null;
 }
 
+async function interjectSequenceRoom(branch, job) {
+  const text = els.messageInput.value.trim();
+  if (!text) return;
+  hideChatError();
+  const runMode = String(job.mode || "").includes("info") ? "info-chat" : "send";
+  try {
+    const payload = await api("/api/sequence-room/interject", {
+      method: "POST",
+      body: JSON.stringify({ branch, id: job.id, text, runMode }),
+    });
+    clearDraft(branch);
+    els.messageInput.value = "";
+    resizeMessageInput();
+    if (activeChatKey() === branch) {
+      renderBranch(payload);
+      updateComposerState();
+      scrollChatToBottom();
+    }
+  } catch (error) {
+    if (activeChatKey() === branch) {
+      showChatError(`개입 실패: ${error.message}`);
+    } else {
+      window.alert(`개입 실패 on ${branch}: ${error.message}`);
+    }
+  }
+}
+
 async function refreshSequenceRoomProgress(job) {
   if (!job?.id || !String(job.mode || job.kind || "").startsWith("sequence-room")) return;
   const savedReplies = (job.events || []).reduce((highest, event) => {
@@ -2495,7 +2528,14 @@ function updateComposerState() {
   els.historyChatButton.disabled = disabled;
   els.sequenceRoomUpdateButton.disabled = disabled || Boolean(running);
   const busyMode = running?.mode || startingMode;
-  els.sendButton.textContent = archived ? "Archived" : running ? "Stop" : "Send";
+  const isSequenceRoom = state.payload?.meta?.kind === "sequence-room";
+  els.sendButton.textContent = archived
+    ? "Archived"
+    : running
+      ? isSequenceRoom
+        ? "Interrupt"
+        : "Stop"
+      : "Send";
   els.contextResetButton.textContent = busyMode === "context-chat" ? "Busy" : "Reset";
   els.historyChatButton.textContent = archived
     ? "Archived"
@@ -2751,6 +2791,7 @@ function renderBranch(payload) {
     state.sequenceEvaluator = null;
   }
   els.activeTitle.textContent = meta.title || meta.id;
+  setBranchDirButton(meta.id);
   els.activeMeta.textContent = archived
     ? `${meta.id} · archived branch · read only`
     : `${meta.id} · history.jsonl is Git-tracked conversation history`;
@@ -2931,6 +2972,7 @@ function renderContextChat(payload) {
   state.payload = payload;
   const meta = payload.meta || {};
   els.activeTitle.textContent = meta.title || "Contexts";
+  setBranchDirButton(null);
   els.activeMeta.textContent = `${meta.id || "contexts"} · top-level contexts chat`;
 
   replaceMessageListHtml(
@@ -3104,6 +3146,7 @@ async function loadBranches() {
     await loadBranch(state.activeBranch);
   } else {
     els.activeTitle.textContent = "No branch selected";
+    setBranchDirButton(null);
     els.activeMeta.textContent = "Create a branch from the terminal with ctxgit branch <id>.";
     replaceMessageListHtml('<div class="muted">No messages yet.</div>');
     renderBranchResourceStage();
@@ -3649,6 +3692,7 @@ async function loadGlobalizedArchive(archiveId) {
   const meta = payload.meta || {};
   const range = `${meta.rangeStart || "?"}-${meta.rangeEnd || "?"}`;
   els.activeTitle.textContent = meta.title || archiveId;
+  setBranchDirButton(null);
   els.activeMeta.textContent = `${meta.sourceBranch || "archived"} · messages ${range}`;
   els.reportView.innerHTML = renderMarkdown(payload.markdown || "");
   const messages =
@@ -3695,6 +3739,7 @@ async function loadView(view) {
   updateComposerState();
   renderBranches();
   els.activeTitle.textContent = payload.id;
+  setBranchDirButton(null);
   els.activeMeta.textContent = payload.path;
   els.reportView.innerHTML = renderMarkdown(payload.text);
   selectTab("report");
@@ -4083,7 +4128,7 @@ els.sequenceUpdateForm.addEventListener("submit", async (event) => {
   }
 });
 
-async function sendComposerMessage({ mode }) {
+async function sendComposerMessage({ mode, runningAction = "stop" }) {
   const isContextChat = state.activeContextChat === true;
   if (!state.activeBranch && !isContextChat) return;
   if (isContextChat && mode === "research") {
@@ -4097,6 +4142,11 @@ async function sendComposerMessage({ mode }) {
   const branch = isContextChat ? CONTEXT_CHAT_KEY : state.activeBranch;
   const runningJob = activeBranchRunningJob(branch);
   if (runningJob) {
+    const isSequenceRoom = state.payload?.meta?.kind === "sequence-room";
+    if (isSequenceRoom && runningAction === "interrupt") {
+      await interjectSequenceRoom(branch, runningJob);
+      return;
+    }
     await cancelTrackedJob(runningJob);
     return;
   }
@@ -4274,13 +4324,13 @@ async function resetContextChatHistory() {
 
 els.composer.addEventListener("submit", async (event) => {
   event.preventDefault();
-  await sendComposerMessage({ mode: "chat" });
+  await sendComposerMessage({ mode: "chat", runningAction: "interrupt" });
 });
 
 els.messageInput.addEventListener("keydown", async (event) => {
   if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
   event.preventDefault();
-  await sendComposerMessage({ mode: "info-chat" });
+  await sendComposerMessage({ mode: "info-chat", runningAction: "interrupt" });
 });
 
 els.messageInput.addEventListener("input", () => {
@@ -4297,6 +4347,19 @@ els.messageInput.addEventListener("paste", (event) => {
 resizeMessageInput();
 
 els.copyEventLogButton.addEventListener("click", copyEventLog);
+
+// Copying rendered markdown (assistant results, reports) should yield plain
+// text only, without carrying rich formatting into the paste target.
+function forcePlainTextCopy(event) {
+  const selection = window.getSelection();
+  if (!selection || selection.isCollapsed) return;
+  const text = selection.toString();
+  if (!text || !event.clipboardData) return;
+  event.clipboardData.setData("text/plain", text);
+  event.preventDefault();
+}
+els.messageList.addEventListener("copy", forcePlainTextCopy);
+els.reportView.addEventListener("copy", forcePlainTextCopy);
 
 els.providerInput.addEventListener("change", () => {
   renderProviderModelOptions(els.providerInput.value);
@@ -4322,6 +4385,7 @@ els.providerSettings.addEventListener("submit", async (event) => {
           model: els.providerModelInput.value.trim(),
           timeoutSeconds,
           webSearch: els.webSearchInput.checked,
+          subagents: els.subagentsInput.checked,
           sandbox: els.sandboxInput.value,
         }),
       }),
@@ -4338,7 +4402,36 @@ els.providerSettings.addEventListener("submit", async (event) => {
 });
 
 els.historyChatButton.addEventListener("click", async () => {
-  await sendComposerMessage({ mode: "info-chat" });
+  await sendComposerMessage({ mode: "info-chat", runningAction: "stop" });
+});
+
+function setBranchDirButton(branchId) {
+  if (!els.openBranchDirButton) return;
+  if (branchId) {
+    els.openBranchDirButton.dataset.branch = branchId;
+    els.openBranchDirButton.hidden = false;
+  } else {
+    delete els.openBranchDirButton.dataset.branch;
+    els.openBranchDirButton.hidden = true;
+  }
+}
+
+els.openBranchDirButton?.addEventListener("click", async () => {
+  const branch = els.openBranchDirButton.dataset.branch || "";
+  if (!branch) return;
+  const previous = els.openBranchDirButton.textContent;
+  els.openBranchDirButton.disabled = true;
+  try {
+    await api("/api/branch/reveal", { method: "POST", body: JSON.stringify({ branch }) });
+    els.openBranchDirButton.textContent = "📂 Opened";
+    window.setTimeout(() => {
+      els.openBranchDirButton.textContent = previous;
+    }, 1500);
+  } catch (error) {
+    window.alert(`폴더를 열 수 없습니다: ${error.message}`);
+  } finally {
+    els.openBranchDirButton.disabled = false;
+  }
 });
 
 els.eventPanelToggle.addEventListener("click", () => {

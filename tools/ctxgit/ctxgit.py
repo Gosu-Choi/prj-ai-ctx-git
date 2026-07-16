@@ -144,6 +144,8 @@ _PROJECT_ENV_LOCK = threading.RLock()
 _PROJECT_ENV_ORIGINAL: dict[str, str | None] = {}
 _INTERNAL_GIT_LOCKS: dict[str, threading.RLock] = {}
 _INTERNAL_GIT_LOCKS_GUARD = threading.RLock()
+_HISTORY_APPEND_LOCKS: dict[str, threading.RLock] = {}
+_HISTORY_APPEND_LOCKS_GUARD = threading.RLock()
 
 
 class ChatTimeoutError(RuntimeError):
@@ -374,6 +376,16 @@ def internal_git_lock(root: Path) -> threading.RLock:
         if lock is None:
             lock = threading.RLock()
             _INTERNAL_GIT_LOCKS[key] = lock
+        return lock
+
+
+def history_append_lock(path: Path) -> threading.RLock:
+    key = str(path.resolve())
+    with _HISTORY_APPEND_LOCKS_GUARD:
+        lock = _HISTORY_APPEND_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _HISTORY_APPEND_LOCKS[key] = lock
         return lock
 
 
@@ -801,6 +813,19 @@ def path_is_within(parent: Path, child: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def open_path_in_file_browser(path: Path) -> None:
+    """Open the given directory in the local OS file browser (Finder/Explorer)."""
+    target = str(path)
+    if sys.platform == "darwin":
+        subprocess.Popen(["open", target])
+    elif os.name == "nt" or sys.platform.startswith("win"):
+        # Windows Explorer returns a non-zero exit code even on success, so
+        # launch it detached and do not wait on it.
+        subprocess.Popen(["explorer", target])
+    else:
+        subprocess.Popen(["xdg-open", target])
 
 
 def discover_workspace_root(start: Path) -> Path | None:
@@ -1995,10 +2020,30 @@ class ContextStore:
             record.update(extra)
         if not str(record.get("id") or "").strip():
             record["id"] = new_history_record_id()
-        with paths.history.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+        with history_append_lock(paths.history):
+            with paths.history.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
         self.touch_branch(branch_id)
         return record
+
+    def append_sequence_interjection(
+        self, branch_id: str, text: str, run_mode: str | None = None
+    ) -> dict[str, Any]:
+        """Record a user's mid-run message in a sequence room's history.
+
+        The message is appended live while an agent is generating, so it lands
+        just before that in-flight agent's reply (which is appended only after
+        generation finishes). It does not change the run's access mode.
+        """
+        if not branch_is_sequence_room(self, branch_id):
+            raise ValueError("branch is not a sequence room")
+        message = str(text or "").strip()
+        if not message:
+            raise ValueError("interjection message is required")
+        extra: dict[str, Any] = {"mode": "sequence-room", "interjection": True}
+        if run_mode in {"send", "info-chat"}:
+            extra["sequenceRunMode"] = run_mode
+        return self.append_history(branch_id, "user", message, extra=extra)
 
     def context_history_path(self) -> Path:
         return self.contexts / "history.jsonl"
@@ -4525,7 +4570,8 @@ def default_llm_config() -> dict[str, Any]:
             "bin": "claude",
             "model": "opus",
             "webSearch": True,
-            "strictStructuredOutput": False,
+            "strictStructuredOutput": True,
+            "subagents": False,
             "sandbox": DEFAULT_CODEX_SANDBOX,
             "timeoutSeconds": 900,
             "contextBudgetCharacters": DEFAULT_CONTEXT_BUDGET_CHARS,
@@ -4593,6 +4639,8 @@ def write_provider_config(root: Path, updates: dict[str, Any]) -> dict[str, Any]
         next_provider["timeoutSeconds"] = timeout_seconds
     if "webSearch" in updates:
         next_provider["webSearch"] = updates.get("webSearch") is True
+    if "subagents" in updates:
+        next_provider["subagents"] = updates.get("subagents") is True
     if "sandbox" in updates:
         sandbox = str(updates.get("sandbox") or "").strip()
         if sandbox not in ALLOWED_CODEX_SANDBOXES:
@@ -4692,6 +4740,7 @@ def claude_login_status(root: Path) -> dict[str, Any]:
             "loginCommand": "claude auth login", "resolvedCommand": " ".join(resolve_claude_command(root)),
             "model": str(config.get("model") or "opus"),
             "webSearch": config.get("webSearch") is not False,
+            "subagents": config.get("subagents") is True,
             "sandbox": str(config.get("sandbox") or DEFAULT_CODEX_SANDBOX),
             "timeoutSeconds": coerce_positive_int(config.get("timeoutSeconds"), 900),
             "envFiles": env_status.get("files", []),
@@ -4712,6 +4761,7 @@ def claude_login_status(root: Path) -> dict[str, Any]:
         "resolvedCommand": " ".join(resolve_claude_command(root)),
         "model": str(config.get("model") or "opus"),
         "webSearch": config.get("webSearch") is not False,
+        "subagents": config.get("subagents") is True,
         "sandbox": str(config.get("sandbox") or DEFAULT_CODEX_SANDBOX),
         "timeoutSeconds": coerce_positive_int(config.get("timeoutSeconds"), 900),
         "auth": auth,
@@ -5954,12 +6004,59 @@ def codex_event_progress(line: str) -> str:
     return ""
 
 
+def _claude_tool_detail(tool_input: Any) -> str:
+    if not isinstance(tool_input, dict):
+        return ""
+    for key in ("file_path", "path", "command", "pattern", "query", "url"):
+        value = tool_input.get(key)
+        if value:
+            return f" · {compact_progress_text(str(value), 80)}"
+    return ""
+
+
+def claude_stream_progress(line: str) -> str:
+    """Turn a Claude Code `stream-json` event line into a progress message."""
+    line = line.strip()
+    if not line:
+        return ""
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(event, dict) or event.get("type") != "assistant":
+        return ""
+    message = event.get("message") if isinstance(event.get("message"), dict) else {}
+    content = message.get("content") if isinstance(message.get("content"), list) else []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        part_type = part.get("type")
+        if part_type == "tool_use":
+            name = str(part.get("name") or "tool")
+            if name == "StructuredOutput":
+                # Internal plumbing used to emit the required structured output.
+                return ""
+            if name in ("Task", "Agent"):
+                tool_input = part.get("input") if isinstance(part.get("input"), dict) else {}
+                subagent = str(tool_input.get("subagent_type") or "subagent")
+                description = str(tool_input.get("description") or tool_input.get("prompt") or "").strip()
+                detail = f" · {compact_progress_text(description, 80)}" if description else ""
+                return f"Delegating to subagent: {subagent}{detail}"
+            return f"Using tool: {name}{_claude_tool_detail(part.get('input'))}"
+        if part_type == "text":
+            text = str(part.get("text") or "").strip()
+            if text:
+                return compact_progress_text(text, 140)
+    return ""
+
+
 def run_process_with_progress(
     cmd: list[str],
     cwd: Path,
     timeout_seconds: int,
     progress: ProgressCallback,
     stdin_text: str | None = None,
+    event_formatter: Callable[[str], str] = codex_event_progress,
 ) -> subprocess.CompletedProcess[str]:
     process = subprocess.Popen(
         cmd,
@@ -6043,7 +6140,7 @@ def run_process_with_progress(
                 startup_warnings_seen.add(warning_key)
                 message = format_codex_startup_warning(warning_key)
             else:
-                message = codex_event_progress(line)
+                message = event_formatter(line)
             if message and message != last_progress:
                 emit_progress(progress, message)
                 last_progress = message
@@ -6391,11 +6488,41 @@ def call_codex_prompt(
         return parsed
 
 
-def parse_claude_result(raw: str) -> dict[str, Any]:
+def claude_final_result_payload(raw: str) -> dict[str, Any] | None:
+    """Return the final result object from Claude Code output.
+
+    Handles both `--output-format json` (a single JSON object) and
+    `--output-format stream-json` (JSONL, where the final `type == "result"`
+    event carries the same envelope).
+    """
+    text = raw.strip()
+    if not text:
+        return None
     try:
-        payload = json.loads(raw.strip())
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return obj
     except json.JSONDecodeError:
-        return parse_chat_result(raw)
+        pass
+    result_obj: dict[str, Any] | None = None
+    last_dict: dict[str, Any] | None = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            last_dict = obj
+            if obj.get("type") == "result":
+                result_obj = obj
+    return result_obj or last_dict
+
+
+def parse_claude_result(raw: str) -> dict[str, Any]:
+    payload = claude_final_result_payload(raw)
     if not isinstance(payload, dict):
         return parse_chat_result(raw)
     structured = payload.get("structured_output")
@@ -6433,13 +6560,144 @@ def claude_structured_output_retry_failed(stdout: str, stderr: str) -> bool:
     return False
 
 
-def claude_tools(*, writable: bool, web_search: bool) -> str:
+def claude_tools(*, writable: bool, web_search: bool, subagents: bool = False) -> str:
     tools = ["Read", "Glob", "Grep"]
     if writable:
         tools.extend(["Edit", "Write", "Bash"])
     if web_search:
         tools.extend(["WebSearch", "WebFetch"])
+    if subagents:
+        # Task is the tool Claude Code uses to spawn subagents.
+        tools.append("Task")
     return ",".join(tools)
+
+
+# Role-specialized subagent library offered when the subagent toggle is on. The
+# lead agent orchestrates these via the Task tool (see the orchestration protocol
+# in call_claude_prompt). A project can add or override any of these with markdown
+# files under contexts/agents/. Entries carry a private "_needs_write" flag so
+# write-capable roles are withheld in read-only mode.
+BUILTIN_SUBAGENTS: dict[str, dict[str, Any]] = {
+    "planner": {
+        "description": (
+            "Decomposes a complex or ambiguous task into a concrete delegation plan: the subtasks, "
+            "which specialist handles each, dependencies, and the acceptance bar. Use before large, "
+            "multi-part work."
+        ),
+        "prompt": (
+            "You are a planning subagent. Given a goal, produce a concise, concrete plan: (1) break it "
+            "into independent subtasks, (2) assign each to a specialist role (researcher / implementer / "
+            "reviewer / verifier), (3) note dependencies and a clear acceptance bar (what 'done' means). "
+            "Do not do the work — return the plan only. Be specific and realistic."
+        ),
+        "tools": ["Read", "Grep", "Glob"],
+    },
+    "researcher": {
+        "description": (
+            "Read-only investigation: searches and reads files and web sources, then reports findings "
+            "with evidence. Use for parallel research."
+        ),
+        "prompt": (
+            "You are a read-only research subagent. Investigate the delegated question thoroughly by "
+            "reading and searching (files and, when useful, the web). Report concise findings with "
+            "concrete evidence and source pointers, and state uncertainty explicitly. Do not modify files."
+        ),
+        "tools": ["Read", "Grep", "Glob", "WebSearch", "WebFetch"],
+    },
+    "implementer": {
+        "description": (
+            "Does the actual work: writes/edits files, builds artifacts, runs commands. Use for a "
+            "self-contained build or edit subtask."
+        ),
+        "prompt": (
+            "You are an implementation subagent. Carry out the delegated build/edit subtask precisely "
+            "within the current working directory. Make the change, check that it does what was asked "
+            "(run or inspect the result), and report exactly what you changed and how you verified it. "
+            "Stay strictly within the assigned scope."
+        ),
+        "tools": ["Read", "Grep", "Glob", "Edit", "Write", "Bash"],
+        "_needs_write": True,
+    },
+    "reviewer": {
+        "description": (
+            "Adversarial quality gate: reviews an output for correctness, completeness, and defects, and "
+            "returns a pass/fail verdict with required changes. Use before finalizing substantial work."
+        ),
+        "prompt": (
+            "You are a critical reviewer subagent — a quality gate. Adversarially inspect the specified "
+            "output against the goal and acceptance criteria: look for correctness errors, missing pieces, "
+            "and quality problems. Return a clear verdict — PASS, or FAIL with a numbered list of concrete "
+            "required changes. Be specific and skeptical; never rubber-stamp. Read-only: do not fix it yourself."
+        ),
+        "tools": ["Read", "Grep", "Glob"],
+    },
+    "verifier": {
+        "description": (
+            "Verifies that an artifact actually works by exercising it (render / run / recompute), reporting "
+            "observed behavior versus expected. Use for anything that can be run, rendered, or checked."
+        ),
+        "prompt": (
+            "You are a verification subagent. Actually exercise the artifact — render the page, run the "
+            "code or command, recompute the numbers — and report what you OBSERVED versus what was expected, "
+            "citing concrete evidence (output, dimensions, values). Do not edit files; report defects for the "
+            "implementer to fix."
+        ),
+        "tools": ["Read", "Grep", "Glob", "Bash"],
+        "_needs_write": True,
+    },
+}
+
+
+def claude_subagents_json(root: Path, *, writable: bool) -> str:
+    agents: dict[str, dict[str, Any]] = {}
+    for name, entry in BUILTIN_SUBAGENTS.items():
+        if entry.get("_needs_write") and not writable:
+            # Withhold write/run-capable roles when the session is read-only.
+            continue
+        agents[name] = {key: value for key, value in entry.items() if not key.startswith("_")}
+    agents.update(load_project_subagents(root))  # project files override built-ins by name
+    return json.dumps(agents, ensure_ascii=False, separators=(",", ":"))
+
+
+def parse_agent_markdown(text: str) -> tuple[dict[str, str], str]:
+    """Parse an agent .md file with optional `---` YAML-ish frontmatter."""
+    if text.startswith("---"):
+        parts = text.split("---", 2)
+        if len(parts) >= 3:
+            meta: dict[str, str] = {}
+            for line in parts[1].splitlines():
+                if ":" in line:
+                    key, value = line.split(":", 1)
+                    meta[key.strip()] = value.strip()
+            return meta, parts[2].strip()
+    return {}, text.strip()
+
+
+def load_project_subagents(root: Path) -> dict[str, dict[str, Any]]:
+    agents_dir = root / "contexts" / "agents"
+    if not agents_dir.is_dir():
+        return {}
+    result: dict[str, dict[str, Any]] = {}
+    for path in sorted(agents_dir.glob("*.md")):
+        try:
+            meta, body = parse_agent_markdown(path.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+        name = str(meta.get("name") or path.stem).strip()
+        if not name or not body:
+            continue
+        entry: dict[str, Any] = {
+            "description": str(meta.get("description") or f"Project subagent {name}."),
+            "prompt": body,
+        }
+        tools_raw = str(meta.get("tools") or "").strip()
+        if tools_raw:
+            entry["tools"] = [item.strip() for item in re.split(r"[,\s]+", tools_raw) if item.strip()]
+        model_raw = str(meta.get("model") or "").strip()
+        if model_raw:
+            entry["model"] = model_raw
+        result[name] = entry
+    return result
 
 
 def call_claude_prompt(
@@ -6459,13 +6717,48 @@ def call_claude_prompt(
     config = read_llm_config(root).get("claude", {})
     timeout_seconds = coerce_positive_int(config.get("timeoutSeconds"), 900)
     schema = output_schema or chat_output_schema()
-    tools = claude_tools(writable=writable, web_search=config.get("webSearch") is not False)
+    subagents_enabled = config.get("subagents") is True
+    tools = claude_tools(
+        writable=writable,
+        web_search=config.get("webSearch") is not False,
+        subagents=subagents_enabled,
+    )
+    system_prompt = (
+        "You are running inside ctxgit. Do not push, publish, deploy, or modify files outside "
+        "the current working directory and explicitly added directories. Respect the requested "
+        "read-only or writable mode. Return the required structured output."
+    )
+    if subagents_enabled:
+        system_prompt += (
+            "\n\nYou can orchestrate a team of subagents via the Task tool to produce higher-quality"
+            " results. Orchestrate ADAPTIVELY — match effort to the task; never over-engineer a trivial"
+            " request. Available specialists: planner (decomposes complex work), researcher (read-only"
+            " investigation), implementer (writes/edits/builds), reviewer (adversarial quality gate),"
+            " verifier (exercises artifacts to confirm they work)."
+            "\nProtocol:"
+            "\n1. Assess the task's complexity and whether it splits into independent parts. Trivial or"
+            " purely conversational tasks: just answer directly, no delegation."
+            "\n2. Plan: for genuinely complex or ambiguous work, delegate to `planner` first to get a"
+            " decomposition and acceptance bar."
+            "\n3. Delegate in parallel: dispatch independent subtasks to the right specialist"
+            " (`researcher` for investigation, `implementer` for edits/building). Run at most 3-4"
+            " concurrently; give each a precise, self-contained brief with its acceptance bar."
+            "\n4. Quality gate: before finalizing any substantial output, delegate a review to `reviewer`"
+            " (and `verifier` for artifacts that can be rendered/run/recomputed). If they return required"
+            " changes, fix and re-check. Do NOT finalize until the review passes."
+            "\n5. Synthesize the results into your own answer — you own the final result."
+            "\nDelegate to amplify quality and parallelism, not for its own sake."
+        )
 
     def build_cmd(*, strict_schema: bool) -> list[str]:
         command = resolve_claude_command(root)
         command.extend([
             "-p",
-            "--output-format", "json",
+            # stream-json emits intermediate events (tool use, assistant text)
+            # line-by-line so the UI can show live progress, not just a spinner.
+            # --verbose is required for stream-json in print mode.
+            "--output-format", "stream-json",
+            "--verbose",
         ])
         if strict_schema:
             command.extend([
@@ -6477,12 +6770,10 @@ def call_claude_prompt(
             "--tools", tools,
             "--allowedTools", tools,
             "--append-system-prompt",
-            (
-                "You are running inside ctxgit. Do not push, publish, deploy, or modify files outside "
-                "the current working directory and explicitly added directories. Respect the requested "
-                "read-only or writable mode. Return the required structured output."
-            ),
+            system_prompt,
         ])
+        if subagents_enabled:
+            command.extend(["--agents", claude_subagents_json(root, writable=writable)])
         model = str(config.get("model") or "opus").strip()
         if model:
             command.extend(["--model", model])
@@ -6493,14 +6784,15 @@ def call_claude_prompt(
     def run_claude(command: list[str], stdin_text: str) -> subprocess.CompletedProcess[str]:
         if progress:
             return run_process_with_progress(
-                command, cwd, timeout_seconds, progress, stdin_text=stdin_text
+                command, cwd, timeout_seconds, progress, stdin_text=stdin_text,
+                event_formatter=claude_stream_progress,
             )
         return subprocess.run(
             command, cwd=cwd, check=False, text=True, encoding="utf-8", errors="replace",
             input=stdin_text, capture_output=True, timeout=timeout_seconds,
         )
 
-    strict_structured_output = config.get("strictStructuredOutput") is True
+    strict_structured_output = config.get("strictStructuredOutput") is not False
     cmd = build_cmd(strict_schema=strict_structured_output)
     try:
         emit_progress(progress, "Claude Code is working")
@@ -10170,6 +10462,37 @@ def make_handler(
                     )
                 self.send_json(jobs.create("sequence-room", sequence_work, root=root), status=202)
                 return
+            if parsed.path == "/api/sequence-room/interject":
+                branch_id = str(body.get("branch") or "")
+                text = str(body.get("text") or "").strip()
+                job_id = str(body.get("id") or "")
+                run_mode = str(body.get("runMode") or "") or None
+                if not text:
+                    self.send_json({"error": "message_required"}, status=400)
+                    return
+                if job_id:
+                    running = jobs.snapshot(job_id, root=root)
+                    if running.get("status") != "running":
+                        self.send_json(
+                            {
+                                "error": "no_active_run",
+                                "message": "No running sequence room turn to interject.",
+                            },
+                            status=409,
+                        )
+                        return
+                try:
+                    record = store.append_sequence_interjection(branch_id, text, run_mode=run_mode)
+                except ValueError as exc:
+                    self.send_json(
+                        {"error": "sequence_interjection_failed", "message": str(exc)},
+                        status=400,
+                    )
+                    return
+                payload = branch_payload(store, branch_id)
+                payload["interjection"] = record
+                self.send_json(payload)
+                return
             if parsed.path == "/api/sequence-room/order":
                 try:
                     branch_id = str(body.get("branch") or "")
@@ -10237,6 +10560,29 @@ def make_handler(
                     self.send_json(payload)
                 except ValueError as exc:
                     self.send_json({"error": "sequence_room_update_failed", "message": str(exc)}, status=400)
+                return
+            if parsed.path == "/api/branch/reveal":
+                branch_id = str(body.get("branch") or "")
+                try:
+                    directory = store.branch_paths_for_read(branch_id).root
+                except SystemExit as exc:
+                    self.send_json({"error": "branch_invalid"}, status=int(exc.code or 400))
+                    return
+                if not directory.exists() or not directory.is_dir():
+                    self.send_json(
+                        {"error": "branch_not_found", "message": f"branch directory not found: {branch_id}"},
+                        status=404,
+                    )
+                    return
+                if not path_is_within(root, directory):
+                    self.send_json({"error": "path_outside_project"}, status=400)
+                    return
+                try:
+                    open_path_in_file_browser(directory.resolve())
+                except Exception as exc:  # noqa: BLE001 - surface any launch failure to the UI
+                    self.send_json({"error": "reveal_failed", "message": str(exc)}, status=500)
+                    return
+                self.send_json({"ok": True, "path": relpath(root, directory)})
                 return
             if parsed.path == "/api/branch/clone":
                 source_id = str(body.get("source") or "")

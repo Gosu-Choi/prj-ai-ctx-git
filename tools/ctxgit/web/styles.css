@@ -601,14 +601,46 @@ textarea {
   min-width: 0;
 }
 
+.active-title-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
 .active-title {
   font-size: 20px;
   font-weight: 750;
   overflow-wrap: anywhere;
+  word-break: keep-all;
+}
+
+.open-dir-button {
+  flex: none;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  padding: 4px 12px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.open-dir-button:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.open-dir-button:disabled {
+  opacity: 0.6;
+  cursor: default;
 }
 
 .active-meta {
   overflow-wrap: anywhere;
+  word-break: keep-all;
 }
 
 .tabs {
@@ -913,6 +945,7 @@ textarea {
   border-radius: 6px;
   padding: 12px;
   overflow-wrap: anywhere;
+  word-break: keep-all;
 }
 
 .pending-message {
@@ -1016,6 +1049,7 @@ textarea {
   min-width: 0;
   line-height: 1.55;
   overflow-wrap: anywhere;
+  word-break: keep-all;
 }
 
 .sequence-evaluation {
@@ -1114,6 +1148,7 @@ textarea {
   background: #f7f7f2;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+  word-break: normal;
 }
 
 .message-text pre code {
@@ -1458,6 +1493,7 @@ textarea {
 .event-message {
   line-height: 1.4;
   overflow-wrap: anywhere;
+  word-break: keep-all;
 }
 
 .artifact-links {
@@ -1521,6 +1557,7 @@ textarea {
   border-radius: 6px;
   padding: 10px 12px;
   overflow-wrap: anywhere;
+  word-break: keep-all;
 }
 
 .error-banner[hidden] {
@@ -1541,6 +1578,7 @@ textarea {
 .markdown {
   max-width: 1080px;
   line-height: 1.55;
+  word-break: keep-all;
 }
 
 .markdown h1,

@@ -120,6 +120,10 @@
               <input id="webSearchInput" type="checkbox" />
               <span>Web search</span>
             </label>
+            <label class="checkbox-label">
+              <input id="subagentsInput" type="checkbox" />
+              <span>Subagents (Claude)</span>
+            </label>
             <label for="timeoutSecondsInput">Timeout seconds</label>
             <div class="settings-row">
               <input id="timeoutSecondsInput" min="1" step="1" type="number" />
@@ -148,7 +152,16 @@
       <main class="workspace">
         <header class="topbar">
           <div>
-            <div id="activeTitle" class="active-title">No branch selected</div>
+            <div class="active-title-row">
+              <div id="activeTitle" class="active-title">No branch selected</div>
+              <button
+                id="openBranchDirButton"
+                class="open-dir-button"
+                type="button"
+                hidden
+                title="Open this branch's folder in Finder/Explorer"
+              >📂 Open folder</button>
+            </div>
             <div id="activeMeta" class="active-meta"></div>
           </div>
           <div class="tabs" role="tablist">
