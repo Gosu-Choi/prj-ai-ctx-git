@@ -514,39 +514,74 @@ class OrchestrationLogTest(unittest.TestCase):
             self.assertEqual(len(failed), 1)
             self.assertIn("worker exploded", failed[0]["reply"])
 
-    def test_chat_turn_captures_lead_delegations(self) -> None:
+    def test_chat_turn_reconstructs_a_subagent_timeline_from_the_stream(self) -> None:
+        # The lead's fan-out only exists in the raw stream, tagged with
+        # parent_tool_use_id; the turn must turn that into a timeline the modal reads.
+        def ev(ts, obj):
+            obj["timestamp"] = ts
+            return json.dumps(obj)
+
+        stream_lines = [
+            ev("2026-01-01T00:00:00.000Z", {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": "Agent", "id": "AA",
+                 "input": {"subagent_type": "scientist", "description": "review ML"}},
+                {"type": "tool_use", "name": "Agent", "id": "BB",
+                 "input": {"subagent_type": "architect", "description": "review ontology"}},
+            ]}}),
+            ev("2026-01-01T00:00:01.000Z", {"type": "assistant", "parent_tool_use_id": "AA",
+                "subagent_type": "scientist", "message": {"content": [
+                    {"type": "tool_use", "name": "WebSearch", "input": {"query": "DAgger"}}]}}),
+            ev("2026-01-01T00:00:01.500Z", {"type": "assistant", "parent_tool_use_id": "BB",
+                "subagent_type": "architect", "message": {"content": [
+                    {"type": "tool_use", "name": "WebSearch", "input": {"query": "SHACL"}}]}}),
+            ev("2026-01-01T00:00:06.000Z", {"type": "assistant", "parent_tool_use_id": "AA",
+                "subagent_type": "scientist", "message": {"content": [
+                    {"type": "text", "text": "ML claims mostly hold."}]}}),
+            ev("2026-01-01T00:00:06.500Z", {"type": "assistant", "parent_tool_use_id": "BB",
+                "subagent_type": "architect", "message": {"content": [
+                    {"type": "text", "text": "SHACL usage is sound."}]}}),
+        ]
+
+        original_stream = ctxgit.run_process_with_progress
+        original_run = ctxgit.subprocess.run
+
+        def fake_stream(cmd, cwd, timeout, progress, stdin_text=None, event_formatter=None):
+            sink = getattr(progress, "event_sink", None)
+            if sink:
+                for line in stream_lines:
+                    sink(json.loads(line))
+            return FakeCompleted(
+                stdout=structured_result({"assistant": "done", "artifacts": [], "approvalRequests": []})
+            )
+
+        def fake_run(cmd, **_kwargs):
+            if "auth" in cmd and "status" in cmd:
+                return FakeCompleted(stdout="Logged in")
+            return FakeCompleted(stdout=structured_result({"assistant": "done", "artifacts": [], "approvalRequests": []}))
+
         with tempfile.TemporaryDirectory() as tmp:
             root, store = self._project(tmp)
-            original = ctxgit.subprocess.run
-
-            def fake_run(cmd, **kwargs):
-                if "auth" in cmd and "status" in cmd:
-                    return FakeCompleted(stdout="Logged in")
-                return FakeCompleted(stdout=structured_result({"assistant": "done", "artifacts": [], "approvalRequests": []}))
-
-            # the lead's delegations only exist as streamed events
-            original_progress = ctxgit.run_process_with_progress
-
-            def fake_stream(cmd, cwd, timeout, progress, stdin_text=None, event_formatter=None):
-                progress("Delegating to subagent: researcher · market size")
-                progress("Delegating to subagent: executor · write the file")
-                return FakeCompleted(
-                    stdout=structured_result({"assistant": "done", "artifacts": [], "approvalRequests": []})
-                )
-
-            ctxgit.subprocess.run = fake_run
             ctxgit.run_process_with_progress = fake_stream
+            ctxgit.subprocess.run = fake_run
             try:
                 ctxgit.run_chat_turn(root, store, "b1", "do it", provider="claude", progress=lambda _m: None)
             finally:
-                ctxgit.subprocess.run = original
-                ctxgit.run_process_with_progress = original_progress
+                ctxgit.run_process_with_progress = original_stream
+                ctxgit.subprocess.run = original_run
 
             assistant = [item for item in store.iter_history("b1") if item["role"] == "assistant"][-1]
             self.assertIn("orchestrationLog", assistant)
             log = json.loads((root / assistant["orchestrationLog"]).read_text())
-            self.assertEqual([entry["kind"] for entry in log["entries"]], ["delegation", "delegation"])
-            self.assertEqual([entry["role"] for entry in log["entries"]], ["researcher", "executor"])
+            self.assertEqual(log["mode"], "chat")
+            subs = log["timeline"]["subagents"]
+            self.assertEqual([s["type"] for s in subs], ["scientist", "architect"])
+            # each subagent's own work and reply are captured
+            self.assertEqual(subs[0]["summary"], "ML claims mostly hold.")
+            self.assertTrue(any(e["kind"] == "tool" for e in subs[0]["events"]))
+            # the two ran concurrently: their active windows overlap
+            a, b = subs[0], subs[1]
+            overlap = min(a["endAt"], b["endAt"]) - max(a["startAt"], b["startAt"])
+            self.assertGreater(overlap, 0)
 
     def test_delegation_parser_handles_batches_and_ignores_other_events(self) -> None:
         from orchestration.transcript import delegations_from_event

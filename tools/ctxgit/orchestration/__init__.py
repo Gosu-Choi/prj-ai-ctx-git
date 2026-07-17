@@ -49,6 +49,7 @@ from .protocol import (
     worker_preamble,
 )
 from .transcript import Transcript, delegations_from_event
+from .stream_transcript import StreamTranscript
 from .stages import (
     ASSIGNABLE_ROLES,
     DEFAULT_MAX_PARALLEL,
@@ -69,6 +70,7 @@ __all__ = [
     "PipelineResult",
     "run_team_pipeline",
     "Transcript",
+    "StreamTranscript",
     "delegations_from_event",
     "DEFAULT_MAX_FIX_ATTEMPTS",
     "DEFAULT_MAX_ITERATIONS",

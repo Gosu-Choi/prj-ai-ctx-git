@@ -62,8 +62,8 @@ if str(_MODULE_DIR) not in sys.path:
 from orchestration import (  # noqa: E402
     LEAD_ORCHESTRATION_PROTOCOL,
     WORKER_RUNTIME_OVERRIDE,
+    StreamTranscript,
     Transcript,
-    delegations_from_event,
     resolve_agent,
     AgentReply,
     AgentRequest,
@@ -6120,6 +6120,12 @@ def run_process_with_progress(
     stdin_text: str | None = None,
     event_formatter: Callable[[str], str] = codex_event_progress,
 ) -> subprocess.CompletedProcess[str]:
+    # A turn can attach a raw-event sink to the progress callback to reconstruct the
+    # subagent timeline; keeping it on `progress` avoids threading a param through
+    # every provider layer.
+    event_sink = getattr(progress, "event_sink", None)
+    if not callable(event_sink):
+        event_sink = None
     process = subprocess.Popen(
         cmd,
         cwd=cwd,
@@ -6195,6 +6201,13 @@ def run_process_with_progress(
             continue
         if name == "stdout":
             stdout_lines.append(line)
+            if event_sink is not None:
+                stripped = line.strip()
+                if stripped:
+                    try:
+                        event_sink(json.loads(stripped))
+                    except (json.JSONDecodeError, Exception):  # noqa: BLE001 - never let capture break the run
+                        pass
             warning_key = codex_startup_warning_key(line)
             if warning_key:
                 if warning_key in startup_warnings_seen:
@@ -6781,37 +6794,31 @@ def orchestration_log_path(store: ContextStore, branch_id: str, turn_id: str) ->
 
 
 def save_orchestration_log(
-    store: ContextStore, branch_id: str, transcript: Transcript
+    store: ContextStore, branch_id: str, turn_id: str, payload: dict[str, Any]
 ) -> str | None:
-    """Persist a turn's transcript and return its project-relative path."""
-    if not transcript.entries:
+    """Persist a turn's orchestration record and return its project-relative path."""
+    if not payload:
         return None
-    path = orchestration_log_path(store, branch_id, transcript.turn_id)
-    dump_json(path, transcript.to_dict())
+    path = orchestration_log_path(store, branch_id, turn_id)
+    dump_json(path, payload)
     return relpath(store.root, path)
 
 
-def delegation_recording_progress(
-    transcript: Transcript, progress: ProgressCallback | None
+def stream_capturing_progress(
+    stream: "StreamTranscript", progress: ProgressCallback | None
 ) -> ProgressCallback:
-    """Tee progress events, keeping the delegations for the transcript.
+    """Return a progress callback that also feeds raw stream events to `stream`.
 
-    A lead agent's hand-offs to subagents only exist as streamed events, so this is
-    the only place a chat or sequence-room turn can capture them.
+    run_process_with_progress reads `.event_sink` off the callback, so this is how a
+    chat or sequence-room turn reconstructs the real subagent timeline (who did what,
+    when, and whether they overlapped) without threading a param through every layer.
     """
 
     def wrapped(message: str) -> None:
-        for delegation in delegations_from_event(message):
-            transcript.record(
-                "delegation",
-                role=delegation["role"],
-                label="delegation",
-                reply=delegation["description"],
-                meta={"description": delegation["description"]},
-            )
         if progress:
             progress(message)
 
+    wrapped.event_sink = stream.ingest  # type: ignore[attr-defined]
     cancelled = getattr(progress, "cancelled", None)
     if cancelled is not None:
         wrapped.cancelled = cancelled  # type: ignore[attr-defined]
@@ -6929,7 +6936,11 @@ def run_team_pipeline_turn(
         max_parallel=coerce_positive_int(max_parallel, 4),
         transcript=transcript,
     )
-    orchestration_log = save_orchestration_log(store, branch_id, transcript)
+    orchestration_log = (
+        save_orchestration_log(store, branch_id, turn_id, transcript.to_dict())
+        if transcript.entries
+        else None
+    )
 
     state = result.state
     verdict = (result.verify or {}).get("verdict") or "n/a"
@@ -7117,7 +7128,7 @@ def run_chat_turn(
             user_extra["resources"] = normalized_resources
         store.append_history(branch_id, "user", user_message, extra=user_extra)
     markdown_before = markdown_file_snapshot(root)
-    transcript = Transcript(turn_id=turn_id, branch=branch_id, mode="chat", task=user_message)
+    stream = StreamTranscript()
     result = call_provider_chat(
         selected_provider,
         root,
@@ -7126,9 +7137,23 @@ def run_chat_turn(
         user_message,
         approved_external_paths=approved_external_paths,
         resource_paths=normalized_resources,
-        progress=delegation_recording_progress(transcript, progress),
+        progress=stream_capturing_progress(stream, progress),
     )
-    orchestration_log = save_orchestration_log(store, branch_id, transcript)
+    orchestration_log = None
+    if stream.has_delegations:
+        orchestration_log = save_orchestration_log(
+            store,
+            branch_id,
+            turn_id,
+            {
+                "schemaVersion": 2,
+                "turnId": turn_id,
+                "branch": branch_id,
+                "mode": "chat",
+                "task": user_message,
+                "timeline": stream.timeline(),
+            },
+        )
     direct_markdown_refs = changed_markdown_file_refs(root, markdown_before, markdown_file_snapshot(root))
     artifact_refs = []
     emit_progress(progress, "Saving assistant output")
@@ -7849,13 +7874,14 @@ def run_sequence_room_turn(
             else None
         )
         markdown_before = markdown_file_snapshot(root)
+        reply_stream = StreamTranscript()
         result = call_provider_prompt(
             selected_provider,
             root,
             prompt,
             writable=effective_access == "send",
             cwd=workspace,
-            progress=delegation_recording_progress(transcript, progress),
+            progress=stream_capturing_progress(reply_stream, progress),
             output_schema=output_schema,
         )
         workspace_rel = relpath(root, workspace)
@@ -7924,6 +7950,9 @@ def run_sequence_room_turn(
                 "sourceBranch": source_id,
                 "accessMode": effective_access,
                 "isEvaluator": stop_decider is not None and order == stop_decider,
+                # Each reply is its own claude process, so it carries its own subagent
+                # timeline. Only keep it when the agent actually delegated.
+                **({"timeline": reply_stream.timeline()} if reply_stream.has_delegations else {}),
                 **({"evaluation": evaluation} if evaluation else {}),
             },
         )
@@ -7946,7 +7975,8 @@ def run_sequence_room_turn(
             if stop_decider is None
             else "Maximum agent replies reached before the completion criteria passed."
         )
-    save_orchestration_log(store, branch_id, transcript)
+    if transcript.entries:
+        save_orchestration_log(store, branch_id, run_id, transcript.to_dict())
     turn_commit = internal_git_commit_turn(
         store,
         kind="sequence-room-turn",

@@ -1733,10 +1733,83 @@ const ORCHESTRATION_STAGE_LABEL = {
   "sequence-reply": "Room reply",
 };
 
+const ORCH_EVENT_ICON = { tool: "⚙", text: "💬", result: "↩", delegate: "⇢" };
+
 function orchestrationDuration(ms) {
   const value = Number(ms || 0);
   if (!Number.isFinite(value) || value <= 0) return "";
   return value >= 1000 ? `${(value / 1000).toFixed(1)}s` : `${value}ms`;
+}
+
+function orchClock(ms) {
+  const value = Number(ms || 0);
+  if (!Number.isFinite(value) || value < 0) return "0.0s";
+  return `${(value / 1000).toFixed(1)}s`;
+}
+
+// How many subagents were active at the same instant — the "did it run in parallel"
+// number, computed from the [startAt, endAt] intervals.
+function orchMaxConcurrency(subs) {
+  const points = [];
+  subs.forEach((s) => {
+    points.push([Number(s.startAt) || 0, 1]);
+    points.push([Number(s.endAt) || 0, -1]);
+  });
+  points.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  let current = 0;
+  let max = 0;
+  points.forEach(([, delta]) => {
+    current += delta;
+    max = Math.max(max, current);
+  });
+  return max;
+}
+
+function renderOrchSubagentLane(sub, total, index) {
+  const start = Math.max(0, Number(sub.startAt) || 0);
+  const end = Math.max(start, Number(sub.endAt) || start);
+  const left = total > 0 ? (start / total) * 100 : 0;
+  const width = total > 0 ? Math.max(1.5, ((end - start) / total) * 100) : 100;
+  const dur = orchestrationDuration(sub.durationMs);
+  const events = Array.isArray(sub.events) ? sub.events : [];
+  const detail = events
+    .map(
+      (e) =>
+        `<div class="orch-ev orch-ev-${escapeHtml(e.kind || "")}"><span class="orch-ev-t">${orchClock(e.at)}</span><span class="orch-ev-i">${ORCH_EVENT_ICON[e.kind] || "·"}</span><span class="orch-ev-l">${escapeHtml(e.label || "")}</span></div>`,
+    )
+    .join("");
+  return `
+    <div class="orch-lane" style="--lane: ${index};">
+      <div class="orch-lane-label" title="${escapeHtml(sub.brief || "")}">
+        <span class="orch-lane-name">${escapeHtml(sub.type || "subagent")}</span>
+        ${dur ? `<span class="orch-lane-dur">${escapeHtml(dur)}</span>` : ""}
+      </div>
+      <div class="orch-lane-track">
+        <div class="orch-bar" style="left:${left}%;width:${width}%;" title="${escapeHtml(sub.brief || "")} · ${escapeHtml(orchClock(start))}→${escapeHtml(orchClock(end))}"></div>
+      </div>
+      <details class="orch-lane-detail">
+        <summary>${escapeHtml(sub.brief || sub.type || "details")} · ${events.length} step(s)</summary>
+        <div class="orch-ev-list">${detail || '<div class="muted">no recorded steps</div>'}</div>
+        ${sub.summary ? `<div class="orch-ev-summary"><span class="orch-task-label">returned</span><pre>${escapeHtml(sub.summary)}</pre></div>` : ""}
+      </details>
+    </div>
+  `;
+}
+
+function renderOrchTimeline(timeline) {
+  const subs = Array.isArray(timeline.subagents) ? timeline.subagents : [];
+  const total = Number(timeline.totalMs) || subs.reduce((m, s) => Math.max(m, Number(s.endAt) || 0), 0);
+  if (!subs.length) return "";
+  const ticks = [0, 0.25, 0.5, 0.75, 1]
+    .map((f) => `<span class="orch-tick" style="left:${f * 100}%;">${orchClock(f * total)}</span>`)
+    .join("");
+  const lanes = subs.map((sub, i) => renderOrchSubagentLane(sub, total, i)).join("");
+  return `
+    <div class="orch-timeline">
+      <div class="orch-ruler"><div class="orch-ruler-track">${ticks}</div></div>
+      ${lanes}
+    </div>
+  `;
 }
 
 function renderOrchestrationEntry(entry) {
@@ -1749,6 +1822,10 @@ function renderOrchestrationEntry(entry) {
   if (meta.failed) badges.push("failed");
   const duration = orchestrationDuration(entry.duration_ms);
   const isDelegation = entry.kind === "delegation";
+  const laneTimeline =
+    meta.timeline && Array.isArray(meta.timeline.subagents) && meta.timeline.subagents.length
+      ? `<div class="orch-entry-timeline"><div class="orch-entry-tl-label">delegated ${meta.timeline.subagents.length} subagent(s)${orchMaxConcurrency(meta.timeline.subagents) > 1 ? ` · up to ${orchMaxConcurrency(meta.timeline.subagents)} in parallel` : ""}</div>${renderOrchTimeline(meta.timeline)}</div>`
+      : "";
   return `
     <li class="orch-entry ${isDelegation ? "orch-delegation" : ""} ${meta.failed ? "orch-failed" : ""}">
       <div class="orch-entry-head">
@@ -1758,6 +1835,7 @@ function renderOrchestrationEntry(entry) {
         ${badges.map((item) => `<span class="orch-badge">${escapeHtml(item)}</span>`).join("")}
         ${duration ? `<span class="orch-duration">${escapeHtml(duration)}</span>` : ""}
       </div>
+      ${laneTimeline}
       ${
         entry.prompt
           ? `<details class="orch-block"><summary>asked</summary><pre>${escapeHtml(entry.prompt)}</pre></details>`
@@ -1783,21 +1861,34 @@ async function showOrchestrationLog(turnId) {
     const log = await api(
       `/api/orchestration?branch=${encodeURIComponent(branch)}&turn=${encodeURIComponent(turnId)}`,
     );
-    const entries = Array.isArray(log.entries) ? log.entries : [];
-    const stages = entries.filter((item) => item.kind === "stage").length;
-    const delegations = entries.filter((item) => item.kind === "delegation").length;
-    const total = entries.reduce((sum, item) => sum + Number(item.duration_ms || 0), 0);
-    const roles = [...new Set(entries.map((item) => item.role).filter(Boolean))];
     els.orchestrationTitle.textContent = `Orchestration · ${log.mode || "turn"}`;
-    els.orchestrationSubtitle.textContent =
-      `${entries.length} step(s) · ${stages} stage(s)` +
-      (delegations ? ` · ${delegations} delegation(s)` : "") +
-      (total ? ` · ${orchestrationDuration(total)} of agent time` : "");
-    els.orchestrationBody.innerHTML = `
-      ${log.task ? `<div class="orch-task"><span class="orch-task-label">Goal</span><pre>${escapeHtml(log.task)}</pre></div>` : ""}
-      <div class="orch-flow">${roles.map((role) => `<span class="orch-chip">${escapeHtml(role)}</span>`).join('<span class="orch-arrow">→</span>')}</div>
-      <ol class="orch-list">${entries.map(renderOrchestrationEntry).join("")}</ol>
-    `;
+    const goal = log.task
+      ? `<div class="orch-task"><span class="orch-task-label">Goal</span><pre>${escapeHtml(log.task)}</pre></div>`
+      : "";
+
+    if (log.timeline && Array.isArray(log.timeline.subagents) && log.timeline.subagents.length) {
+      // Chat turn: one lead fanning out to subagents on a shared time axis.
+      const subs = log.timeline.subagents;
+      const concurrency = orchMaxConcurrency(subs);
+      els.orchestrationSubtitle.textContent =
+        `${subs.length} subagent(s) · ${orchClock(log.timeline.totalMs)} wall clock · ` +
+        (concurrency > 1 ? `up to ${concurrency} ran in parallel` : "ran one at a time");
+      els.orchestrationBody.innerHTML = `${goal}${renderOrchTimeline(log.timeline)}`;
+    } else {
+      // Team pipeline / sequence room: an ordered list of stages, each of which may
+      // carry its own subagent timeline.
+      const entries = Array.isArray(log.entries) ? log.entries : [];
+      const stages = entries.filter((item) => item.kind === "stage").length;
+      const delegations = entries.filter((item) => item.kind === "delegation").length;
+      const total = entries.reduce((sum, item) => sum + Number(item.duration_ms || 0), 0);
+      els.orchestrationSubtitle.textContent =
+        `${entries.length} step(s) · ${stages} stage(s)` +
+        (delegations ? ` · ${delegations} delegation(s)` : "") +
+        (total ? ` · ${orchestrationDuration(total)} of agent time` : "");
+      els.orchestrationBody.innerHTML = `${goal}<ol class="orch-list">${entries
+        .map(renderOrchestrationEntry)
+        .join("")}</ol>`;
+    }
   } catch (error) {
     els.orchestrationSubtitle.textContent = "";
     els.orchestrationBody.innerHTML = `<div class="muted">기록을 불러오지 못했습니다: ${escapeHtml(error.message)}</div>`;

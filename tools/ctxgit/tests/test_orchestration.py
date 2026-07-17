@@ -204,6 +204,50 @@ class SubagentLibraryTest(unittest.TestCase):
         for role in re.findall(r"([a-z][a-z-]+) \(", ROLE_SUMMARY):
             self.assertIn(role, roster, f"role summary names a role that does not exist: {role}")
 
+    def test_stream_transcript_reconstructs_overlapping_subagents(self) -> None:
+        st = orch.StreamTranscript()
+
+        def ev(ts, obj):
+            obj["timestamp"] = ts
+            st.ingest(obj)
+
+        ev("2026-01-01T00:00:00.000Z", {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Agent", "id": "AA",
+             "input": {"subagent_type": "alpha", "description": "do alpha"}},
+            {"type": "tool_use", "name": "Agent", "id": "BB",
+             "input": {"subagent_type": "beta", "description": "do beta"}},
+        ]}})
+        ev("2026-01-01T00:00:01.000Z", {"type": "assistant", "parent_tool_use_id": "AA",
+            "subagent_type": "alpha", "message": {"content": [
+                {"type": "tool_use", "name": "Bash", "input": {"command": "sleep 5"}}]}})
+        ev("2026-01-01T00:00:01.500Z", {"type": "assistant", "parent_tool_use_id": "BB",
+            "subagent_type": "beta", "message": {"content": [
+                {"type": "tool_use", "name": "Bash", "input": {"command": "sleep 5"}}]}})
+        ev("2026-01-01T00:00:06.500Z", {"type": "assistant", "parent_tool_use_id": "AA",
+            "subagent_type": "alpha", "message": {"content": [{"type": "text", "text": "alpha done"}]}})
+        ev("2026-01-01T00:00:07.000Z", {"type": "assistant", "parent_tool_use_id": "BB",
+            "subagent_type": "beta", "message": {"content": [{"type": "text", "text": "beta done"}]}})
+
+        self.assertTrue(st.has_delegations)
+        tl = st.timeline()
+        self.assertEqual(len(tl["subagents"]), 2)
+        a, b = tl["subagents"]
+        self.assertEqual(a["type"], "alpha")
+        self.assertEqual(a["startAt"], 1000)   # ms from the first event
+        self.assertEqual(a["endAt"], 6500)
+        self.assertEqual(a["summary"], "alpha done")
+        # the two windows overlap -> genuinely concurrent
+        overlap = min(a["endAt"], b["endAt"]) - max(a["startAt"], b["startAt"])
+        self.assertGreater(overlap, 0)
+
+    def test_stream_transcript_is_empty_without_delegations(self) -> None:
+        st = orch.StreamTranscript()
+        st.ingest({"type": "assistant", "timestamp": "2026-01-01T00:00:00.000Z",
+                   "message": {"content": [{"type": "text", "text": "just answering"}]}})
+        st.ingest({"type": "system", "subtype": "init"})
+        self.assertFalse(st.has_delegations)
+        self.assertEqual(st.timeline()["subagents"], [])
+
     def test_frontmatter_parser_keeps_body_with_dashes(self) -> None:
         meta, body = orch.parse_agent_markdown(
             "---\nname: t\ndescription: d\n---\n\nBody\n\n| a | b |\n|---|---|\n| 1 | 2 |\n"
