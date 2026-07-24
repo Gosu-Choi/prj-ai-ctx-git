@@ -97,7 +97,7 @@ DEFAULT_RESEARCH_MAX_FETCHES = 8
 DEFAULT_CODEX_SANDBOX = "workspace-write"
 ALLOWED_CODEX_SANDBOXES = {"read-only", "workspace-write", "danger-full-access"}
 APPROVAL_STATUSES = {"approved", "denied"}
-PROJECT_ENV_ALLOWED_KEYS = {"BRAVE_API_KEY"}
+PROJECT_ENV_ALLOWED_KEYS = {"BRAVE_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"}
 REPO_ENV_FILES = (".env",)
 PROJECT_ENV_FILES = (".ctxgit/.env", ".env")
 PROJECT_ENV_GITIGNORE_LINES = (
@@ -339,6 +339,12 @@ def ensure_repo_env_example() -> None:
             # `.env` is ignored by Git and should not be committed.
 
             BRAVE_API_KEY=
+
+            # Optional: get a Telegram message when a job/branch completes.
+            # Create a bot with @BotFather for the token, and get your numeric
+            # chat id from @userinfobot. Leave blank to disable.
+            TELEGRAM_BOT_TOKEN=
+            TELEGRAM_CHAT_ID=
             """
         ),
     )
@@ -384,6 +390,130 @@ def load_project_env(root: Path) -> dict[str, Any]:
         "sources": sources,
         "configured": configured,
     }
+
+
+def telegram_config_for_root(root: Path) -> tuple[str, str]:
+    """Return (bot_token, chat_id) from the project's .env files, if configured."""
+    try:
+        values, _ = read_project_env(root)
+    except Exception:  # noqa: BLE001 - config read must never break job completion
+        return "", ""
+    return values.get("TELEGRAM_BOT_TOKEN", "").strip(), values.get("TELEGRAM_CHAT_ID", "").strip()
+
+
+def send_telegram_message(token: str, chat_id: str, text: str, timeout: int = 8) -> None:
+    """Send a Telegram text message via the Bot API. Raises on failure."""
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode("utf-8")
+    request = urllib.request.Request(url, data=data, method="POST")
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        response.read()
+
+
+def send_telegram_document(
+    token: str,
+    chat_id: str,
+    filename: str,
+    content: bytes,
+    caption: str = "",
+    timeout: int = 20,
+) -> None:
+    """Upload a document to a Telegram chat via the Bot API. Raises on failure.
+
+    Used to deliver long content (e.g. an answer) as a .txt attachment so the
+    chat is not flooded with a huge text message.
+    """
+    url = f"https://api.telegram.org/bot{token}/sendDocument"
+    boundary = "----ctxgit" + os.urandom(16).hex()
+    crlf = b"\r\n"
+    parts: list[bytes] = []
+
+    def field(name: str, value: str) -> None:
+        parts.append(f"--{boundary}".encode("utf-8"))
+        parts.append(f'Content-Disposition: form-data; name="{name}"'.encode("utf-8"))
+        parts.append(b"")
+        parts.append(value.encode("utf-8"))
+
+    field("chat_id", chat_id)
+    if caption:
+        field("caption", caption)
+    parts.append(f"--{boundary}".encode("utf-8"))
+    parts.append(
+        f'Content-Disposition: form-data; name="document"; filename="{filename}"'.encode("utf-8")
+    )
+    parts.append(b"Content-Type: text/plain; charset=utf-8")
+    parts.append(b"")
+    parts.append(content)
+    parts.append(f"--{boundary}--".encode("utf-8"))
+    parts.append(b"")
+    body = crlf.join(parts)
+    request = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        response.read()
+
+
+def job_answer_text(job: dict[str, Any]) -> str:
+    """Best-effort extraction of the assistant answer from a finished job."""
+    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+    history = payload.get("history")
+    if isinstance(history, list):
+        for record in reversed(history):
+            if isinstance(record, dict) and record.get("role") == "assistant":
+                text = str(record.get("text") or "").strip()
+                if text:
+                    return text
+    return ""
+
+
+def job_branch_label(job: dict[str, Any]) -> str:
+    """Best-effort human label for the branch a job worked on."""
+    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+    for candidate in (job.get("branch"), payload.get("branch"), meta.get("id")):
+        text = str(candidate or "").strip()
+        if text:
+            return text
+    return str(job.get("mode") or job.get("kind") or "job").strip() or "job"
+
+
+def notify_job_completion_telegram(job: dict[str, Any]) -> None:
+    """Fire a best-effort Telegram message that a branch's job completed.
+
+    Never raises: config problems or network errors must not affect the job.
+    """
+    try:
+        root_value = str(job.get("projectPath") or "").strip()
+        if not root_value:
+            return
+        token, chat_id = telegram_config_for_root(Path(root_value))
+        if not token or not chat_id:
+            return
+        label = job_branch_label(job)
+        caption = f'✅ ctxgit: branch "{label}" complete'
+        answer = job_answer_text(job)
+
+        def worker() -> None:
+            try:
+                if answer:
+                    # Deliver the answer as a .txt attachment so long output does
+                    # not clutter the chat; the short status rides along as caption.
+                    filename = f"{slugify(label, fallback='branch')}-answer.txt"
+                    send_telegram_document(
+                        token, chat_id, filename, answer.encode("utf-8"), caption=caption
+                    )
+                else:
+                    send_telegram_message(token, chat_id, caption)
+            except Exception:  # noqa: BLE001 - best-effort notification
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+    except Exception:  # noqa: BLE001 - best-effort notification
+        pass
 
 
 def ensure_project_gitignore(root: Path) -> None:
@@ -9524,6 +9654,7 @@ class JobStore:
                     job["updatedAt"] = utc_now()
                     job.setdefault("events", []).append({"message": "완료됨", "createdAt": job["updatedAt"]})
                     self.persist_locked(job)
+                notify_job_completion_telegram(job)
             except ChatTimeoutError as exc:
                 self.fail(job_id, "timeout", str(exc))
             except JobCancelledError:
@@ -9670,6 +9801,8 @@ class JobStore:
             job["workerStatus"] = "finished"
             job["updatedAt"] = now
             self.persist_locked(job)
+        if not error:
+            notify_job_completion_telegram(job)
         return self.snapshot(job_id)
 
     def add_event(self, job_id: str, message: str) -> None:
