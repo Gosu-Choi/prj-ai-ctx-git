@@ -411,22 +411,39 @@ class CtxgitTest(unittest.TestCase):
             self.assertEqual(ctxgit.resource_kind_for_path(root / "deck.pptx"), "pptx")
             self.assertFalse((root / "contexts/branches/source/resources/deck.pptx.meta.json").exists())
 
-    def test_branch_resource_upload_rejects_unsupported_resource(self) -> None:
+    def test_branch_resource_upload_accepts_any_extension(self) -> None:
+        # No extension allowlist: resources are referenced by path in the prompt,
+        # not decoded by type, so any file may be attached.
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             store = ctxgit.ContextStore(root)
             store.create_branch("source")
 
-            with self.assertRaises(ValueError):
+            for name, blob in (("data.csv", b"a,b\n1,2\n"), ("weird.xyz", b"\x00\x01\xff")):
                 ctxgit.upload_branch_source_file_chunk(
                     store,
                     "source",
-                    "program.exe",
-                    base64.b64encode(b"exe").decode("ascii"),
+                    name,
+                    base64.b64encode(blob).decode("ascii"),
                     0,
-                    3,
+                    len(blob),
                     last_chunk=True,
                 )
+            payload = ctxgit.finish_branch_source_upload(store, "source", ["data.csv", "weird.xyz"])
+
+            paths = [item["path"] for item in payload["uploadedResources"]]
+            self.assertEqual(
+                paths,
+                [
+                    "contexts/branches/source/resources/data.csv",
+                    "contexts/branches/source/resources/weird.xyz",
+                ],
+            )
+            self.assertTrue((root / "contexts/branches/source/resources/weird.xyz").exists())
+            self.assertEqual(ctxgit.resource_kind_for_path(root / "data.csv"), "csv")
+            # Path traversal is still rejected regardless of extension.
+            with self.assertRaises(ValueError):
+                ctxgit.branch_source_upload_relative_path("../escape.csv")
 
     def test_auth_store_first_signup_login_and_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

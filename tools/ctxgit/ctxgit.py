@@ -8899,9 +8899,8 @@ def branch_source_upload_relative_path(path_value: str) -> Path:
     rel = safe_upload_relative_path(path_value)
     if len(rel.parts) != 1 and not (len(rel.parts) == 2 and rel.parts[0] == "browser-data"):
         raise ValueError("branch resource upload accepts files or browser-data files")
-    if rel.suffix.lower() not in BRANCH_RESOURCE_EXTENSIONS:
-        supported = ", ".join(sorted(BRANCH_RESOURCE_EXTENSIONS))
-        raise ValueError(f"unsupported branch resource file type: {rel.suffix or '(none)'}; supported: {supported}")
+    # Any file type may be attached: resources are referenced by path in the prompt,
+    # not decoded by extension, so there is no allowlist to enforce here.
     return rel
 
 

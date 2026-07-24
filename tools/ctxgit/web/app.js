@@ -1185,23 +1185,11 @@ function stageBranchResourceFiles(fileList) {
     showChatError("Select an active writable branch before staging resource files.");
     return;
   }
-  const supported = [];
-  const unsupported = [];
-  for (const file of files) {
-    if (BRANCH_RESOURCE_EXTENSIONS.has(fileExtension(file.name))) {
-      supported.push(file);
-    } else {
-      unsupported.push(file.name);
-    }
-  }
-  if (unsupported.length) {
-    showChatError(`Unsupported resource file type: ${unsupported.slice(0, 4).join(", ")}${unsupported.length > 4 ? ", ..." : ""}`);
-  } else {
-    hideChatError();
-  }
-  if (!supported.length) return;
+  // Any file type may be attached: resources are referenced by path (name/size) in
+  // the prompt, so there is no extension allowlist to filter against here.
+  hideChatError();
   const existing = stagedBranchResources(branch);
-  state.branchResourceStaged[branch] = [...existing, ...supported];
+  state.branchResourceStaged[branch] = [...existing, ...files];
   renderBranchResourceStage();
 }
 
