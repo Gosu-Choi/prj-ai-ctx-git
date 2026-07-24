@@ -463,7 +463,11 @@ function isProjectFilePath(path) {
 
 function renderProjectFileLink(path, labelHtml = escapeHtml(path)) {
   if (!state.project?.path || !isProjectFilePath(path)) return labelHtml;
-  return `<a class="file-link" href="${escapeHtml(obsidianFileUrl(path))}" title="Open in Obsidian">${labelHtml}</a>`;
+  // Markdown opens in Obsidian; every other file opens with the OS default app.
+  if (fileExtension(path) === ".md") {
+    return `<a class="file-link" href="${escapeHtml(obsidianFileUrl(path))}" title="Open in Obsidian">${labelHtml}</a>`;
+  }
+  return `<a class="file-link" href="#" data-open-file="${escapeHtml(path)}" title="Open with default app">${labelHtml}</a>`;
 }
 
 function renderCodeSpan(text) {
@@ -4679,6 +4683,19 @@ els.openBranchDirButton?.addEventListener("click", async () => {
   } finally {
     els.openBranchDirButton.disabled = false;
   }
+});
+
+// Non-markdown project file links open with the OS default app (delegated, since
+// these links are injected as innerHTML across many render sites).
+document.addEventListener("click", (event) => {
+  const link = event.target?.closest?.("[data-open-file]");
+  if (!link) return;
+  event.preventDefault();
+  const path = link.dataset.openFile || "";
+  if (!path) return;
+  api("/api/project/file/open", { method: "POST", body: JSON.stringify({ path }) }).catch((error) => {
+    window.alert(`파일을 열 수 없습니다: ${error.message}`);
+  });
 });
 
 els.parentBranchButton?.addEventListener("click", async () => {

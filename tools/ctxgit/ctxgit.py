@@ -884,6 +884,18 @@ def open_path_in_file_browser(path: Path) -> None:
         subprocess.Popen(["xdg-open", target])
 
 
+def open_file_in_default_app(path: Path) -> None:
+    """Open the given file with the OS default application for its type."""
+    target = str(path)
+    if sys.platform == "darwin":
+        subprocess.Popen(["open", target])
+    elif os.name == "nt" or sys.platform.startswith("win"):
+        # os.startfile launches a file with its associated default program.
+        os.startfile(target)  # type: ignore[attr-defined]  # noqa: S606 - Windows-only
+    else:
+        subprocess.Popen(["xdg-open", target])
+
+
 def discover_workspace_root(start: Path) -> Path | None:
     current = start.resolve()
     for candidate in [current, *current.parents]:
@@ -10864,6 +10876,22 @@ def make_handler(
                     self.send_json({"error": "reveal_failed", "message": str(exc)}, status=500)
                     return
                 self.send_json({"ok": True, "path": relpath(root, directory)})
+                return
+            if parsed.path == "/api/project/file/open":
+                try:
+                    target = resolve_project_file(root, str(body.get("path") or ""))
+                except FileNotFoundError:
+                    self.send_json({"error": "file_not_found", "message": "File not found."}, status=404)
+                    return
+                except (SystemExit, ValueError) as exc:
+                    self.send_json({"error": "invalid_path", "message": str(exc) or "Cannot open file."}, status=400)
+                    return
+                try:
+                    open_file_in_default_app(target.resolve())
+                except Exception as exc:  # noqa: BLE001 - surface any launch failure to the UI
+                    self.send_json({"error": "open_failed", "message": str(exc)}, status=500)
+                    return
+                self.send_json({"ok": True, "path": relpath(root, target)})
                 return
             if parsed.path == "/api/branch/clone":
                 source_id = str(body.get("source") or "")
