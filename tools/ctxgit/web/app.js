@@ -35,6 +35,10 @@ const state = {
 };
 
 const CONTEXT_CHAT_KEY = "__contexts__";
+// Unread-completion tab indicator state (see updateUnseenTabIndicator).
+const BASE_DOCUMENT_TITLE = document.title || "ctxgit";
+const notifiedDoneJobs = new Set();
+const observedJobStatus = new Map();
 const UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024;
 const PROJECT_SESSION_KEY = "ctxgit.activeProjectPath";
 const EVENT_PANEL_STORAGE_KEY = "ctxgit.eventsVisible";
@@ -122,6 +126,7 @@ const els = {
   activeTitle: document.querySelector("#activeTitle"),
   activeMeta: document.querySelector("#activeMeta"),
   openBranchDirButton: document.querySelector("#openBranchDirButton"),
+  parentBranchButton: document.querySelector("#parentBranchButton"),
   chatTab: document.querySelector("#chatTab"),
   chatMain: document.querySelector(".chat-main"),
   messageList: document.querySelector("#messageList"),
@@ -1501,6 +1506,7 @@ function renderBranches() {
     button.addEventListener("click", () => loadView(button.dataset.view));
   });
   renderGlobalizedList();
+  updateUnseenTabIndicator();
 }
 
 function renderGlobalizedList() {
@@ -2964,6 +2970,7 @@ function renderBranch(payload) {
   }
   els.activeTitle.textContent = meta.title || meta.id;
   setBranchDirButton(meta.id);
+  setBranchParentButton(meta);
   els.activeMeta.textContent = archived
     ? `${meta.id} · archived branch · read only`
     : `${meta.id} · history.jsonl is Git-tracked conversation history`;
@@ -4356,6 +4363,9 @@ async function sendComposerMessage({ mode, runningAction = "stop" }) {
     return;
   }
   const requestedMode = isContextChat ? "context-chat" : isResearch ? "research" : isTeam ? "team" : isInfoChat ? "info-chat" : "chat";
+  // Ask for desktop-notification permission on this user gesture so a finished
+  // background job can pop a native notification (best-effort; tab badge works regardless).
+  ensureNotificationPermission();
   state.startingBranches[branch] = requestedMode;
   markBranchActivity(branch);
   updateComposerState();
@@ -4616,6 +4626,40 @@ function setBranchDirButton(branchId) {
   } else {
     delete els.openBranchDirButton.dataset.branch;
     els.openBranchDirButton.hidden = true;
+    // No active branch: hide the parent button too (renderBranch re-shows it).
+    if (els.parentBranchButton) {
+      els.parentBranchButton.hidden = true;
+      delete els.parentBranchButton.dataset.parent;
+    }
+  }
+}
+
+// Primary parent of a branch, mirroring the server's precedence in
+// internal_git_parent_refs_for_branch: parent → forkedFrom/clonedFrom →
+// parents[] → merge.sourceBranches[]. Returns "" for a root branch.
+function primaryParentBranchId(meta) {
+  if (!meta || typeof meta !== "object") return "";
+  const clean = (value) => (typeof value === "string" ? value.trim() : "");
+  const candidates = [clean(meta.parent), clean(meta.forkedFrom), clean(meta.clonedFrom)];
+  if (Array.isArray(meta.parents)) {
+    candidates.push(...meta.parents.map(clean));
+  }
+  if (meta.merge && Array.isArray(meta.merge.sourceBranches)) {
+    candidates.push(...meta.merge.sourceBranches.map(clean));
+  }
+  return candidates.find((id) => id) || "";
+}
+
+function setBranchParentButton(meta) {
+  if (!els.parentBranchButton) return;
+  const parent = primaryParentBranchId(meta);
+  els.parentBranchButton.hidden = false;
+  if (parent) {
+    els.parentBranchButton.dataset.parent = parent;
+    els.parentBranchButton.title = `Go to parent branch: ${parent}`;
+  } else {
+    delete els.parentBranchButton.dataset.parent;
+    els.parentBranchButton.title = "This branch has no parent (root branch)";
   }
 }
 
@@ -4636,6 +4680,138 @@ els.openBranchDirButton?.addEventListener("click", async () => {
     els.openBranchDirButton.disabled = false;
   }
 });
+
+els.parentBranchButton?.addEventListener("click", async () => {
+  const parent = els.parentBranchButton.dataset.parent || "";
+  if (!parent) {
+    window.alert("이 브랜치는 부모 브랜치가 없습니다 (최상위 브랜치).");
+    return;
+  }
+  const isActive = Array.isArray(state.branches) && state.branches.some((item) => item.id === parent);
+  const isArchived = Array.isArray(state.archived) && state.archived.some((item) => item.id === parent);
+  if (!isActive && !isArchived) {
+    window.alert(`부모 브랜치를 찾을 수 없습니다: ${parent}`);
+    return;
+  }
+  // Archived branches open with the same loader (read-only view), so navigate either way.
+  await loadBranch(parent);
+});
+
+// ---------------------------------------------------------------------------
+// Unread-completion tab indicator
+//
+// When any branch's job finishes ("초록불" / done) and has not been opened yet,
+// reflect it in the browser tab so it is visible even when ctxgit is in a
+// background tab: an unread count in the document title and a green dot on the
+// favicon (works in every browser, no permission needed). As a bonus, a native
+// desktop notification fires on the running→done transition where the browser
+// grants permission (Chrome, Firefox, Safari, ...).
+// (BASE_DOCUMENT_TITLE / notifiedDoneJobs / observedJobStatus are declared near
+// the top of this file so they are initialized before any render runs.)
+// ---------------------------------------------------------------------------
+
+function unseenDoneBranchJobs() {
+  const result = [];
+  for (const [branch, jobId] of Object.entries(state.branchJobs || {})) {
+    const job = jobId ? state.jobs[jobId] : null;
+    if (job?.status === "done" && !isBranchJobAcknowledged(branch)) {
+      result.push({ branch, job });
+    }
+  }
+  return result;
+}
+
+function faviconLinkElement() {
+  let link = document.querySelector('link[rel~="icon"]');
+  if (!link) {
+    link = document.createElement("link");
+    link.rel = "icon";
+    document.head.appendChild(link);
+  }
+  return link;
+}
+
+function renderFaviconDataUrl(count) {
+  const size = 64;
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return "";
+  ctx.fillStyle = "#1f2430";
+  ctx.fillRect(0, 0, size, size);
+  ctx.fillStyle = "#e6e6e6";
+  ctx.font = "bold 34px sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText("cg", size / 2, size / 2 + 2);
+  if (count > 0) {
+    const r = 19;
+    ctx.beginPath();
+    ctx.arc(size - r, r, r, 0, Math.PI * 2);
+    ctx.fillStyle = "#2ecc71";
+    ctx.fill();
+    ctx.fillStyle = "#0b1220";
+    ctx.font = "bold 26px sans-serif";
+    ctx.fillText(count > 9 ? "9+" : String(count), size - r, r + 1);
+  }
+  return canvas.toDataURL("image/png");
+}
+
+function maybeShowDesktopNotification(branch, job) {
+  if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
+  // Skip if the user is already looking at this branch in a focused tab.
+  if (activeChatKey() === branch && document.hasFocus()) return;
+  const label = branch === CONTEXT_CHAT_KEY ? "Contexts chat" : branchTitle(branch) || branch;
+  try {
+    const notification = new Notification("ctxgit — 작업 완료", {
+      body: `${label} 작업이 끝났습니다.`,
+      tag: `ctxgit-job-${job.id}`,
+    });
+    notification.onclick = () => {
+      window.focus();
+      if (branch === CONTEXT_CHAT_KEY) {
+        loadContextChat().catch(() => {});
+      } else {
+        loadBranch(branch).catch(() => {});
+      }
+      notification.close();
+    };
+  } catch (_error) {
+    // Notifications are best-effort; ignore construction failures.
+  }
+}
+
+function updateUnseenTabIndicator() {
+  const unseen = unseenDoneBranchJobs();
+  const count = unseen.length;
+  document.title = count > 0 ? `(${count}) ${BASE_DOCUMENT_TITLE}` : BASE_DOCUMENT_TITLE;
+  try {
+    faviconLinkElement().href = renderFaviconDataUrl(count);
+  } catch (_error) {
+    // Canvas may be unavailable; the title indicator still works.
+  }
+  // Fire a desktop notification only for jobs we actually watched go running→done
+  // this session, so a page reload with old unread jobs does not spam popups.
+  for (const { branch, job } of unseen) {
+    if (observedJobStatus.get(job.id) === "running" && !notifiedDoneJobs.has(job.id)) {
+      notifiedDoneJobs.add(job.id);
+      maybeShowDesktopNotification(branch, job);
+    }
+  }
+  observedJobStatus.clear();
+  for (const jobId of Object.values(state.branchJobs || {})) {
+    const status = jobId ? state.jobs[jobId]?.status : null;
+    if (status) observedJobStatus.set(jobId, status);
+  }
+}
+
+function ensureNotificationPermission() {
+  if (typeof Notification === "undefined") return;
+  if (Notification.permission === "default") {
+    Notification.requestPermission().catch(() => {});
+  }
+}
 
 els.eventPanelToggle.addEventListener("click", () => {
   setEventPanelVisible(!state.eventsVisible);
