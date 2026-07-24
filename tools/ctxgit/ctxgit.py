@@ -219,6 +219,17 @@ def slugify(value: str, fallback: str = "note") -> str:
     return slug[:80] or fallback
 
 
+def sanitize_artifact_extension(extension: str | None, fallback: str = "md") -> str:
+    """Normalize a model-supplied artifact extension to a safe bare suffix.
+
+    Returns a lowercase alphanumeric extension without the leading dot (e.g.
+    "html", "csv"); falls back to markdown when missing or unusable.
+    """
+    raw = str(extension or "").strip().lower().lstrip(".")
+    cleaned = re.sub(r"[^a-z0-9]+", "", raw)
+    return cleaned[:12] or fallback
+
+
 def read_text(path: Path, default: str = "") -> str:
     try:
         return path.read_text(encoding="utf-8")
@@ -2161,18 +2172,26 @@ class ContextStore:
         self.touch_branch(branch_id)
         return note_path
 
-    def add_artifact(self, branch_id: str, title: str, body: str, kind: str = "artifact") -> Path:
+    def add_artifact(
+        self,
+        branch_id: str,
+        title: str,
+        body: str,
+        kind: str = "artifact",
+        extension: str | None = None,
+    ) -> Path:
         paths = self.branch_paths(branch_id)
         if not paths.root.exists():
             die(f"branch does not exist: {branch_id}")
         paths.artifacts.mkdir(parents=True, exist_ok=True)
         now = utc_now()
         safe_kind = slugify(kind, fallback="artifact")
-        file_name = f"{now.replace(':', '').replace('-', '')}-{safe_kind}-{slugify(title)}.md"
+        ext = sanitize_artifact_extension(extension)
+        file_name = f"{now.replace(':', '').replace('-', '')}-{safe_kind}-{slugify(title)}.{ext}"
         artifact_path = paths.artifacts / file_name
-        write_text(
-            artifact_path,
-            "\n".join(
+        if ext in {"md", "markdown"}:
+            # Markdown artifacts keep the readable metadata header.
+            content = "\n".join(
                 [
                     f"# {title}",
                     "",
@@ -2188,8 +2207,11 @@ class ContextStore:
                     body.strip(),
                     "",
                 ]
-            ),
-        )
+            )
+        else:
+            # Any other format is written verbatim so it stays valid (HTML, CSV, JSON, ...).
+            content = body if body.endswith("\n") else body + "\n"
+        write_text(artifact_path, content)
         self.touch_branch(branch_id)
         return artifact_path
 
@@ -5500,13 +5522,16 @@ def build_chat_prompt(
             "",
             "Return JSON only. The JSON must have:",
             "- assistant: string conversational answer to show in the chat timeline.",
-            "- artifacts: array of zero or more markdown artifacts.",
+            "- artifacts: array of zero or more artifacts (markdown by default; use another format when asked).",
             "- approvalRequests: array of zero or more outside-workspace write requests.",
             "",
             "Each artifact may have:",
             "- kind: short kind such as research-note, synthesis, source-map, decision-record, report-draft.",
             "- title: short title.",
-            "- body: markdown body.",
+            "- body: the artifact content itself, as raw text in the chosen format.",
+            "- extension: optional file extension without the dot (default \"md\"). Set it to the format the",
+            "  user asked for, e.g. html, csv, json, txt, svg. When it is not \"md\", body must be raw content",
+            "  of that format only (e.g. a full HTML document for \"html\") with no markdown wrapper.",
             "",
             "Each approval request must have:",
             "- path: absolute outside-workspace file or directory path.",
@@ -5763,6 +5788,7 @@ def chat_output_schema() -> dict[str, Any]:
                         "kind": {"type": "string"},
                         "title": {"type": "string"},
                         "body": {"type": "string"},
+                        "extension": {"type": "string"},
                     },
                 },
             },
@@ -7163,9 +7189,10 @@ def run_chat_turn(
         title = str(artifact.get("title") or "Untitled artifact").strip()
         body = str(artifact.get("body") or "").strip()
         kind = str(artifact.get("kind") or "artifact").strip()
+        extension = str(artifact.get("extension") or "").strip()
         if not body:
             continue
-        path = store.add_artifact(branch_id, title, body, kind=kind)
+        path = store.add_artifact(branch_id, title, body, kind=kind, extension=extension)
         artifact_refs.append({"kind": kind, "title": title, "path": relpath(root, path)})
     seen_artifact_paths = {str(item.get("path") or "") for item in artifact_refs}
     artifact_refs.extend(item for item in direct_markdown_refs if item.get("path") not in seen_artifact_paths)

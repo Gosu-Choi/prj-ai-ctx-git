@@ -445,6 +445,33 @@ class CtxgitTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 ctxgit.branch_source_upload_relative_path("../escape.csv")
 
+    def test_sanitize_artifact_extension(self) -> None:
+        self.assertEqual(ctxgit.sanitize_artifact_extension(""), "md")
+        self.assertEqual(ctxgit.sanitize_artifact_extension(None), "md")
+        self.assertEqual(ctxgit.sanitize_artifact_extension("HTML"), "html")
+        self.assertEqual(ctxgit.sanitize_artifact_extension(".Json"), "json")
+        # Unsafe characters are stripped so the extension can never escape the name.
+        self.assertEqual(ctxgit.sanitize_artifact_extension("../evil sh"), "evilsh")
+
+    def test_add_artifact_honors_extension_and_only_wraps_markdown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("source")
+
+            md_path = store.add_artifact("source", "My Report", "- one", kind="report-draft")
+            self.assertTrue(md_path.name.endswith(".md"))
+            md_text = md_path.read_text(encoding="utf-8")
+            self.assertIn("## Artifact Metadata", md_text)
+            self.assertIn("- one", md_text)
+
+            html = "<!doctype html><html><body><h1>Hi</h1></body></html>"
+            html_path = store.add_artifact("source", "Dashboard HTML", html, kind="report-draft", extension="html")
+            self.assertTrue(html_path.name.endswith(".html"))
+            # Non-markdown artifacts are written verbatim, with no markdown wrapper.
+            self.assertEqual(html_path.read_text(encoding="utf-8"), html + "\n")
+            self.assertNotIn("Artifact Metadata", html_path.read_text(encoding="utf-8"))
+
     def test_auth_store_first_signup_login_and_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
