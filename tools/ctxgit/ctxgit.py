@@ -392,6 +392,29 @@ def load_project_env(root: Path) -> dict[str, Any]:
     }
 
 
+def global_settings_path() -> Path:
+    """Path to machine-wide ctxgit settings (not project-scoped)."""
+    return Path.home() / ".ctxgit" / "settings.json"
+
+
+def read_global_settings() -> dict[str, Any]:
+    path = global_settings_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def write_global_settings(settings: dict[str, Any]) -> None:
+    dump_json(global_settings_path(), settings)
+
+
+def telegram_notify_enabled() -> bool:
+    """Global on/off for Telegram completion messages. Defaults to on."""
+    return bool(read_global_settings().get("telegramNotifyEnabled", True))
+
+
 def telegram_config_for_root(root: Path) -> tuple[str, str]:
     """Return (bot_token, chat_id) from the project's .env files, if configured."""
     try:
@@ -487,6 +510,8 @@ def notify_job_completion_telegram(job: dict[str, Any]) -> None:
     Never raises: config problems or network errors must not affect the job.
     """
     try:
+        if not telegram_notify_enabled():
+            return
         root_value = str(job.get("projectPath") or "").strip()
         if not root_value:
             return
@@ -10321,6 +10346,15 @@ def make_handler(
             if parsed.path == "/api/provider/status":
                 self.send_json(provider_status(root))
                 return True
+            if parsed.path == "/api/settings/notifications":
+                token, chat_id = telegram_config_for_root(root)
+                self.send_json(
+                    {
+                        "telegramNotifyEnabled": telegram_notify_enabled(),
+                        "telegramConfigured": bool(token and chat_id),
+                    }
+                )
+                return True
             if parsed.path == "/api/project/files":
                 try:
                     self.send_json(project_files_payload(root, (query.get("path") or [""])[0]))
@@ -11025,6 +11059,17 @@ def make_handler(
                     self.send_json({"error": "open_failed", "message": str(exc)}, status=500)
                     return
                 self.send_json({"ok": True, "path": relpath(root, target)})
+                return
+            if parsed.path == "/api/settings/notifications":
+                enabled = bool(body.get("telegramNotifyEnabled"))
+                settings = read_global_settings()
+                settings["telegramNotifyEnabled"] = enabled
+                try:
+                    write_global_settings(settings)
+                except Exception as exc:  # noqa: BLE001 - surface persistence failure
+                    self.send_json({"error": "settings_write_failed", "message": str(exc)}, status=500)
+                    return
+                self.send_json({"telegramNotifyEnabled": enabled})
                 return
             if parsed.path == "/api/branch/clone":
                 source_id = str(body.get("source") or "")

@@ -178,6 +178,8 @@ const els = {
   historyChatButton: document.querySelector("#historyChatButton"),
   teamButton: document.querySelector("#teamButton"),
   refreshButton: document.querySelector("#refreshButton"),
+  telegramNotifyInput: document.querySelector("#telegramNotifyInput"),
+  telegramNotifyStatus: document.querySelector("#telegramNotifyStatus"),
   sequenceRoomCreateButton: document.querySelector("#sequenceRoomCreateButton"),
   sequenceRoomUpdateButton: document.querySelector("#sequenceRoomUpdateButton"),
   sequenceRoomDialog: document.querySelector("#sequenceRoomDialog"),
@@ -3382,6 +3384,7 @@ async function loadProject() {
     renderGit(await api("/api/git/status"));
     renderProvider(await api("/api/provider/status"));
     await loadWorkerStatus();
+    loadNotificationSettings().catch(() => {});
   } else if (!project.path) {
     clearWorkspace("Select or initialize a ctxgit project.");
   } else {
@@ -4838,6 +4841,42 @@ els.contextResetButton.addEventListener("click", resetContextChatHistory);
 
 els.refreshButton.addEventListener("click", async () => {
   await loadProject();
+});
+
+// Global toggle for Telegram completion messages (one switch controls all projects).
+async function loadNotificationSettings() {
+  if (!els.telegramNotifyInput) return;
+  const settings = await api("/api/settings/notifications");
+  els.telegramNotifyInput.checked = settings.telegramNotifyEnabled !== false;
+  if (els.telegramNotifyStatus) {
+    els.telegramNotifyStatus.textContent = settings.telegramConfigured
+      ? ""
+      : "Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env to enable.";
+  }
+}
+
+els.telegramNotifyInput?.addEventListener("change", async () => {
+  const enabled = els.telegramNotifyInput.checked;
+  els.telegramNotifyInput.disabled = true;
+  try {
+    await api("/api/settings/notifications", {
+      method: "POST",
+      body: JSON.stringify({ telegramNotifyEnabled: enabled }),
+    });
+    if (els.telegramNotifyStatus && !els.telegramNotifyStatus.textContent) {
+      els.telegramNotifyStatus.textContent = enabled ? "On" : "Off";
+      window.setTimeout(() => {
+        if (els.telegramNotifyStatus.textContent === (enabled ? "On" : "Off")) {
+          els.telegramNotifyStatus.textContent = "";
+        }
+      }, 1200);
+    }
+  } catch (error) {
+    els.telegramNotifyInput.checked = !enabled;
+    window.alert(`알림 설정 저장 실패: ${error.message}`);
+  } finally {
+    els.telegramNotifyInput.disabled = false;
+  }
 });
 
 restoreEventPanelVisibility();
