@@ -605,6 +605,45 @@ def notify_job_completion_telegram(job: dict[str, Any]) -> None:
         pass
 
 
+def notify_sequence_reply_telegram(
+    root: Path,
+    label: str,
+    order: int,
+    reply_index: int,
+    text: str,
+) -> None:
+    """Best-effort Telegram send for a single sequence-room agent reply.
+
+    Used when a room has per-reply notification enabled, so each agent's answer
+    arrives as its own .txt attachment. Still gated by the global master toggle.
+    Never raises.
+    """
+    try:
+        if not telegram_notify_enabled():
+            return
+        token, chat_id = telegram_config_for_root(root)
+        if not token or not chat_id:
+            return
+        caption = f'✅ ctxgit: branch "{label}" — agent {order} reply {reply_index} complete'
+        answer = (text or "").strip()
+
+        def worker() -> None:
+            try:
+                if answer:
+                    filename = f"{slugify(label, fallback='branch')}-agent{order}-reply{reply_index}.txt"
+                    send_telegram_document(
+                        token, chat_id, filename, answer.encode("utf-8"), caption=caption
+                    )
+                else:
+                    send_telegram_message(token, chat_id, caption)
+            except Exception:  # noqa: BLE001 - best-effort notification
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+    except Exception:  # noqa: BLE001 - best-effort notification
+        pass
+
+
 def ensure_project_gitignore(root: Path) -> None:
     path = root / ".gitignore"
     existing = read_text(path)
@@ -2295,6 +2334,9 @@ class ContextStore:
         role = role.strip().lower()
         if role not in {"user", "assistant", "system", "note"}:
             die("role must be one of: user, assistant, system, note")
+        if role == "assistant":
+            # Humanize AI output (plain typography) when the global toggle is on.
+            text = maybe_humanize_output(text)
         record = {
             "schemaVersion": 1,
             "id": new_history_record_id(),
@@ -2348,9 +2390,6 @@ class ContextStore:
         role = role.strip().lower()
         if role not in {"user", "assistant", "system", "note"}:
             die("role must be one of: user, assistant, system, note")
-        if role == "assistant":
-            # Humanize AI output (plain typography) when the global toggle is on.
-            text = maybe_humanize_output(text)
         record = {
             "schemaVersion": 1,
             "id": new_history_record_id(),
@@ -3487,6 +3526,18 @@ class ContextStore:
         if update_evaluator:
             config["stopDecider"] = evaluator_order
         config["speakingOrderUpdatedAt"] = utc_now()
+        meta["sequenceRoom"] = config
+        dump_json(paths.meta, meta)
+        self.touch_branch(branch_id)
+        return config
+
+    def set_sequence_notify_each_reply(self, branch_id: str, enabled: bool) -> dict[str, Any]:
+        """Per-room toggle: send a Telegram message for every agent reply."""
+        paths = self.branch_paths(branch_id)
+        meta = load_json(paths.meta)
+        config = self.sequence_room_config(branch_id)
+        config["notifyEachReply"] = bool(enabled)
+        config["notifyEachReplyUpdatedAt"] = utc_now()
         meta["sequenceRoom"] = config
         dump_json(paths.meta, meta)
         self.touch_branch(branch_id)
@@ -8055,6 +8106,7 @@ def run_sequence_room_turn(
     progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     config = store.sequence_room_config(branch_id)
+    notify_each_reply = bool(config.get("notifyEachReply"))
     selected_provider = str(read_llm_config(root).get("provider") or "codex")
     participants = config.get("participants") if isinstance(config.get("participants"), list) else []
     if len(participants) < 2:
@@ -8201,6 +8253,8 @@ def run_sequence_room_turn(
                 ),
             },
         )
+        if notify_each_reply:
+            notify_sequence_reply_telegram(root, branch_id, order, reply_index + 1, text)
         transcript.record(
             "stage",
             role=f"agent-{order}",
@@ -11051,6 +11105,17 @@ def make_handler(
                     self.send_json(payload)
                 except (TypeError, ValueError) as exc:
                     self.send_json({"error": "sequence_room_order_failed", "message": str(exc)}, status=400)
+                return
+            if parsed.path == "/api/sequence-room/notify":
+                branch_id = str(body.get("branch") or "")
+                enabled = bool(body.get("notifyEachReply"))
+                try:
+                    config = store.set_sequence_notify_each_reply(branch_id, enabled)
+                    payload = branch_payload(store, branch_id)
+                    payload["sequenceRoom"] = config
+                    self.send_json(payload)
+                except (TypeError, ValueError) as exc:
+                    self.send_json({"error": "sequence_room_notify_failed", "message": str(exc)}, status=400)
                 return
             if parsed.path == "/api/sequence-room/update":
                 try:

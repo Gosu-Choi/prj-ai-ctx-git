@@ -2967,6 +2967,13 @@ function renderBranch(payload) {
   const sequenceRoom = payload.meta?.kind === "sequence-room";
   els.sequenceRoomUpdateButton.hidden = !sequenceRoom;
   els.sequenceOrderPicker.hidden = !sequenceRoom;
+  if (els.sequenceNotifyToggle) {
+    els.sequenceNotifyToggle.hidden = !sequenceRoom;
+    els.sequenceNotifyToggle.setAttribute(
+      "aria-pressed",
+      String(sequenceRoom && payload.sequenceRoom?.notifyEachReply === true),
+    );
+  }
   setSequenceOrderOpen(false);
   if (sequenceRoom) {
     const configuredOrder = Array.isArray(payload.sequenceRoom?.speakingOrder)
@@ -4301,6 +4308,24 @@ els.sequenceRoomUpdateButton.addEventListener("click", async () => {
     .join("");
   await loadSequenceParticipantComparison();
   els.sequenceUpdateDialog.showModal();
+});
+
+els.sequenceNotifyToggle?.addEventListener("click", async () => {
+  const branch = state.activeBranch;
+  if (!branch || state.payload?.meta?.kind !== "sequence-room") return;
+  const next = els.sequenceNotifyToggle.getAttribute("aria-pressed") !== "true";
+  els.sequenceNotifyToggle.disabled = true;
+  try {
+    const payload = await api("/api/sequence-room/notify", {
+      method: "POST",
+      body: JSON.stringify({ branch, notifyEachReply: next }),
+    });
+    if (state.activeBranch === branch) renderBranch(payload);
+  } catch (error) {
+    window.alert(`알림 설정 저장 실패: ${error.message}`);
+  } finally {
+    els.sequenceNotifyToggle.disabled = false;
+  }
 });
 
 els.sequenceUpdateOrder.addEventListener("change", () => {
