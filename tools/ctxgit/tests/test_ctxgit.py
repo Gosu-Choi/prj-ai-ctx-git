@@ -472,6 +472,24 @@ class CtxgitTest(unittest.TestCase):
             self.assertEqual(html_path.read_text(encoding="utf-8"), html + "\n")
             self.assertNotIn("Artifact Metadata", html_path.read_text(encoding="utf-8"))
 
+    def test_humanize_output_text_replaces_typography(self) -> None:
+        out = ctxgit.humanize_output_text(
+            "A — b – c ― d, x → y ⇒ z ← w ↔ v, wait…, “q” ‘r’, 3×4÷2, a≥b≤c≈d, ±5, ™©®"
+        )
+        self.assertEqual(
+            out,
+            'A --- b -- c --- d, x -> y => z <- w <-> v, wait..., "q" \'r\', 3x4/2, a>=b<=c~=d, +/-5, (TM)(c)(R)',
+        )
+
+    def test_humanize_output_text_removes_emoji_and_invisibles(self) -> None:
+        self.assertEqual(ctxgit.humanize_output_text("done ✅ warn ⚠️"), "done  warn ")
+        self.assertEqual(ctxgit.humanize_output_text("a​b﻿c"), "abc")
+        self.assertEqual(ctxgit.humanize_output_text("full（x）："), "full(x):")
+
+    def test_humanize_output_text_preserves_middle_dot_and_bullets(self) -> None:
+        # These are context-dependent and intentionally left untouched.
+        self.assertEqual(ctxgit.humanize_output_text("A·B • item ▪ ▶"), "A·B • item ▪ ▶")
+
     def test_auth_store_first_signup_login_and_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

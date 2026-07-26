@@ -183,8 +183,11 @@ const els = {
   refreshButton: document.querySelector("#refreshButton"),
   telegramNotifyInput: document.querySelector("#telegramNotifyInput"),
   telegramNotifyStatus: document.querySelector("#telegramNotifyStatus"),
+  outputHumanizeInput: document.querySelector("#outputHumanizeInput"),
+  outputHumanizeStatus: document.querySelector("#outputHumanizeStatus"),
   sequenceRoomCreateButton: document.querySelector("#sequenceRoomCreateButton"),
   sequenceRoomUpdateButton: document.querySelector("#sequenceRoomUpdateButton"),
+  sequenceNotifyToggle: document.querySelector("#sequenceNotifyToggle"),
   sequenceRoomDialog: document.querySelector("#sequenceRoomDialog"),
   sequenceRoomForm: document.querySelector("#sequenceRoomForm"),
   sequenceAgentRows: document.querySelector("#sequenceAgentRows"),
@@ -4874,38 +4877,62 @@ els.branchesToggle?.addEventListener("click", () => {
 
 // Global toggle for Telegram completion messages (one switch controls all projects).
 async function loadNotificationSettings() {
-  if (!els.telegramNotifyInput) return;
+  if (!els.telegramNotifyInput && !els.outputHumanizeInput) return;
   const settings = await api("/api/settings/notifications");
-  els.telegramNotifyInput.checked = settings.telegramNotifyEnabled !== false;
+  if (els.telegramNotifyInput) {
+    els.telegramNotifyInput.checked = settings.telegramNotifyEnabled !== false;
+  }
   if (els.telegramNotifyStatus) {
     els.telegramNotifyStatus.textContent = settings.telegramConfigured
       ? ""
       : "Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env to enable.";
   }
+  if (els.outputHumanizeInput) {
+    els.outputHumanizeInput.checked = settings.outputHumanizeEnabled === true;
+  }
 }
 
-els.telegramNotifyInput?.addEventListener("change", async () => {
-  const enabled = els.telegramNotifyInput.checked;
-  els.telegramNotifyInput.disabled = true;
+// Persist one settings toggle and reflect status; reverts the checkbox on failure.
+async function saveSettingToggle(input, statusEl, key, failLabel) {
+  const enabled = input.checked;
+  input.disabled = true;
   try {
     await api("/api/settings/notifications", {
       method: "POST",
-      body: JSON.stringify({ telegramNotifyEnabled: enabled }),
+      body: JSON.stringify({ [key]: enabled }),
     });
-    if (els.telegramNotifyStatus && !els.telegramNotifyStatus.textContent) {
-      els.telegramNotifyStatus.textContent = enabled ? "On" : "Off";
+    if (statusEl && !statusEl.dataset.sticky) {
+      statusEl.textContent = enabled ? "On" : "Off";
       window.setTimeout(() => {
-        if (els.telegramNotifyStatus.textContent === (enabled ? "On" : "Off")) {
-          els.telegramNotifyStatus.textContent = "";
-        }
+        if (statusEl.textContent === (enabled ? "On" : "Off")) statusEl.textContent = "";
       }, 1200);
     }
   } catch (error) {
-    els.telegramNotifyInput.checked = !enabled;
-    window.alert(`알림 설정 저장 실패: ${error.message}`);
+    input.checked = !enabled;
+    window.alert(`${failLabel}: ${error.message}`);
   } finally {
-    els.telegramNotifyInput.disabled = false;
+    input.disabled = false;
   }
+}
+
+els.telegramNotifyInput?.addEventListener("change", () => {
+  // The status line here doubles as a "configure token" hint, so keep it sticky.
+  if (els.telegramNotifyStatus) els.telegramNotifyStatus.dataset.sticky = "1";
+  saveSettingToggle(
+    els.telegramNotifyInput,
+    els.telegramNotifyStatus,
+    "telegramNotifyEnabled",
+    "알림 설정 저장 실패",
+  );
+});
+
+els.outputHumanizeInput?.addEventListener("change", () => {
+  saveSettingToggle(
+    els.outputHumanizeInput,
+    els.outputHumanizeStatus,
+    "outputHumanizeEnabled",
+    "출력 변환 설정 저장 실패",
+  );
 });
 
 restoreEventPanelVisibility();

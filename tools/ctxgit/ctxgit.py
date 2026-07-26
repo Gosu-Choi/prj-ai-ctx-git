@@ -415,6 +415,70 @@ def telegram_notify_enabled() -> bool:
     return bool(read_global_settings().get("telegramNotifyEnabled", True))
 
 
+def output_humanize_enabled() -> bool:
+    """Global on/off for the plain-typography output transformer. Defaults to off."""
+    return bool(read_global_settings().get("outputHumanizeEnabled", False))
+
+
+# Unicode typography -> plain keyboard equivalents, so AI output reads as if a
+# person typed it. Ordered; longer/more-specific sources first. Deliberately
+# omits the middle dot (·) and bullets (• ▪ ◦ ▶) because their replacement is
+# context-dependent (comma / slash / "와/과" / markdown bullet) and a blanket
+# swap does more harm than good -- detect those by eye instead.
+_HUMANIZE_REPLACEMENTS: tuple[tuple[str, str], ...] = (
+    ("—", "---"),   # — em dash
+    ("―", "---"),   # ― horizontal bar / Korean 줄표
+    ("–", "--"),    # – en dash
+    ("‒", "--"),    # ‒ figure dash
+    ("⇒", "=>"),    # ⇒
+    ("→", "->"),    # →
+    ("↔", "<->"),   # ↔
+    ("←", "<-"),    # ←
+    ("…", "..."),   # …
+    ("“", '"'), ("”", '"'),          # “ ”
+    ("‘", "'"), ("’", "'"),          # ‘ ’
+    ("×", "x"),     # ×
+    ("÷", "/"),     # ÷
+    ("≥", ">="), ("≤", "<="), ("≈", "~="),  # ≥ ≤ ≈
+    ("±", "+/-"),   # ±
+    ("™", "(TM)"), ("©", "(c)"), ("®", "(R)"),  # ™ © ®
+    ("（", "("), ("）", ")"), ("：", ":"),        # fullwidth （）：
+    ("％", "%"), ("～", "~"),                          # fullwidth ％ ～
+    (" ", " "), ("　", " "),          # NBSP, ideographic space
+    ("​", ""), ("‌", ""), ("‍", ""),  # ZWSP, ZWNJ, ZWJ
+    ("⁠", ""), ("﻿", ""),            # WJ, BOM
+)
+
+# Emoji / pictographs -> removed (e.g. ✅ ⚠️ 💡 🚀). Kept separate from the
+# table above because it is a range delete, not a 1:1 swap.
+_EMOJI_RE = re.compile(
+    "[\U0001F300-\U0001FAFF"   # symbols, pictographs, supplemental, extended-A
+    "\U00002600-\U000027BF"    # misc symbols + dingbats (incl. ✅ ⚠)
+    "\U00002B00-\U00002BFF"    # misc symbols and arrows (stars, etc.)
+    "\U0001F1E6-\U0001F1FF"    # regional indicator flags
+    "\U0000FE00-\U0000FE0F]",  # variation selectors (e.g. the ️ in ⚠️)
+)
+
+
+def humanize_output_text(text: str) -> str:
+    """Rewrite Unicode typography as plain keyboard characters.
+
+    Pure and deterministic. Leaves the middle dot and bullets alone (see note on
+    _HUMANIZE_REPLACEMENTS).
+    """
+    if not text:
+        return text
+    for source, target in _HUMANIZE_REPLACEMENTS:
+        if source in text:
+            text = text.replace(source, target)
+    return _EMOJI_RE.sub("", text)
+
+
+def maybe_humanize_output(text: str) -> str:
+    """Apply the output transformer only when the global toggle is on."""
+    return humanize_output_text(text) if output_humanize_enabled() else text
+
+
 def telegram_config_for_root(root: Path) -> tuple[str, str]:
     """Return (bot_token, chat_id) from the project's .env files, if configured."""
     try:
@@ -2284,6 +2348,9 @@ class ContextStore:
         role = role.strip().lower()
         if role not in {"user", "assistant", "system", "note"}:
             die("role must be one of: user, assistant, system, note")
+        if role == "assistant":
+            # Humanize AI output (plain typography) when the global toggle is on.
+            text = maybe_humanize_output(text)
         record = {
             "schemaVersion": 1,
             "id": new_history_record_id(),
@@ -2351,6 +2418,8 @@ class ContextStore:
         if not paths.root.exists():
             die(f"branch does not exist: {branch_id}")
         paths.artifacts.mkdir(parents=True, exist_ok=True)
+        # Humanize file output (plain typography) when the global toggle is on.
+        body = maybe_humanize_output(body)
         now = utc_now()
         safe_kind = slugify(kind, fallback="artifact")
         ext = sanitize_artifact_extension(extension)
@@ -10352,6 +10421,7 @@ def make_handler(
                     {
                         "telegramNotifyEnabled": telegram_notify_enabled(),
                         "telegramConfigured": bool(token and chat_id),
+                        "outputHumanizeEnabled": output_humanize_enabled(),
                     }
                 )
                 return True
@@ -11061,15 +11131,22 @@ def make_handler(
                 self.send_json({"ok": True, "path": relpath(root, target)})
                 return
             if parsed.path == "/api/settings/notifications":
-                enabled = bool(body.get("telegramNotifyEnabled"))
                 settings = read_global_settings()
-                settings["telegramNotifyEnabled"] = enabled
+                # Update only the toggles present in the request body.
+                for key in ("telegramNotifyEnabled", "outputHumanizeEnabled"):
+                    if key in body:
+                        settings[key] = bool(body.get(key))
                 try:
                     write_global_settings(settings)
                 except Exception as exc:  # noqa: BLE001 - surface persistence failure
                     self.send_json({"error": "settings_write_failed", "message": str(exc)}, status=500)
                     return
-                self.send_json({"telegramNotifyEnabled": enabled})
+                self.send_json(
+                    {
+                        "telegramNotifyEnabled": bool(settings.get("telegramNotifyEnabled", True)),
+                        "outputHumanizeEnabled": bool(settings.get("outputHumanizeEnabled", False)),
+                    }
+                )
                 return
             if parsed.path == "/api/branch/clone":
                 source_id = str(body.get("source") or "")
