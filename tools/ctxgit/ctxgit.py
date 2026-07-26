@@ -3532,14 +3532,22 @@ class ContextStore:
         return config
 
     def set_sequence_notify_each_reply(self, branch_id: str, enabled: bool) -> dict[str, Any]:
-        """Per-room toggle: send a Telegram message for every agent reply."""
+        """Per-room toggle: send a Telegram message for every agent reply.
+
+        Can be flipped while a turn is running; the reply loop re-reads it each
+        reply. Holds the meta file lock so a concurrent touch_branch (fired by
+        every append) cannot clobber this write.
+        """
         paths = self.branch_paths(branch_id)
-        meta = load_json(paths.meta)
-        config = self.sequence_room_config(branch_id)
-        config["notifyEachReply"] = bool(enabled)
-        config["notifyEachReplyUpdatedAt"] = utc_now()
-        meta["sequenceRoom"] = config
-        dump_json(paths.meta, meta)
+        with file_write_lock(paths.meta):
+            meta = load_json(paths.meta)
+            config = meta.get("sequenceRoom")
+            if meta.get("kind") != "sequence-room" or not isinstance(config, dict):
+                raise ValueError("branch is not a sequence room")
+            config["notifyEachReply"] = bool(enabled)
+            config["notifyEachReplyUpdatedAt"] = utc_now()
+            meta["sequenceRoom"] = config
+            dump_json(paths.meta, meta)
         self.touch_branch(branch_id)
         return config
 
@@ -8106,7 +8114,6 @@ def run_sequence_room_turn(
     progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     config = store.sequence_room_config(branch_id)
-    notify_each_reply = bool(config.get("notifyEachReply"))
     selected_provider = str(read_llm_config(root).get("provider") or "codex")
     participants = config.get("participants") if isinstance(config.get("participants"), list) else []
     if len(participants) < 2:
@@ -8253,7 +8260,9 @@ def run_sequence_room_turn(
                 ),
             },
         )
-        if notify_each_reply:
+        # Re-read the toggle each reply so it can be switched on mid-run (like the
+        # completion notification), not only if it was on when the turn started.
+        if bool(store.sequence_room_config(branch_id).get("notifyEachReply")):
             notify_sequence_reply_telegram(root, branch_id, order, reply_index + 1, text)
         transcript.record(
             "stage",
