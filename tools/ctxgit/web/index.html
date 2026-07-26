@@ -58,9 +58,27 @@
         </section>
 
         <section class="sidebar-section">
-          <div class="section-title">Branches</div>
-          <button id="contextChatButton" class="wide-button" type="button">Contexts chat</button>
-          <div id="branchList" class="nav-list"></div>
+          <div class="section-title">Notifications</div>
+          <label class="checkbox-label">
+            <input id="telegramNotifyInput" type="checkbox" />
+            <span>Telegram on completion</span>
+          </label>
+          <div id="telegramNotifyStatus" class="settings-status"></div>
+        </section>
+
+        <section class="sidebar-section">
+          <div class="section-title">Sequence room</div>
+          <button id="sequenceRoomCreateButton" class="wide-button" type="button">Create sequence room</button>
+        </section>
+
+        <section class="sidebar-section">
+          <button id="branchesToggle" class="section-title section-toggle" type="button" aria-expanded="true">
+            <span class="section-toggle-caret" aria-hidden="true">▾</span><span>Branches</span>
+          </button>
+          <div id="branchesBody">
+            <button id="contextChatButton" class="wide-button" type="button">Contexts chat</button>
+            <div id="branchList" class="nav-list"></div>
+          </div>
         </section>
 
         <section class="sidebar-section">
@@ -95,23 +113,9 @@
         </section>
 
         <section class="sidebar-section">
-          <div class="section-title">Sequence room</div>
-          <button id="sequenceRoomCreateButton" class="wide-button" type="button">Create sequence room</button>
-        </section>
-
-        <section class="sidebar-section">
           <div class="section-title">Git</div>
           <div id="gitSummary" class="git-summary"></div>
           <button id="refreshButton" class="wide-button" type="button">Refresh</button>
-        </section>
-
-        <section class="sidebar-section">
-          <div class="section-title">Notifications</div>
-          <label class="checkbox-label">
-            <input id="telegramNotifyInput" type="checkbox" />
-            <span>Telegram on completion</span>
-          </label>
-          <div id="telegramNotifyStatus" class="settings-status"></div>
         </section>
 
         <section class="sidebar-section">

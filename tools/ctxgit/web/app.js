@@ -42,6 +42,7 @@ const observedJobStatus = new Map();
 const UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024;
 const PROJECT_SESSION_KEY = "ctxgit.activeProjectPath";
 const EVENT_PANEL_STORAGE_KEY = "ctxgit.eventsVisible";
+const BRANCHES_COLLAPSED_STORAGE_KEY = "ctxgit.branchesCollapsed";
 const BRANCH_RESOURCE_EXTENSIONS = new Set([
   ".bmp",
   ".gif",
@@ -91,6 +92,8 @@ const els = {
   openServerProjectButton: document.querySelector("#openServerProjectButton"),
   serverProjectStatus: document.querySelector("#serverProjectStatus"),
   branchList: document.querySelector("#branchList"),
+  branchesToggle: document.querySelector("#branchesToggle"),
+  branchesBody: document.querySelector("#branchesBody"),
   contextChatButton: document.querySelector("#contextChatButton"),
   branchGraphButton: document.querySelector("#branchGraphButton"),
   viewList: document.querySelector("#viewList"),
@@ -4842,6 +4845,32 @@ els.contextResetButton.addEventListener("click", resetContextChatHistory);
 els.refreshButton.addEventListener("click", async () => {
   await loadProject();
 });
+
+function setBranchesCollapsed(collapsed) {
+  if (!els.branchesToggle || !els.branchesBody) return;
+  els.branchesBody.hidden = collapsed;
+  els.branchesToggle.setAttribute("aria-expanded", String(!collapsed));
+  try {
+    localStorage.setItem(BRANCHES_COLLAPSED_STORAGE_KEY, collapsed ? "1" : "0");
+  } catch (_error) {
+    // localStorage may be unavailable; the toggle still works for this session.
+  }
+}
+
+els.branchesToggle?.addEventListener("click", () => {
+  const expanded = els.branchesToggle.getAttribute("aria-expanded") === "true";
+  setBranchesCollapsed(expanded);
+});
+
+(function restoreBranchesCollapsed() {
+  let collapsed = false;
+  try {
+    collapsed = localStorage.getItem(BRANCHES_COLLAPSED_STORAGE_KEY) === "1";
+  } catch (_error) {
+    collapsed = false;
+  }
+  setBranchesCollapsed(collapsed);
+})();
 
 // Global toggle for Telegram completion messages (one switch controls all projects).
 async function loadNotificationSettings() {
