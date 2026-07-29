@@ -4131,12 +4131,13 @@ els.mergeSourceFilter.addEventListener("input", renderMergeSourcePicker);
 els.mergeForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   const branches = [...state.mergeSelectedBranches];
-  const name = els.mergeNameInput.value.trim();
-  if (branches.length < 2 || !name) {
-    els.mergeStatus.textContent = "Select at least two branches in merge order and enter a new branch id.";
+  const title = els.mergeNameInput.value.trim();
+  if (branches.length < 2 || !title) {
+    els.mergeStatus.textContent = "Select at least two branches in merge order and enter a title.";
     els.mergeStatus.className = "settings-status error";
     return;
   }
+  const name = uniqueBranchIdForTitle(title);
   els.mergeButton.disabled = true;
   els.mergeStatus.textContent = "Starting merge...";
   els.mergeStatus.className = "settings-status";
@@ -4149,7 +4150,7 @@ els.mergeForm.addEventListener("submit", async (event) => {
     renderBranches();
     await startTrackedJob(
       "/api/merge/start",
-      { branches, name, provider: state.provider?.provider || "codex" },
+      { branches, name, title, provider: state.provider?.provider || "codex" },
       { branch: name, mode: "merge", title: "머지 요약 생성 중" },
     );
     state.mergeSelectedBranches = [];
@@ -4768,14 +4769,15 @@ els.parentBranchButton?.addEventListener("click", async () => {
 
 els.contextBranchButton?.addEventListener("click", async () => {
   if (!state.activeContextChat) return;
-  const target = window.prompt("New branch id (letters, digits, - and _):", "");
-  const id = String(target || "").trim();
-  if (!id) return;
+  const title = window.prompt("New branch title:", "");
+  const targetTitle = String(title || "").trim();
+  if (!targetTitle) return;
+  const targetId = uniqueBranchIdForTitle(targetTitle);
   els.contextBranchButton.disabled = true;
   try {
     const payload = await api("/api/context-chat/branch", {
       method: "POST",
-      body: JSON.stringify({ target: id, title: id }),
+      body: JSON.stringify({ target: targetId, title: targetTitle }),
     });
     // Open the freshly created branch and refresh the sidebar to include it.
     state.activeContextChat = false;
