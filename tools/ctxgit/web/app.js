@@ -2902,9 +2902,8 @@ async function monitorTrackedJob(jobId) {
       await refreshSequenceRoomProgress(remembered);
     }
     if (remembered.status === "done") {
-      if (isActiveChat) {
-        acknowledgeBranchJob(branch);
-      }
+      // Do not auto-clear the "done" indicator just because this branch is open;
+      // it clears only when the user engages the input (focuses it). See below.
       await refreshBranchNavigation().catch(() => {});
       if (activeChatKey() === branch) {
         if (remembered.mode === "context-chat" || remembered.payload?.topLevel === true) {
@@ -3507,7 +3506,6 @@ async function loadBranch(branch) {
   state.activeBranch = branch;
   state.activeGlobalized = null;
   state.activeContextChat = false;
-  acknowledgeBranchJob(branch);
   selectTab("chat");
   renderBranches();
   const payload = await api(`/api/branch?id=${encodeURIComponent(branch)}`);
@@ -3526,7 +3524,6 @@ async function loadContextChat() {
   state.activeBranch = null;
   state.activeGlobalized = null;
   state.activeContextChat = true;
-  acknowledgeBranchJob(CONTEXT_CHAT_KEY);
   selectTab("chat");
   renderBranches();
   const payload = await api("/api/context-chat");
@@ -4574,6 +4571,21 @@ els.composer.addEventListener("submit", async (event) => {
   await sendComposerMessage({ mode: "chat", runningAction: "interrupt" });
 });
 
+// Engaging the input (focus, click, or typing) is the explicit "I've seen this"
+// signal: only then does the completion indicator (green dot + tab badge) clear.
+// Just viewing the branch or letting a job finish while it is open no longer
+// clears it, so a finished result stays flagged until you actually act on it.
+function engageActiveChat() {
+  const key = activeChatKey();
+  if (key && !isBranchJobAcknowledged(key)) {
+    acknowledgeBranchJob(key);
+    renderBranches();
+  }
+}
+
+els.messageInput.addEventListener("focus", engageActiveChat);
+els.messageInput.addEventListener("pointerdown", engageActiveChat);
+
 els.messageInput.addEventListener("keydown", async (event) => {
   if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
   event.preventDefault();
@@ -4581,6 +4593,7 @@ els.messageInput.addEventListener("keydown", async (event) => {
 });
 
 els.messageInput.addEventListener("input", () => {
+  engageActiveChat();
   saveActiveDraft();
   resizeMessageInput();
 });
