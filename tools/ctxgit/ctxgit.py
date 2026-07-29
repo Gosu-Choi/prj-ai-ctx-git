@@ -1769,6 +1769,29 @@ class ContextStore:
         dump_json(target_paths.meta, meta)
         self.write_index()
 
+    def create_branch_from_context_chat(self, branch_id: str, title: str | None = None) -> Path:
+        """Create a fresh branch seeded with the top-level contexts chat.
+
+        Unlike a fork (which copies an existing branch's history + snapshot), this
+        starts a new branch off the root and drops the contexts chat conversation
+        in as its opening history, so you can continue it branch-aware.
+        """
+        self.require_initialized()
+        records = list(self.iter_context_history())
+        parent = "initial" if self.branch_paths("initial").root.exists() else None
+        self.create_branch_files(branch_id, title=title, parent=parent, tags=["from-contexts-chat"])
+        paths = self.branch_paths(branch_id)
+        if records:
+            text = "".join(
+                json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n" for record in records
+            )
+            write_text(paths.history, text)
+        meta = load_json(paths.meta)
+        meta["createdFromContextChat"] = True
+        dump_json(paths.meta, meta)
+        self.write_index()
+        return paths.root
+
     @staticmethod
     def reset_copied_branch_lineage(meta: dict[str, Any]) -> None:
         for key in (
@@ -11240,6 +11263,24 @@ def make_handler(
                     self.send_json(payload)
                 except SystemExit as exc:
                     self.send_json({"error": "clone_failed"}, status=int(exc.code or 400))
+                return
+            if parsed.path == "/api/context-chat/branch":
+                target_id = str(body.get("target") or "")
+                title = str(body.get("title") or "") or None
+                try:
+                    store.create_branch_from_context_chat(target_id, title=title)
+                    payload = branch_payload(store, target_id)
+                    payload["turnCommit"] = internal_git_commit_turn(
+                        store,
+                        kind="branch-from-contexts-chat",
+                        actor="user",
+                        summary=f"Create branch {target_id} from contexts chat",
+                        branch_id=target_id,
+                        metadata={"target": target_id, "title": title},
+                    )
+                    self.send_json(payload)
+                except SystemExit as exc:
+                    self.send_json({"error": "branch_create_failed"}, status=int(exc.code or 400))
                 return
             if parsed.path == "/api/branch/rename":
                 branch_id = str(body.get("branch") or "")

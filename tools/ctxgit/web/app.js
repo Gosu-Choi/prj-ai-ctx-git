@@ -178,6 +178,7 @@ const els = {
   messageInput: document.querySelector("#messageInput"),
   sendButton: document.querySelector("#sendButton"),
   contextResetButton: document.querySelector("#contextResetButton"),
+  contextBranchButton: document.querySelector("#contextBranchButton"),
   historyChatButton: document.querySelector("#historyChatButton"),
   teamButton: document.querySelector("#teamButton"),
   refreshButton: document.querySelector("#refreshButton"),
@@ -3187,6 +3188,7 @@ function renderContextChat(payload) {
   const meta = payload.meta || {};
   els.activeTitle.textContent = meta.title || "Contexts";
   setBranchDirButton(null);
+  if (els.contextBranchButton) els.contextBranchButton.hidden = false;
   els.activeMeta.textContent = `${meta.id || "contexts"} · top-level contexts chat`;
 
   replaceMessageListHtml(
@@ -4671,6 +4673,9 @@ els.teamButton.addEventListener("click", async () => {
 
 function setBranchDirButton(branchId) {
   if (!els.openBranchDirButton) return;
+  // The "new branch from chat" button is contexts-chat only; renderContextChat
+  // re-shows it. Any branch/empty view hides it here.
+  if (els.contextBranchButton) els.contextBranchButton.hidden = true;
   if (branchId) {
     els.openBranchDirButton.dataset.branch = branchId;
     els.openBranchDirButton.hidden = false;
@@ -4759,6 +4764,28 @@ els.parentBranchButton?.addEventListener("click", async () => {
   }
   // Archived branches open with the same loader (read-only view), so navigate either way.
   await loadBranch(parent);
+});
+
+els.contextBranchButton?.addEventListener("click", async () => {
+  if (!state.activeContextChat) return;
+  const target = window.prompt("New branch id (letters, digits, - and _):", "");
+  const id = String(target || "").trim();
+  if (!id) return;
+  els.contextBranchButton.disabled = true;
+  try {
+    const payload = await api("/api/context-chat/branch", {
+      method: "POST",
+      body: JSON.stringify({ target: id, title: id }),
+    });
+    // Open the freshly created branch and refresh the sidebar to include it.
+    state.activeContextChat = false;
+    state.activeBranch = payload.meta.id;
+    await loadBranches();
+  } catch (error) {
+    window.alert(`브랜치 생성 실패: ${error.message}`);
+  } finally {
+    els.contextBranchButton.disabled = false;
+  }
 });
 
 // ---------------------------------------------------------------------------
