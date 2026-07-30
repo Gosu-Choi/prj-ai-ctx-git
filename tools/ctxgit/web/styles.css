@@ -2741,3 +2741,71 @@ button.section-toggle[aria-expanded="false"] .section-toggle-caret {
   color: var(--muted);
   font-size: 14px;
 }
+
+/* Branch folders --------------------------------------------------------- */
+.branch-folder {
+  margin-top: 4px;
+}
+
+.folder-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 6px 8px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  cursor: pointer;
+  border-radius: 6px;
+}
+
+.folder-header:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.folder-caret {
+  display: inline-block;
+  transition: transform 0.12s ease;
+  font-size: 10px;
+}
+
+.branch-folder.collapsed .folder-caret {
+  transform: rotate(-90deg);
+}
+
+.folder-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+}
+
+.folder-count {
+  flex-shrink: 0;
+  min-width: 18px;
+  padding: 0 6px;
+  border-radius: 9px;
+  background: var(--line);
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 16px;
+  text-align: center;
+}
+
+.branch-folder.collapsed .folder-body {
+  display: none;
+}
+
+.folder-body {
+  padding-left: 6px;
+  border-left: 2px solid var(--line);
+  margin-left: 6px;
+}

@@ -2145,6 +2145,26 @@ class ContextStore:
             write_text(paths.context, "\n".join(lines).rstrip() + "\n")
         self.write_index()
 
+    def set_branch_folder(self, branch_id: str, folder: str) -> None:
+        """Assign a branch to a logical folder (grouping label), or clear it.
+
+        This is metadata only — branch files are not moved on disk, so parent
+        links, archives, and git history are unaffected.
+        """
+        self.require_initialized()
+        paths = self.branch_paths(branch_id)
+        if not paths.root.exists():
+            die(f"branch does not exist: {branch_id}")
+        meta = load_json(paths.meta)
+        folder = (folder or "").strip()
+        if folder:
+            meta["folder"] = folder
+        else:
+            meta.pop("folder", None)
+        meta["updatedAt"] = utc_now()
+        dump_json(paths.meta, meta)
+        self.write_index()
+
     def remove_branch(self, branch_id: str) -> None:
         self.require_initialized()
         paths = self.branch_paths(branch_id)
@@ -3270,6 +3290,7 @@ class ContextStore:
             "id": branch_id,
             "title": meta.get("title") or branch_id,
             "parent": meta.get("parent"),
+            "folder": str(meta.get("folder") or ""),
             "createdAt": meta.get("createdAt"),
             "updatedAt": meta.get("updatedAt"),
             "lastMessageAt": last_message_at,
@@ -11526,6 +11547,23 @@ def make_handler(
                     self.send_json(payload)
                 except SystemExit as exc:
                     self.send_json({"error": "rename_failed"}, status=int(exc.code or 400))
+                return
+            if parsed.path == "/api/branch/folder":
+                branch_id = str(body.get("branch") or "")
+                folder = str(body.get("folder") or "")
+                try:
+                    store.set_branch_folder(branch_id, folder)
+                    internal_git_commit_turn(
+                        store,
+                        kind="branch-folder",
+                        actor="user",
+                        summary=f"Set folder of {branch_id} to {folder or '(none)'}",
+                        branch_id=branch_id,
+                        metadata={"branch": branch_id, "folder": folder},
+                    )
+                    self.send_json({"branches": store.list_branches()})
+                except SystemExit as exc:
+                    self.send_json({"error": "folder_failed"}, status=int(exc.code or 400))
                 return
             if parsed.path == "/api/branch/remove":
                 branch_id = str(body.get("branch") or "")

@@ -1459,6 +1459,42 @@ async function createFolderFromPrompt() {
   }
 }
 
+const FOLDER_COLLAPSED_STORAGE_KEY = "ctxgit.foldersCollapsed";
+
+function getCollapsedFolders() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(FOLDER_COLLAPSED_STORAGE_KEY) || "[]");
+    return Array.isArray(raw) ? raw : [];
+  } catch {
+    return [];
+  }
+}
+
+function toggleFolderCollapsed(folder) {
+  const set = new Set(getCollapsedFolders());
+  if (set.has(folder)) set.delete(folder);
+  else set.add(folder);
+  try {
+    localStorage.setItem(FOLDER_COLLAPSED_STORAGE_KEY, JSON.stringify([...set]));
+  } catch {
+    // localStorage may be unavailable; the toggle still works for this render.
+  }
+  renderBranches();
+}
+
+async function setBranchFolder(branch, folder) {
+  try {
+    const data = await api("/api/branch/folder", {
+      method: "POST",
+      body: JSON.stringify({ branch, folder }),
+    });
+    state.branches = data.branches || state.branches;
+    renderBranches();
+  } catch (error) {
+    window.alert(`Move to folder failed: ${error.message}`);
+  }
+}
+
 function renderBranches() {
   if (els.contextChatButton) {
     els.contextChatButton.classList.toggle("active", state.activeContextChat === true);
@@ -1477,38 +1513,75 @@ function renderBranches() {
     );
   }
   renderMergeSourcePicker();
-  els.branchList.innerHTML = orderedBranches()
-    .map((branch) => {
-      const job = branchJob(branch.id);
-      const startingMode = state.startingBranches[branch.id] || "";
-      const isRunning = Boolean(startingMode) || job?.status === "running";
-      const isDoneUnseen = job?.status === "done" && !isBranchJobAcknowledged(branch.id);
-      const statusClass = isRunning ? "job-running" : isDoneUnseen ? "job-done" : job?.status === "failed" ? "job-failed" : "";
-      const jobLabel =
-        isRunning
-          ? ` · 실행 중 ${startingMode || job?.mode || job?.kind || "job"}`
-          : isDoneUnseen
-          ? " · 완료됨"
-          : job?.status === "failed"
-          ? " · 최근 작업 실패"
-          : "";
-      return `
-        <div class="branch-row ${branch.id === state.activeBranch ? "active" : ""} ${statusClass}">
-          <button class="nav-item branch-main ${branch.id === state.activeBranch ? "active" : ""}" data-branch="${escapeHtml(branch.id)}" type="button" title="${escapeHtml(`${branch.title} (${branch.id})`)}">
-            <span class="nav-title" title="${escapeHtml(branch.title)}">${escapeHtml(branch.title)}</span>
-            <span class="nav-meta" title="${escapeHtml(`${branch.id} · ${branch.historyCount} messages${jobLabel}`)}">${escapeHtml(branch.id)} · ${branch.historyCount} messages${escapeHtml(jobLabel)}</span>
-          </button>
-          <button class="branch-options-button" data-branch-options="${escapeHtml(branch.id)}" type="button" aria-label="Branch options">...</button>
-          <div class="branch-options-menu">
-            <button data-branch-rename="${escapeHtml(branch.id)}" data-branch-title="${escapeHtml(branch.title)}" type="button">Rename branch</button>
-            <button data-branch-clone="${escapeHtml(branch.id)}" type="button">Clone branch</button>
-            <button data-branch-archive="${escapeHtml(branch.id)}" type="button">Archive branch</button>
-            <button class="danger" data-branch-remove="${escapeHtml(branch.id)}" type="button">Remove branch</button>
-          </div>
+  const buildBranchRow = (branch) => {
+    const job = branchJob(branch.id);
+    const startingMode = state.startingBranches[branch.id] || "";
+    const isRunning = Boolean(startingMode) || job?.status === "running";
+    const isDoneUnseen = job?.status === "done" && !isBranchJobAcknowledged(branch.id);
+    const statusClass = isRunning ? "job-running" : isDoneUnseen ? "job-done" : job?.status === "failed" ? "job-failed" : "";
+    const jobLabel =
+      isRunning
+        ? ` · 실행 중 ${startingMode || job?.mode || job?.kind || "job"}`
+        : isDoneUnseen
+        ? " · 완료됨"
+        : job?.status === "failed"
+        ? " · 최근 작업 실패"
+        : "";
+    return `
+      <div class="branch-row ${branch.id === state.activeBranch ? "active" : ""} ${statusClass}">
+        <button class="nav-item branch-main ${branch.id === state.activeBranch ? "active" : ""}" data-branch="${escapeHtml(branch.id)}" type="button" title="${escapeHtml(`${branch.title} (${branch.id})`)}">
+          <span class="nav-title" title="${escapeHtml(branch.title)}">${escapeHtml(branch.title)}</span>
+          <span class="nav-meta" title="${escapeHtml(`${branch.id} · ${branch.historyCount} messages${jobLabel}`)}">${escapeHtml(branch.id)} · ${branch.historyCount} messages${escapeHtml(jobLabel)}</span>
+        </button>
+        <button class="branch-options-button" data-branch-options="${escapeHtml(branch.id)}" type="button" aria-label="Branch options">...</button>
+        <div class="branch-options-menu">
+          <button data-branch-rename="${escapeHtml(branch.id)}" data-branch-title="${escapeHtml(branch.title)}" type="button">Rename branch</button>
+          <button data-branch-folder="${escapeHtml(branch.id)}" data-branch-current-folder="${escapeHtml(branch.folder || "")}" type="button">Move to folder…</button>
+          <button data-branch-clone="${escapeHtml(branch.id)}" type="button">Clone branch</button>
+          <button data-branch-archive="${escapeHtml(branch.id)}" type="button">Archive branch</button>
+          <button class="danger" data-branch-remove="${escapeHtml(branch.id)}" type="button">Remove branch</button>
         </div>
-      `;
-    })
-    .join("") || '<div class="muted">No branches yet</div>';
+      </div>
+    `;
+  };
+
+  const ordered = orderedBranches();
+  const folderOf = (branch) => (branch.folder || "").trim();
+  const collapsed = getCollapsedFolders();
+  const ungrouped = ordered.filter((branch) => !folderOf(branch));
+  const folderNames = [...new Set(ordered.map(folderOf).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+  let branchHtml = ungrouped.map(buildBranchRow).join("");
+  folderNames.forEach((folder) => {
+    const items = ordered.filter((branch) => folderOf(branch) === folder);
+    // Keep a folder open if the active branch lives inside it, even if collapsed.
+    const hasActive = items.some((branch) => branch.id === state.activeBranch);
+    const isCollapsed = collapsed.includes(folder) && !hasActive;
+    branchHtml += `
+      <div class="branch-folder ${isCollapsed ? "collapsed" : ""}">
+        <button class="folder-header" data-folder="${escapeHtml(folder)}" type="button" title="${escapeHtml(folder)}">
+          <span class="folder-caret" aria-hidden="true">▾</span><span class="folder-name">${escapeHtml(folder)}</span><span class="folder-count">${items.length}</span>
+        </button>
+        <div class="folder-body">${items.map(buildBranchRow).join("")}</div>
+      </div>
+    `;
+  });
+  els.branchList.innerHTML = branchHtml || '<div class="muted">No branches yet</div>';
+  els.branchList.querySelectorAll("[data-folder]").forEach((button) => {
+    button.addEventListener("click", () => toggleFolderCollapsed(button.dataset.folder));
+  });
+  els.branchList.querySelectorAll("[data-branch-folder]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      closeBranchMenus();
+      const branch = button.dataset.branchFolder;
+      const current = button.dataset.branchCurrentFolder || "";
+      const existing = [...new Set(state.branches.map((item) => (item.folder || "").trim()).filter(Boolean))];
+      const hint = existing.length ? `\n기존 폴더: ${existing.join(", ")}` : "";
+      const folder = window.prompt(`"${branch}" 을(를) 넣을 폴더 이름 (비우면 그룹 해제):${hint}`, current);
+      if (folder === null) return;
+      setBranchFolder(branch, folder.trim());
+    });
+  });
   els.branchList.querySelectorAll("[data-branch]").forEach((button) => {
     button.addEventListener("click", () => loadBranch(button.dataset.branch));
   });
