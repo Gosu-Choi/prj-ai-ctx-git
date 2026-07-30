@@ -94,6 +94,10 @@ const els = {
   branchList: document.querySelector("#branchList"),
   branchesToggle: document.querySelector("#branchesToggle"),
   branchesBody: document.querySelector("#branchesBody"),
+  extensionsToggle: document.querySelector("#extensionsToggle"),
+  extensionsBody: document.querySelector("#extensionsBody"),
+  extensionList: document.querySelector("#extensionList"),
+  extensionContent: document.querySelector("#extensionContent"),
   contextChatButton: document.querySelector("#contextChatButton"),
   branchGraphButton: document.querySelector("#branchGraphButton"),
   viewList: document.querySelector("#viewList"),
@@ -4184,6 +4188,182 @@ els.branchGraphButton.addEventListener("click", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Extensions — optional add-ons (not fundamental ctxgit features).
+// Built-in registry rendered in the sidebar; opening one takes over the main
+// panel via a dedicated #extensionTab.
+// ---------------------------------------------------------------------------
+const EXTENSIONS = [
+  {
+    id: "instagram",
+    name: "Instagram",
+    icon: "📸",
+    description: "View a public profile and its recent posts (Rocket API).",
+    render: renderInstagramExtension,
+  },
+];
+
+function renderExtensionList() {
+  if (!els.extensionList) return;
+  els.extensionList.innerHTML = "";
+  EXTENSIONS.forEach((ext) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "nav-item extension-item";
+    button.textContent = `${ext.icon} ${ext.name}`;
+    button.title = ext.description;
+    button.addEventListener("click", () => openExtension(ext.id));
+    els.extensionList.appendChild(button);
+  });
+}
+
+function showExtensionPanel() {
+  document.querySelectorAll(".tab").forEach((item) => item.classList.remove("active"));
+  document.querySelectorAll(".tab-panel").forEach((item) => item.classList.remove("active"));
+  document.querySelector("#extensionTab")?.classList.add("active");
+}
+
+function openExtension(id) {
+  const ext = EXTENSIONS.find((item) => item.id === id);
+  if (!ext || !els.extensionContent) return;
+  showExtensionPanel();
+  els.extensionList
+    ?.querySelectorAll(".extension-item")
+    .forEach((item) => item.classList.remove("active"));
+  const buttons = els.extensionList ? Array.from(els.extensionList.querySelectorAll(".extension-item")) : [];
+  const index = EXTENSIONS.findIndex((item) => item.id === id);
+  if (buttons[index]) buttons[index].classList.add("active");
+  els.extensionContent.innerHTML = "";
+  ext.render(els.extensionContent);
+}
+
+function renderInstagramExtension(container) {
+  container.innerHTML = `
+    <div class="extension-header">
+      <h2>📸 Instagram</h2>
+      <p class="extension-subtitle">Powered by Rocket API. View a public profile and recent posts.</p>
+    </div>
+    <form id="instagramForm" class="extension-form">
+      <input id="instagramUsername" type="text" placeholder="username (without @)" autocomplete="off" />
+      <button type="submit">View</button>
+    </form>
+    <div id="instagramStatus" class="settings-status"></div>
+    <div id="instagramResult" class="instagram-result"></div>
+  `;
+  const form = container.querySelector("#instagramForm");
+  const usernameInput = container.querySelector("#instagramUsername");
+  const statusEl = container.querySelector("#instagramStatus");
+  const resultEl = container.querySelector("#instagramResult");
+
+  api("/api/extensions/instagram/status")
+    .then((data) => {
+      if (!data.configured) {
+        statusEl.textContent = "Rocket API key is not configured. Add ROCKETAPI_KEY to your .env.";
+        statusEl.className = "settings-status error";
+      }
+    })
+    .catch(() => {});
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const username = (usernameInput.value || "").trim().replace(/^@/, "");
+    if (!username) return;
+    statusEl.textContent = "Loading profile…";
+    statusEl.className = "settings-status";
+    resultEl.innerHTML = "";
+    try {
+      const profileData = await api("/api/extensions/instagram/profile", {
+        method: "POST",
+        body: JSON.stringify({ username }),
+      });
+      const profile = profileData.profile || {};
+      renderInstagramProfile(resultEl, profile);
+      statusEl.textContent = "";
+      if (profile.id && !profile.is_private) {
+        statusEl.textContent = "Loading posts…";
+        try {
+          const mediaData = await api("/api/extensions/instagram/media", {
+            method: "POST",
+            body: JSON.stringify({ id: profile.id, count: 12 }),
+          });
+          renderInstagramMedia(resultEl, mediaData.media || []);
+          statusEl.textContent = "";
+        } catch (mediaError) {
+          statusEl.textContent = `Posts failed: ${mediaError.message}`;
+          statusEl.className = "settings-status error";
+        }
+      } else if (profile.is_private) {
+        const note = document.createElement("div");
+        note.className = "instagram-private-note";
+        note.textContent = "This account is private — posts are not available.";
+        resultEl.appendChild(note);
+      }
+    } catch (error) {
+      statusEl.textContent = `Failed: ${error.message}`;
+      statusEl.className = "settings-status error";
+    }
+  });
+}
+
+function proxyInstagramImage(url) {
+  if (!url) return "";
+  return `/api/extensions/instagram/image?url=${encodeURIComponent(url)}`;
+}
+
+function renderInstagramProfile(container, profile) {
+  const card = document.createElement("div");
+  card.className = "instagram-profile";
+  const verified = profile.is_verified ? " ✔" : "";
+  const link = profile.external_url
+    ? `<a href="${escapeHtml(profile.external_url)}" target="_blank" rel="noopener">${escapeHtml(profile.external_url)}</a>`
+    : "";
+  card.innerHTML = `
+    <img class="instagram-avatar" src="${proxyInstagramImage(profile.profile_pic_url)}" alt="" />
+    <div class="instagram-profile-info">
+      <div class="instagram-profile-name">
+        <a href="https://www.instagram.com/${escapeHtml(profile.username)}/" target="_blank" rel="noopener">@${escapeHtml(profile.username)}</a>${verified}
+      </div>
+      <div class="instagram-profile-fullname">${escapeHtml(profile.full_name)}</div>
+      <div class="instagram-stats">
+        <span><strong>${Number(profile.posts || 0).toLocaleString()}</strong> posts</span>
+        <span><strong>${Number(profile.followers || 0).toLocaleString()}</strong> followers</span>
+        <span><strong>${Number(profile.following || 0).toLocaleString()}</strong> following</span>
+      </div>
+      <div class="instagram-bio">${escapeHtml(profile.biography).replaceAll("\n", "<br />")}</div>
+      <div class="instagram-external">${link}</div>
+    </div>
+  `;
+  container.appendChild(card);
+}
+
+function renderInstagramMedia(container, media) {
+  const grid = document.createElement("div");
+  grid.className = "instagram-grid";
+  if (!media.length) {
+    grid.innerHTML = `<div class="instagram-empty">No posts found.</div>`;
+    container.appendChild(grid);
+    return;
+  }
+  media.forEach((post) => {
+    const tile = document.createElement("a");
+    tile.className = "instagram-tile";
+    tile.href = post.permalink || "#";
+    tile.target = "_blank";
+    tile.rel = "noopener";
+    tile.title = post.caption || "";
+    const videoBadge = post.is_video ? `<span class="instagram-video-badge">▶</span>` : "";
+    tile.innerHTML = `
+      <img loading="lazy" src="${proxyInstagramImage(post.thumbnail_url)}" alt="" />
+      ${videoBadge}
+      <span class="instagram-tile-meta">♥ ${Number(post.like_count || 0).toLocaleString()} · 💬 ${Number(post.comment_count || 0).toLocaleString()}</span>
+    `;
+    grid.appendChild(tile);
+  });
+  container.appendChild(grid);
+}
+
+renderExtensionList();
+
 els.summarySaveButton.addEventListener("click", saveSummary);
 
 els.graphRefreshButton.addEventListener("click", () => {
@@ -5132,6 +5312,13 @@ els.branchesToggle?.addEventListener("click", () => {
   }
   setBranchesCollapsed(collapsed);
 })();
+
+els.extensionsToggle?.addEventListener("click", () => {
+  if (!els.extensionsBody) return;
+  const expanded = els.extensionsToggle.getAttribute("aria-expanded") === "true";
+  els.extensionsBody.hidden = expanded;
+  els.extensionsToggle.setAttribute("aria-expanded", String(!expanded));
+});
 
 // Global toggle for Telegram completion messages (one switch controls all projects).
 async function loadNotificationSettings() {

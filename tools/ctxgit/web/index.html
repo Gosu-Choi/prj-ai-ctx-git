@@ -81,6 +81,15 @@
         </section>
 
         <section class="sidebar-section">
+          <button id="extensionsToggle" class="section-title section-toggle" type="button" aria-expanded="true">
+            <span class="section-toggle-caret" aria-hidden="true">▾</span><span>Extensions</span>
+          </button>
+          <div id="extensionsBody">
+            <div id="extensionList" class="nav-list"></div>
+          </div>
+        </section>
+
+        <section class="sidebar-section">
           <button id="branchesToggle" class="section-title section-toggle" type="button" aria-expanded="true">
             <span class="section-toggle-caret" aria-hidden="true">▾</span><span>Branches</span>
           </button>
@@ -356,6 +365,10 @@
               <div id="researchList" class="document-list"></div>
             </section>
           </div>
+        </section>
+
+        <section id="extensionTab" class="tab-panel">
+          <div id="extensionContent" class="extension-content"></div>
         </section>
       </main>
     </div>

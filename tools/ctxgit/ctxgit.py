@@ -97,7 +97,12 @@ DEFAULT_RESEARCH_MAX_FETCHES = 8
 DEFAULT_CODEX_SANDBOX = "workspace-write"
 ALLOWED_CODEX_SANDBOXES = {"read-only", "workspace-write", "danger-full-access"}
 APPROVAL_STATUSES = {"approved", "denied"}
-PROJECT_ENV_ALLOWED_KEYS = {"BRAVE_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"}
+PROJECT_ENV_ALLOWED_KEYS = {
+    "BRAVE_API_KEY",
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_CHAT_ID",
+    "ROCKETAPI_KEY",
+}
 REPO_ENV_FILES = (".env",)
 PROJECT_ENV_FILES = (".ctxgit/.env", ".env")
 PROJECT_ENV_GITIGNORE_LINES = (
@@ -486,6 +491,140 @@ def telegram_config_for_root(root: Path) -> tuple[str, str]:
     except Exception:  # noqa: BLE001 - config read must never break job completion
         return "", ""
     return values.get("TELEGRAM_BOT_TOKEN", "").strip(), values.get("TELEGRAM_CHAT_ID", "").strip()
+
+
+# ---------------------------------------------------------------------------
+# Extensions: Rocket API (Instagram)
+#
+# An optional add-on, not a fundamental ctxgit feature. Needs a Rocket API key
+# (https://rocketapi.io) in the gitignored .env as ROCKETAPI_KEY.
+# ---------------------------------------------------------------------------
+ROCKETAPI_BASE = "https://v1.rocketapi.io"
+INSTAGRAM_IMAGE_HOSTS = ("cdninstagram.com", "fbcdn.net")
+
+
+def rocketapi_key_for_root(root: Path) -> str:
+    try:
+        values, _ = read_project_env(root)
+    except Exception:  # noqa: BLE001 - config read must never break the request
+        return ""
+    return values.get("ROCKETAPI_KEY", "").strip()
+
+
+def rocketapi_post(key: str, path: str, payload: dict[str, Any], timeout: int = 20) -> dict[str, Any]:
+    """POST to Rocket API and return the parsed JSON body. Raises ValueError on failure."""
+    if not key:
+        raise ValueError("Rocket API key is not configured (set ROCKETAPI_KEY in .env)")
+    url = ROCKETAPI_BASE + path
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=data,
+        method="POST",
+        headers={"Content-Type": "application/json", "Authorization": f"Token {key}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:300] if hasattr(exc, "read") else str(exc)
+        raise ValueError(f"Rocket API error {exc.code}: {detail}") from exc
+    except Exception as exc:  # noqa: BLE001 - surface network failures to the UI
+        raise ValueError(f"Rocket API request failed: {exc}") from exc
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Rocket API returned invalid JSON") from exc
+
+
+def _first_dict_with(obj: Any, *keys: str) -> dict[str, Any] | None:
+    """Depth-first search for the first dict containing any of `keys`."""
+    if isinstance(obj, dict):
+        if any(k in obj for k in keys):
+            return obj
+        for value in obj.values():
+            found = _first_dict_with(value, *keys)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for value in obj:
+            found = _first_dict_with(value, *keys)
+            if found is not None:
+                return found
+    return None
+
+
+def instagram_profile_from_response(data: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a get_web_profile_info response into a flat profile dict."""
+    user = _first_dict_with(data, "edge_followed_by", "biography") or {}
+    def count(node: Any) -> int:
+        return int(node.get("count", 0)) if isinstance(node, dict) else int(node or 0)
+    return {
+        "id": str(user.get("id") or user.get("pk") or ""),
+        "username": user.get("username") or "",
+        "full_name": user.get("full_name") or "",
+        "biography": user.get("biography") or "",
+        "profile_pic_url": user.get("profile_pic_url_hd") or user.get("profile_pic_url") or "",
+        "is_verified": bool(user.get("is_verified")),
+        "is_private": bool(user.get("is_private")),
+        "followers": count(user.get("edge_followed_by") or user.get("follower_count")),
+        "following": count(user.get("edge_follow") or user.get("following_count")),
+        "posts": count(user.get("edge_owner_to_timeline_media") or user.get("media_count")),
+        "external_url": user.get("external_url") or "",
+    }
+
+
+def _ig_media_thumbnail(item: dict[str, Any]) -> str:
+    versions = item.get("image_versions2")
+    if isinstance(versions, dict):
+        cands = versions.get("candidates")
+        if isinstance(cands, list) and cands and isinstance(cands[0], dict):
+            return str(cands[0].get("url") or "")
+    return str(item.get("thumbnail_url") or item.get("display_url") or "")
+
+
+def instagram_media_from_response(data: dict[str, Any], limit: int = 12) -> list[dict[str, Any]]:
+    """Normalize a get_media response into a list of post thumbnails."""
+    items = None
+    node = _first_dict_with(data, "items")
+    if isinstance(node, dict) and isinstance(node.get("items"), list):
+        items = node["items"]
+    if items is None:
+        # Fallback: graphql edges shape.
+        edges_node = _first_dict_with(data, "edges")
+        if isinstance(edges_node, dict) and isinstance(edges_node.get("edges"), list):
+            items = [e.get("node", {}) for e in edges_node["edges"] if isinstance(e, dict)]
+    if not isinstance(items, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for raw in items[: max(0, limit)]:
+        if not isinstance(raw, dict):
+            continue
+        item = raw.get("media") if isinstance(raw.get("media"), dict) else raw
+        caption = item.get("caption")
+        caption_text = caption.get("text") if isinstance(caption, dict) else (caption or "")
+        code = item.get("code") or item.get("shortcode") or ""
+        out.append(
+            {
+                "id": str(item.get("id") or item.get("pk") or ""),
+                "shortcode": code,
+                "permalink": f"https://www.instagram.com/p/{code}/" if code else "",
+                "thumbnail_url": _ig_media_thumbnail(item),
+                "caption": str(caption_text or "")[:280],
+                "like_count": int(item.get("like_count") or 0),
+                "comment_count": int(item.get("comment_count") or 0),
+                "is_video": int(item.get("media_type") or 0) == 2 or bool(item.get("is_video")),
+            }
+        )
+    return out
+
+
+def is_instagram_image_url(url: str) -> bool:
+    try:
+        host = urllib.parse.urlparse(url).hostname or ""
+    except ValueError:
+        return False
+    return any(host == h or host.endswith("." + h) for h in INSTAGRAM_IMAGE_HOSTS)
 
 
 def send_telegram_message(token: str, chat_id: str, text: str, timeout: int = 8) -> None:
@@ -10611,6 +10750,28 @@ def make_handler(
                 except (SystemExit, ValueError) as exc:
                     self.send_json({"error": "summary_read_failed", "message": str(exc)}, status=400)
                 return True
+            if parsed.path == "/api/extensions/instagram/status":
+                self.send_json({"configured": bool(rocketapi_key_for_root(root))})
+                return True
+            if parsed.path == "/api/extensions/instagram/image":
+                url = (query.get("url") or [""])[0]
+                if not is_instagram_image_url(url):
+                    self.send_text("Blocked host.", content_type="text/plain; charset=utf-8", status=400)
+                    return True
+                try:
+                    proxy_req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                    with urllib.request.urlopen(proxy_req, timeout=15) as resp:
+                        data = resp.read()
+                        content_type = resp.headers.get("Content-Type", "image/jpeg")
+                    self.send_response(200)
+                    self.send_header("Content-Type", content_type)
+                    self.send_header("Cache-Control", "public, max-age=3600")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                except Exception as exc:  # noqa: BLE001 - proxy failures are non-fatal
+                    self.send_text(f"Image fetch failed: {exc}", content_type="text/plain; charset=utf-8", status=502)
+                return True
             return False
 
         def handle_file_get(self, parsed: urllib.parse.ParseResult) -> None:
@@ -11314,6 +11475,35 @@ def make_handler(
                         "outputHumanizeEnabled": bool(settings.get("outputHumanizeEnabled", False)),
                     }
                 )
+                return
+            if parsed.path == "/api/extensions/instagram/profile":
+                key = rocketapi_key_for_root(root)
+                username = str(body.get("username") or "").strip().lstrip("@")
+                if not username:
+                    self.send_json({"error": "bad_request", "message": "username is required"}, status=400)
+                    return
+                try:
+                    raw = rocketapi_post(key, "/instagram/user/get_web_profile_info", {"username": username})
+                    self.send_json({"profile": instagram_profile_from_response(raw)})
+                except ValueError as exc:
+                    self.send_json({"error": "rocketapi_failed", "message": str(exc)}, status=502)
+                return
+            if parsed.path == "/api/extensions/instagram/media":
+                key = rocketapi_key_for_root(root)
+                user_id = str(body.get("id") or "").strip()
+                try:
+                    count = int(body.get("count") or 12)
+                except (TypeError, ValueError):
+                    count = 12
+                count = max(1, min(count, 24))
+                if not user_id:
+                    self.send_json({"error": "bad_request", "message": "id is required"}, status=400)
+                    return
+                try:
+                    raw = rocketapi_post(key, "/instagram/user/get_media", {"id": user_id, "count": count})
+                    self.send_json({"media": instagram_media_from_response(raw, limit=count)})
+                except ValueError as exc:
+                    self.send_json({"error": "rocketapi_failed", "message": str(exc)}, status=502)
                 return
             if parsed.path == "/api/branch/clone":
                 source_id = str(body.get("source") or "")
