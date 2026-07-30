@@ -1457,6 +1457,19 @@ async function createFolderFromPrompt() {
 function renderBranches() {
   if (els.contextChatButton) {
     els.contextChatButton.classList.toggle("active", state.activeContextChat === true);
+    // Contexts chat also runs jobs, so surface its running/unread-done state here;
+    // otherwise a finished contexts-chat turn adds to the tab's (N) badge with no
+    // visible marker to attribute it to.
+    const ctxJob = branchJob(CONTEXT_CHAT_KEY);
+    const ctxRunning =
+      Boolean(activeBranchRunningJob(CONTEXT_CHAT_KEY)) || Boolean(state.startingBranches[CONTEXT_CHAT_KEY]);
+    const ctxDoneUnseen = ctxJob?.status === "done" && !isBranchJobAcknowledged(CONTEXT_CHAT_KEY);
+    els.contextChatButton.classList.toggle("job-running", ctxRunning);
+    els.contextChatButton.classList.toggle("job-done", !ctxRunning && ctxDoneUnseen);
+    els.contextChatButton.classList.toggle(
+      "job-failed",
+      !ctxRunning && !ctxDoneUnseen && ctxJob?.status === "failed",
+    );
   }
   renderMergeSourcePicker();
   els.branchList.innerHTML = orderedBranches()

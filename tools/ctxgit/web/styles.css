@@ -573,6 +573,21 @@ button.section-toggle[aria-expanded="false"] .section-toggle-caret {
   box-shadow: inset 0 0 0 1px #2f8f46;
 }
 
+#contextChatButton.job-running {
+  border-color: #c56a12;
+  box-shadow: inset 0 0 0 1px #c56a12;
+}
+
+#contextChatButton.job-done {
+  border-color: #2f8f46;
+  box-shadow: inset 0 0 0 1px #2f8f46;
+}
+
+#contextChatButton.job-failed {
+  border-color: #b33636;
+  box-shadow: inset 0 0 0 1px #b33636;
+}
+
 .nav-title {
   display: block;
   max-width: 100%;
