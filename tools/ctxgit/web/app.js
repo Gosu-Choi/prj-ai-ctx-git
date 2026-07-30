@@ -257,7 +257,12 @@ function rememberProjectPath(path) {
 }
 
 function activeProjectPathForRequest() {
-  return state.project?.path || "";
+  // Fall back to this tab's stored project path so that on a fresh load (before
+  // state.project exists) every request is still scoped to THIS tab's project
+  // via the X-Ctxgit-Project header. sessionStorage is per-tab, and the folder
+  // path is the unique key, so two tabs on different projects never clobber each
+  // other (a refresh no longer adopts whichever project was globally opened last).
+  return state.project?.path || storedProjectPath();
 }
 
 async function api(path, options = {}) {
@@ -3446,7 +3451,19 @@ async function rehydrateRunningJobs() {
 async function loadProject() {
   await loadServerProjects();
   await loadWorkerStatus();
-  const project = await api("/api/project");
+  let project;
+  try {
+    project = await api("/api/project");
+  } catch (error) {
+    // A stale stored project path (moved/deleted) would 400; drop it and fall
+    // back to the server's active project so the tab still loads.
+    if (error instanceof ApiError && error.payload?.error === "project_invalid") {
+      rememberProjectPath("");
+      project = await api("/api/project");
+    } else {
+      throw error;
+    }
+  }
   renderProject(project);
   if (project.initialized) {
     await loadBranches();
