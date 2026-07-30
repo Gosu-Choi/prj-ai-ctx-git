@@ -4943,7 +4943,7 @@ def default_llm_config() -> dict[str, Any]:
         "provider": "codex",
         "codex": {
             "bin": "codex",
-            "model": "gpt-5.5",
+            "model": "gpt-5.6-sol",
             "webSearch": True,
             "sandbox": DEFAULT_CODEX_SANDBOX,
             "timeoutSeconds": 900,
@@ -4972,10 +4972,11 @@ def default_llm_config() -> dict[str, Any]:
 
 
 LLM_PROVIDER_MODELS = {
-    # GPT is a single linear series -> keep the top two.
+    # GPT-5.6 has three tiers (like Claude) -> keep all three.
     "codex": [
-        {"id": "gpt-5.5", "label": "GPT-5.5"},
-        {"id": "gpt-5.4", "label": "GPT-5.4"},
+        {"id": "gpt-5.6-sol", "label": "GPT-5.6 Sol (frontier)"},
+        {"id": "gpt-5.6-terra", "label": "GPT-5.6 Terra (balanced)"},
+        {"id": "gpt-5.6-luna", "label": "GPT-5.6 Luna (fast)"},
     ],
     # Claude has tiers -> keep the best three. These CLI aliases auto-resolve to
     # the latest model in each tier, so they stay current without hardcoding IDs.
@@ -5241,7 +5242,7 @@ def codex_login_status(root: Path) -> dict[str, Any]:
             "loginCommand": "codex login --device-auth",
             "resolvedCommand": display_codex_command(root),
             "webSearch": codex_config.get("webSearch") is not False,
-            "model": str(codex_config.get("model") or "gpt-5.5"),
+            "model": str(codex_config.get("model") or "gpt-5.6-sol"),
             "sandbox": codex_sandbox_mode(codex_config),
             "timeoutSeconds": timeout_seconds,
             "braveApiKeyConfigured": brave_configured,
@@ -5257,7 +5258,7 @@ def codex_login_status(root: Path) -> dict[str, Any]:
         "loginCommand": "codex login --device-auth",
         "resolvedCommand": display_codex_command(root),
         "webSearch": codex_config.get("webSearch") is not False,
-        "model": str(codex_config.get("model") or "gpt-5.5"),
+        "model": str(codex_config.get("model") or "gpt-5.6-sol"),
         "sandbox": codex_sandbox_mode(codex_config),
         "timeoutSeconds": coerce_positive_int(codex_config.get("timeoutSeconds"), 900),
         "braveApiKeyConfigured": brave_configured,
@@ -6886,7 +6887,7 @@ def call_codex_prompt(
             "--output-schema", str(schema_path),
             "--output-last-message", str(output_path),
         ])
-        model = str(config.get("model") or "gpt-5.5").strip()
+        model = str(config.get("model") or "gpt-5.6-sol").strip()
         if model:
             cmd.extend(["--model", model])
         cmd.append("-")
