@@ -9811,9 +9811,21 @@ class JobStore:
         }
         return job
 
-    def create(self, kind: str, work: Callable[[ProgressCallback], dict[str, Any]], root: Path | None = None) -> dict[str, Any]:
+    def create(
+        self,
+        kind: str,
+        work: Callable[[ProgressCallback], dict[str, Any]],
+        root: Path | None = None,
+        branch: str | None = None,
+        mode: str | None = None,
+    ) -> dict[str, Any]:
         job_id = self.new_job_id()
         job = self.base_job(job_id, kind, root=root)
+        # Record which branch/mode this job belongs to so the UI can re-attach to
+        # it after a reload (in-process jobs otherwise have no branch on them).
+        if branch:
+            job["branch"] = branch
+        job["mode"] = mode or kind
         with self._lock:
             self._jobs[job_id] = job
             self.persist_locked(job)
@@ -9846,6 +9858,18 @@ class JobStore:
 
         threading.Thread(target=target, daemon=True).start()
         return self.snapshot(job_id)
+
+    def running_jobs(self, root: Path | None = None) -> list[dict[str, Any]]:
+        """Currently-running jobs for this project, so a reloaded UI can re-attach."""
+        with self._lock:
+            result = []
+            for job in self._jobs.values():
+                if job.get("status") != "running":
+                    continue
+                if root and Path(str(job.get("projectPath") or "")).expanduser().resolve() != root.resolve():
+                    continue
+                result.append(self.public_job(job))
+            return result
 
     def cancel(self, job_id: str, root: Path | None = None) -> dict[str, Any]:
         with self._lock:
@@ -10511,6 +10535,23 @@ def make_handler(
                     }
                 )
                 return True
+            if parsed.path == "/api/jobs/active":
+                self.send_json(
+                    {
+                        "jobs": [
+                            {
+                                "id": job.get("id"),
+                                "branch": job.get("branch"),
+                                "mode": job.get("mode"),
+                                "kind": job.get("kind"),
+                                "status": job.get("status"),
+                                "createdAt": job.get("createdAt"),
+                            }
+                            for job in jobs.running_jobs(root)
+                        ]
+                    }
+                )
+                return True
             if parsed.path == "/api/project/files":
                 try:
                     self.send_json(project_files_payload(root, (query.get("path") or [""])[0]))
@@ -10980,7 +11021,7 @@ def make_handler(
                             progress=progress,
                         )
 
-                    self.send_json(jobs.create("merge", work, root=root), status=202)
+                    self.send_json(jobs.create("merge", work, root=root, branch=name, mode="merge"), status=202)
                     return
                 try:
                     self.send_json(
@@ -11058,7 +11099,7 @@ def make_handler(
                         run_mode=run_mode,
                         progress=progress,
                     )
-                self.send_json(jobs.create("sequence-room", sequence_work, root=root), status=202)
+                self.send_json(jobs.create("sequence-room", sequence_work, root=root, branch=branch_id, mode="sequence-room"), status=202)
                 return
             if parsed.path == "/api/team/start":
                 branch_id = str(body.get("branch") or "")
@@ -11076,7 +11117,7 @@ def make_handler(
                         max_parallel=max_parallel or None,
                         progress=progress,
                     )
-                self.send_json(jobs.create("team-pipeline", team_work, root=root), status=202)
+                self.send_json(jobs.create("team-pipeline", team_work, root=root, branch=branch_id, mode="team"), status=202)
                 return
             if parsed.path == "/api/sequence-room/interject":
                 branch_id = str(body.get("branch") or "")
@@ -11652,7 +11693,7 @@ def make_handler(
                         progress=progress,
                     )
 
-                self.send_json(jobs.create("research", work, root=root), status=202)
+                self.send_json(jobs.create("research", work, root=root, branch=branch_id, mode="research"), status=202)
                 return
             if parsed.path == "/api/research":
                 branch_id = str(body.get("branch") or "")
@@ -11709,7 +11750,7 @@ def make_handler(
                             progress=progress,
                         )
 
-                    self.send_json(jobs.create("sequence-room", sequence_work, root=root), status=202)
+                    self.send_json(jobs.create("sequence-room", sequence_work, root=root, branch=branch_id, mode="sequence-room"), status=202)
                     return
                 if provider == "codex-worker" or (jobs.prefer_worker and provider in {None, "codex"}):
                     self.send_json(
@@ -11740,7 +11781,7 @@ def make_handler(
                         progress=progress,
                     )
 
-                self.send_json(jobs.create("chat", work, root=root), status=202)
+                self.send_json(jobs.create("chat", work, root=root, branch=branch_id, mode="chat"), status=202)
                 return
             if parsed.path in {"/api/history-chat/start", "/api/info-chat/start"}:
                 branch_id = str(body.get("branch") or "")
@@ -11764,7 +11805,7 @@ def make_handler(
                             progress=progress,
                         )
 
-                    self.send_json(jobs.create("sequence-room", sequence_work, root=root), status=202)
+                    self.send_json(jobs.create("sequence-room", sequence_work, root=root, branch=branch_id, mode="sequence-room"), status=202)
                     return
                 if provider == "codex-worker" or (jobs.prefer_worker and provider in {None, "codex"}):
                     self.send_json(
@@ -11795,7 +11836,7 @@ def make_handler(
                         progress=progress,
                     )
 
-                self.send_json(jobs.create("info-chat", work, root=root), status=202)
+                self.send_json(jobs.create("info-chat", work, root=root, branch=branch_id, mode="info-chat"), status=202)
                 return
             if parsed.path == "/api/context-chat/start":
                 text = str(body.get("text") or "").strip()
@@ -11823,7 +11864,7 @@ def make_handler(
                 def work(progress: ProgressCallback) -> dict[str, Any]:
                     return run_context_chat_turn(root, store, text, provider=provider, progress=progress)
 
-                self.send_json(jobs.create("context-chat", work, root=root), status=202)
+                self.send_json(jobs.create("context-chat", work, root=root, branch="__contexts__", mode="context-chat"), status=202)
                 return
             if parsed.path == "/api/context-chat/reset":
                 try:

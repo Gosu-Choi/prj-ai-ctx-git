@@ -3419,6 +3419,30 @@ async function loadWorkerStatus() {
   }
 }
 
+// After a reload the in-memory job state is gone, but jobs keep running on the
+// server. Re-attach to them so the running branch shows progress + a Stop button
+// and a duplicate turn cannot be started (which used to produce two answers).
+async function rehydrateRunningJobs() {
+  let data;
+  try {
+    data = await api("/api/jobs/active");
+  } catch (_error) {
+    return;
+  }
+  let changed = false;
+  for (const job of data.jobs || []) {
+    if (!job.id || !job.branch) continue;
+    if (state.jobs[job.id]) continue; // already tracked this session
+    rememberJob({ ...job, status: job.status || "running" }, { branch: job.branch, mode: job.mode });
+    monitorTrackedJob(job.id).catch((error) => handleMonitorError(state.jobs[job.id] || job, error));
+    changed = true;
+  }
+  if (changed) {
+    renderBranches();
+    renderActiveBranchJob();
+  }
+}
+
 async function loadProject() {
   await loadServerProjects();
   await loadWorkerStatus();
@@ -3431,6 +3455,7 @@ async function loadProject() {
     renderProvider(await api("/api/provider/status"));
     await loadWorkerStatus();
     loadNotificationSettings().catch(() => {});
+    rehydrateRunningJobs().catch(() => {});
   } else if (!project.path) {
     clearWorkspace("Select or initialize a ctxgit project.");
   } else {
