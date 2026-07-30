@@ -4972,13 +4972,17 @@ def default_llm_config() -> dict[str, Any]:
 
 
 LLM_PROVIDER_MODELS = {
+    # GPT is a single linear series -> keep the top two.
     "codex": [
         {"id": "gpt-5.5", "label": "GPT-5.5"},
         {"id": "gpt-5.4", "label": "GPT-5.4"},
     ],
+    # Claude has tiers -> keep the best three. These CLI aliases auto-resolve to
+    # the latest model in each tier, so they stay current without hardcoding IDs.
     "claude": [
         {"id": "opus", "label": "Claude Opus (latest)"},
         {"id": "sonnet", "label": "Claude Sonnet (latest)"},
+        {"id": "haiku", "label": "Claude Haiku (latest)"},
     ],
 }
 
