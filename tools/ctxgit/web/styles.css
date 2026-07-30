@@ -1610,7 +1610,8 @@ button.section-toggle[aria-expanded="false"] .section-toggle-caret {
   margin: 1.2em 0 0.45em;
 }
 
-.markdown table {
+.markdown table,
+.message-text table {
   border-collapse: collapse;
   width: 100%;
   margin: 10px 0 18px;
@@ -1618,11 +1619,22 @@ button.section-toggle[aria-expanded="false"] .section-toggle-caret {
 }
 
 .markdown th,
-.markdown td {
+.markdown td,
+.message-text th,
+.message-text td {
   border: 1px solid var(--line);
   padding: 7px 9px;
   text-align: left;
   vertical-align: top;
+}
+
+/* Chat is narrower than the report pane, so let wide tables scroll instead of
+   overflowing the message bubble. */
+.message-text table {
+  display: block;
+  width: max-content;
+  max-width: 100%;
+  overflow-x: auto;
 }
 
 .file-browser {

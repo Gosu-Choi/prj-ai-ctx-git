@@ -581,11 +581,35 @@ function renderMessageText(text) {
   let listType = "";
   let inFence = false;
   let fenceLines = [];
+  let tableRows = [];
 
   const closeList = () => {
     if (!listType) return;
     html.push(`</${listType}>`);
     listType = "";
+  };
+  const flushTable = () => {
+    if (tableRows.length === 0) return;
+    const rows = tableRows;
+    tableRows = [];
+    // Needs a header row and a |---|---| separator to be a real table.
+    if (rows.length < 2 || !/^\s*\|?\s*:?-{3,}/.test(rows[1])) {
+      rows.forEach((row) => html.push(`<p>${renderChatInline(row)}</p>`));
+      return;
+    }
+    html.push("<table>");
+    rows.forEach((row, index) => {
+      if (index === 1) return;
+      const cells = row
+        .trim()
+        .replace(/^\|/, "")
+        .replace(/\|$/, "")
+        .split("|")
+        .map((cell) => cell.trim());
+      const tag = index === 0 ? "th" : "td";
+      html.push(`<tr>${cells.map((cell) => `<${tag}>${renderChatInline(cell)}</${tag}>`).join("")}</tr>`);
+    });
+    html.push("</table>");
   };
   const openList = (type, start = null) => {
     if (listType === type) return;
@@ -628,6 +652,13 @@ function renderMessageText(text) {
       continue;
     }
 
+    if (line.includes("|") && line.trim().startsWith("|")) {
+      closeList();
+      tableRows.push(line);
+      continue;
+    }
+    flushTable();
+
     const trimmed = line.trim();
     if (!trimmed) {
       closeList();
@@ -668,6 +699,7 @@ function renderMessageText(text) {
     html.push(`<p>${renderChatInline(line)}</p>`);
   }
   if (inFence) closeFence();
+  flushTable();
   closeList();
   return html.join("\n");
 }
