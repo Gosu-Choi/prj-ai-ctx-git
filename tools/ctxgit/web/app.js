@@ -2616,7 +2616,7 @@ function appendPendingUserMessage({ branch, text, mode }) {
   }
   appendMessageListHtml(
     `
-      <article class="message pending-message" data-pending-message="${escapeHtml(pendingId)}">
+      <article class="message message-user pending-message" data-pending-message="${escapeHtml(pendingId)}">
         <div class="message-header">
           <span class="message-role">user</span>
           <span class="message-meta-actions">
@@ -3030,7 +3030,7 @@ function renderBranch(payload) {
     payload.history
       .map(
         (message, index) => `
-          <article class="message" data-history-message="${index}">
+          <article class="message message-${escapeHtml(message.role)}" data-history-message="${index}">
             <div class="message-header">
               <span class="message-role">${escapeHtml(message.sequenceSpeaker ? `Agent ${message.sequenceSpeaker.order} · ${message.sequenceSpeaker.title || message.sequenceSpeaker.sourceBranch}` : message.role)}</span>
                 <span class="message-meta-actions">
@@ -3227,7 +3227,7 @@ function renderContextChat(payload) {
     (payload.history || [])
       .map(
         (message, index) => `
-          <article class="message">
+          <article class="message message-${escapeHtml(message.role)}">
             <div class="message-header">
               <span class="message-role">${escapeHtml(message.role)}</span>
               <span class="message-meta-actions">
@@ -3931,7 +3931,7 @@ async function loadArchive(archiveId) {
     payload.history
       .map(
         (message) => `
-          <article class="message">
+          <article class="message message-${escapeHtml(message.role)}">
             <div class="message-header">
               <span class="message-role">${escapeHtml(message.role)}</span>
               <span>${escapeHtml(message.createdAt)}</span>
@@ -3971,7 +3971,7 @@ async function loadGlobalizedArchive(archiveId) {
     (payload.history || [])
       .map(
         (message, index) => `
-          <article class="message">
+          <article class="message message-${escapeHtml(message.role)}">
             <div class="message-header">
               <span class="message-role">${escapeHtml(message.role)}</span>
               <span class="message-meta-actions">

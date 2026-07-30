@@ -975,6 +975,34 @@ button.section-toggle[aria-expanded="false"] .section-toggle-caret {
   background: #fbfbf8;
 }
 
+/* Your own messages: black background, white text, to stand out from agents. */
+.message-user {
+  background: #17181c;
+  border-color: #17181c;
+  color: #f4f4f5;
+}
+
+.message-user .message-header {
+  color: #b8b9bd;
+}
+
+.message-user .message-role {
+  color: #ffffff;
+}
+
+.message-user .message-text a {
+  color: #8ec7ff;
+}
+
+.message-user .message-text code {
+  background: rgba(255, 255, 255, 0.14);
+  color: #f4f4f5;
+}
+
+.message-user .message-options-button {
+  color: #b8b9bd;
+}
+
 .pending-label {
   color: var(--muted);
   font-size: 12px;
