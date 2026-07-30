@@ -5851,9 +5851,9 @@ def build_chat_prompt(
             "- kind: short kind such as research-note, synthesis, source-map, decision-record, report-draft.",
             "- title: short title.",
             "- body: the artifact content itself, as raw text in the chosen format.",
-            "- extension: optional file extension without the dot (default \"md\"). Set it to the format the",
-            "  user asked for, e.g. html, csv, json, txt, svg. When it is not \"md\", body must be raw content",
-            "  of that format only (e.g. a full HTML document for \"html\") with no markdown wrapper.",
+            "- extension: file extension without the dot; use \"md\" unless the user asked for another format",
+            "  (e.g. html, csv, json, txt, svg). When it is not \"md\", body must be raw content of that format",
+            "  only (e.g. a full HTML document for \"html\") with no markdown wrapper.",
             "",
             "Each approval request must have:",
             "- path: absolute outside-workspace file or directory path.",
@@ -6105,7 +6105,10 @@ def chat_output_schema() -> dict[str, Any]:
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["kind", "title", "body"],
+                    # OpenAI strict structured output requires `required` to list
+                    # every key in `properties`, so `extension` must be here too.
+                    # An empty string is fine -> sanitize_artifact_extension defaults it to "md".
+                    "required": ["kind", "title", "body", "extension"],
                     "properties": {
                         "kind": {"type": "string"},
                         "title": {"type": "string"},
