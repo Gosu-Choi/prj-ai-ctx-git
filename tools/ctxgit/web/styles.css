@@ -2809,3 +2809,152 @@ button.section-toggle[aria-expanded="false"] .section-toggle-caret {
   border-left: 2px solid var(--line);
   margin-left: 6px;
 }
+
+/* Branch folder actions + picker dialog ---------------------------------- */
+.branch-actions {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.branch-actions #contextChatButton {
+  flex: 1;
+}
+
+.branch-actions #newFolderButton {
+  flex-shrink: 0;
+  width: auto;
+  white-space: nowrap;
+}
+
+.folder-header-row {
+  display: flex;
+  align-items: center;
+}
+
+.folder-header-row .folder-header {
+  flex: 1;
+  min-width: 0;
+}
+
+.folder-delete {
+  flex-shrink: 0;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: 6px;
+  font-size: 12px;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+
+.branch-folder:hover .folder-delete {
+  opacity: 1;
+}
+
+.folder-delete:hover {
+  background: #fdecea;
+  color: #b3261e;
+}
+
+.folder-empty {
+  padding: 6px 10px;
+  font-size: 11px;
+  font-style: italic;
+}
+
+.folder-dialog {
+  width: min(360px, 92vw);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 0;
+  background: var(--panel);
+  color: var(--text);
+}
+
+.folder-dialog::backdrop {
+  background: rgb(0 0 0 / 32%);
+}
+
+.folder-dialog-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.folder-dialog-head button {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.folder-dialog-target-row {
+  padding: 10px 14px 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.folder-dialog-list {
+  display: grid;
+  gap: 4px;
+  padding: 6px 12px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.folder-pick {
+  width: 100%;
+  text-align: left;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.folder-pick:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.folder-pick.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.folder-dialog-new {
+  display: flex;
+  gap: 6px;
+  padding: 10px 12px 14px;
+  border-top: 1px solid var(--line);
+}
+
+.folder-dialog-new input {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+}
+
+.folder-dialog-new button {
+  flex-shrink: 0;
+  padding: 8px 14px;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #fff;
+  border-radius: 6px;
+  cursor: pointer;
+  font-weight: 600;
+}

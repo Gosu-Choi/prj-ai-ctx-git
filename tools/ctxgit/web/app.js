@@ -12,6 +12,7 @@ const state = {
   provider: null,
   serverProjects: [],
   extensions: [],
+  folders: [],
   worker: null,
   auth: null,
   authMode: "login",
@@ -100,6 +101,12 @@ const els = {
   extensionList: document.querySelector("#extensionList"),
   extensionContent: document.querySelector("#extensionContent"),
   contextChatButton: document.querySelector("#contextChatButton"),
+  newFolderButton: document.querySelector("#newFolderButton"),
+  folderDialog: document.querySelector("#folderDialog"),
+  folderDialogTarget: document.querySelector("#folderDialogTarget"),
+  folderDialogList: document.querySelector("#folderDialogList"),
+  folderDialogNewForm: document.querySelector("#folderDialogNewForm"),
+  folderDialogNewInput: document.querySelector("#folderDialogNewInput"),
   branchGraphButton: document.querySelector("#branchGraphButton"),
   viewList: document.querySelector("#viewList"),
   globalizedList: document.querySelector("#globalizedList"),
@@ -1482,17 +1489,72 @@ function toggleFolderCollapsed(folder) {
   renderBranches();
 }
 
+function applyFolderResponse(data) {
+  if (data.branches) state.branches = data.branches;
+  if (data.folders) state.folders = data.folders;
+  renderBranches();
+}
+
 async function setBranchFolder(branch, folder) {
   try {
-    const data = await api("/api/branch/folder", {
-      method: "POST",
-      body: JSON.stringify({ branch, folder }),
-    });
-    state.branches = data.branches || state.branches;
-    renderBranches();
+    applyFolderResponse(
+      await api("/api/branch/folder", { method: "POST", body: JSON.stringify({ branch, folder }) }),
+    );
   } catch (error) {
     window.alert(`Move to folder failed: ${error.message}`);
   }
+}
+
+async function createFolder(name) {
+  const trimmed = (name || "").trim();
+  if (!trimmed) return;
+  try {
+    applyFolderResponse(await api("/api/folders/create", { method: "POST", body: JSON.stringify({ name: trimmed }) }));
+  } catch (error) {
+    window.alert(`Folder create failed: ${error.message}`);
+  }
+}
+
+async function deleteFolder(name) {
+  if (!window.confirm(`폴더 "${name}" 삭제?\n안에 있던 브랜치는 삭제되지 않고 그룹만 해제됩니다.`)) return;
+  try {
+    applyFolderResponse(await api("/api/folders/delete", { method: "POST", body: JSON.stringify({ name }) }));
+  } catch (error) {
+    window.alert(`Folder delete failed: ${error.message}`);
+  }
+}
+
+// "Move to folder" opens a picker listing existing folders (create-first UX).
+function openFolderPicker(branch) {
+  const dialog = els.folderDialog;
+  if (!dialog) return;
+  const current = (state.branches.find((item) => item.id === branch)?.folder || "").trim();
+  els.folderDialogTarget.textContent = branch;
+  const rows = [];
+  rows.push(
+    `<button class="folder-pick ${current ? "" : "active"}" data-pick-folder="" type="button">— 그룹 해제 (폴더 없음)</button>`,
+  );
+  (state.folders || []).forEach((folder) => {
+    rows.push(
+      `<button class="folder-pick ${folder === current ? "active" : ""}" data-pick-folder="${escapeHtml(folder)}" type="button">${escapeHtml(folder)}</button>`,
+    );
+  });
+  els.folderDialogList.innerHTML = rows.join("") || '<div class="muted">폴더가 없습니다. 아래에서 새로 만드세요.</div>';
+  els.folderDialogList.querySelectorAll("[data-pick-folder]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      dialog.close();
+      await setBranchFolder(branch, button.dataset.pickFolder);
+    });
+  });
+  if (els.folderDialogNewInput) els.folderDialogNewInput.value = "";
+  els.folderDialogNewForm.onsubmit = async (event) => {
+    event.preventDefault();
+    const name = (els.folderDialogNewInput.value || "").trim();
+    if (!name) return;
+    dialog.close();
+    await setBranchFolder(branch, name); // assigning auto-registers the folder
+  };
+  dialog.showModal();
 }
 
 function renderBranches() {
@@ -1549,19 +1611,29 @@ function renderBranches() {
   const folderOf = (branch) => (branch.folder || "").trim();
   const collapsed = getCollapsedFolders();
   const ungrouped = ordered.filter((branch) => !folderOf(branch));
-  const folderNames = [...new Set(ordered.map(folderOf).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+  // Folders come from the registry (so empty folders show) unioned with any
+  // folder a branch still references.
+  const folderNames = [
+    ...new Set([...(state.folders || []), ...ordered.map(folderOf).filter(Boolean)]),
+  ].sort((a, b) => a.localeCompare(b));
   let branchHtml = ungrouped.map(buildBranchRow).join("");
   folderNames.forEach((folder) => {
     const items = ordered.filter((branch) => folderOf(branch) === folder);
     // Keep a folder open if the active branch lives inside it, even if collapsed.
     const hasActive = items.some((branch) => branch.id === state.activeBranch);
     const isCollapsed = collapsed.includes(folder) && !hasActive;
+    const body = items.length
+      ? items.map(buildBranchRow).join("")
+      : '<div class="folder-empty muted">비어 있음 — 브랜치의 ⋯ → Move to folder</div>';
     branchHtml += `
       <div class="branch-folder ${isCollapsed ? "collapsed" : ""}">
-        <button class="folder-header" data-folder="${escapeHtml(folder)}" type="button" title="${escapeHtml(folder)}">
-          <span class="folder-caret" aria-hidden="true">▾</span><span class="folder-name">${escapeHtml(folder)}</span><span class="folder-count">${items.length}</span>
-        </button>
-        <div class="folder-body">${items.map(buildBranchRow).join("")}</div>
+        <div class="folder-header-row">
+          <button class="folder-header" data-folder="${escapeHtml(folder)}" type="button" title="${escapeHtml(folder)}">
+            <span class="folder-caret" aria-hidden="true">▾</span><span class="folder-name">${escapeHtml(folder)}</span><span class="folder-count">${items.length}</span>
+          </button>
+          <button class="folder-delete" data-folder-delete="${escapeHtml(folder)}" type="button" title="폴더 삭제 (브랜치는 유지)" aria-label="Delete folder">✕</button>
+        </div>
+        <div class="folder-body">${body}</div>
       </div>
     `;
   });
@@ -1573,13 +1645,13 @@ function renderBranches() {
     button.addEventListener("click", (event) => {
       event.stopPropagation();
       closeBranchMenus();
-      const branch = button.dataset.branchFolder;
-      const current = button.dataset.branchCurrentFolder || "";
-      const existing = [...new Set(state.branches.map((item) => (item.folder || "").trim()).filter(Boolean))];
-      const hint = existing.length ? `\n기존 폴더: ${existing.join(", ")}` : "";
-      const folder = window.prompt(`"${branch}" 을(를) 넣을 폴더 이름 (비우면 그룹 해제):${hint}`, current);
-      if (folder === null) return;
-      setBranchFolder(branch, folder.trim());
+      openFolderPicker(button.dataset.branchFolder);
+    });
+  });
+  els.branchList.querySelectorAll("[data-folder-delete]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      deleteFolder(button.dataset.folderDelete);
     });
   });
   els.branchList.querySelectorAll("[data-branch]").forEach((button) => {
@@ -2884,6 +2956,7 @@ function renderActiveBranchJob() {
 async function refreshBranchNavigation() {
   const data = await api("/api/branches");
   state.branches = data.branches || [];
+  state.folders = data.folders || [];
   state.archived = data.archived || [];
   state.views = data.views || [];
   state.globalized = data.globalized || [];
@@ -3529,6 +3602,7 @@ function renderArchives(archives) {
 async function loadBranches() {
   const data = await api("/api/branches");
   state.branches = data.branches || [];
+  state.folders = data.folders || [];
   state.archived = data.archived || [];
   state.views = data.views || [];
   state.globalized = data.globalized || [];
@@ -5441,6 +5515,12 @@ els.extensionsToggle?.addEventListener("click", () => {
   const expanded = els.extensionsToggle.getAttribute("aria-expanded") === "true";
   els.extensionsBody.hidden = expanded;
   els.extensionsToggle.setAttribute("aria-expanded", String(!expanded));
+});
+
+els.newFolderButton?.addEventListener("click", () => {
+  const name = window.prompt("새 폴더 이름:");
+  if (name === null) return;
+  createFolder(name);
 });
 
 // Global toggle for Telegram completion messages (one switch controls all projects).

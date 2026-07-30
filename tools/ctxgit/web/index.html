@@ -94,7 +94,10 @@
             <span class="section-toggle-caret" aria-hidden="true">▾</span><span>Branches</span>
           </button>
           <div id="branchesBody">
-            <button id="contextChatButton" class="wide-button" type="button">Contexts chat</button>
+            <div class="branch-actions">
+              <button id="contextChatButton" class="wide-button" type="button">Contexts chat</button>
+              <button id="newFolderButton" class="wide-button" type="button" title="Create an empty folder to group branches into">＋ 새 폴더</button>
+            </div>
             <div id="branchList" class="nav-list"></div>
           </div>
         </section>
@@ -372,6 +375,19 @@
         </section>
       </main>
     </div>
+
+    <dialog id="folderDialog" class="folder-dialog">
+      <div class="folder-dialog-head">
+        <strong>폴더로 이동</strong>
+        <button type="button" onclick="this.closest('dialog').close()" aria-label="Close">✕</button>
+      </div>
+      <div class="folder-dialog-target-row">브랜치: <code id="folderDialogTarget"></code></div>
+      <div id="folderDialogList" class="folder-dialog-list"></div>
+      <form id="folderDialogNewForm" class="folder-dialog-new">
+        <input id="folderDialogNewInput" type="text" placeholder="새 폴더 이름" autocomplete="off" />
+        <button type="submit">만들고 이동</button>
+      </form>
+    </dialog>
 
     <dialog id="orchestrationDialog" class="orchestration-dialog">
       <div class="orchestration-head">

@@ -2159,6 +2159,8 @@ class ContextStore:
         folder = (folder or "").strip()
         if folder:
             meta["folder"] = folder
+            # Keep the registry in sync so the folder persists even if later emptied.
+            self._write_branch_folder_registry(self._read_branch_folder_registry() + [folder])
         else:
             meta.pop("folder", None)
         meta["updatedAt"] = utc_now()
@@ -2422,6 +2424,55 @@ class ContextStore:
             items.append(self.branch_list_item(meta_path))
         self.sort_branch_list(items)
         return items
+
+    def branch_folders_path(self) -> Path:
+        return self.contexts / "branch-folders.json"
+
+    def _read_branch_folder_registry(self) -> list[str]:
+        path = self.branch_folders_path()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            return []
+        names = data.get("folders") if isinstance(data, dict) else []
+        return [str(n).strip() for n in (names or []) if str(n).strip()]
+
+    def _write_branch_folder_registry(self, names: list[str]) -> None:
+        cleaned = sorted({n.strip() for n in names if isinstance(n, str) and n.strip()}, key=str.lower)
+        dump_json(self.branch_folders_path(), {"folders": cleaned})
+
+    def list_branch_folders(self) -> list[str]:
+        """Registered folder names, unioned with any folder still referenced by a branch."""
+        self.require_initialized()
+        names = set(self._read_branch_folder_registry())
+        for item in self.list_branches():
+            folder = str(item.get("folder") or "").strip()
+            if folder:
+                names.add(folder)
+        return sorted(names, key=str.lower)
+
+    def create_branch_folder(self, name: str) -> None:
+        self.require_initialized()
+        name = (name or "").strip()
+        if not name:
+            die("folder name is required")
+        self._write_branch_folder_registry(self._read_branch_folder_registry() + [name])
+
+    def delete_branch_folder(self, name: str) -> None:
+        """Delete a folder: un-group its branches (they are kept) and drop the name."""
+        self.require_initialized()
+        name = (name or "").strip()
+        if not name:
+            return
+        for meta_path in sorted(self.branches.glob("*/branch.json")):
+            meta = load_json(meta_path)
+            if str(meta.get("folder") or "").strip() == name:
+                meta.pop("folder", None)
+                meta["updatedAt"] = utc_now()
+                dump_json(meta_path, meta)
+        remaining = [n for n in self._read_branch_folder_registry() if n != name]
+        self._write_branch_folder_registry(remaining)
+        self.write_index()
 
     def list_archived_branches(self) -> list[dict[str, Any]]:
         self.require_initialized()
@@ -10629,6 +10680,7 @@ def make_handler(
                 self.send_json(
                     {
                         "branches": store.list_branches(),
+                        "folders": store.list_branch_folders(),
                         "archived": store.list_archived_branches(),
                         "views": store.list_views(),
                         "globalized": store.list_globalized_archives(),
@@ -11561,9 +11613,32 @@ def make_handler(
                         branch_id=branch_id,
                         metadata={"branch": branch_id, "folder": folder},
                     )
-                    self.send_json({"branches": store.list_branches()})
+                    self.send_json({"branches": store.list_branches(), "folders": store.list_branch_folders()})
                 except SystemExit as exc:
                     self.send_json({"error": "folder_failed"}, status=int(exc.code or 400))
+                return
+            if parsed.path == "/api/folders/create":
+                name = str(body.get("name") or "")
+                try:
+                    store.create_branch_folder(name)
+                    self.send_json({"branches": store.list_branches(), "folders": store.list_branch_folders()})
+                except SystemExit as exc:
+                    self.send_json({"error": "folder_create_failed"}, status=int(exc.code or 400))
+                return
+            if parsed.path == "/api/folders/delete":
+                name = str(body.get("name") or "")
+                try:
+                    store.delete_branch_folder(name)
+                    internal_git_commit_turn(
+                        store,
+                        kind="branch-folder-delete",
+                        actor="user",
+                        summary=f"Delete folder {name} (branches ungrouped, kept)",
+                        metadata={"folder": name},
+                    )
+                    self.send_json({"branches": store.list_branches(), "folders": store.list_branch_folders()})
+                except SystemExit as exc:
+                    self.send_json({"error": "folder_delete_failed"}, status=int(exc.code or 400))
                 return
             if parsed.path == "/api/branch/remove":
                 branch_id = str(body.get("branch") or "")
