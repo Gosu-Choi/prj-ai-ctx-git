@@ -1018,6 +1018,78 @@ button.section-toggle[aria-expanded="false"] .section-toggle-caret {
   color: #b8b9bd;
 }
 
+/* A chat that got no answer: light red, with one-click resend / delete.
+   Declared after .message-user so it overrides the black user-message style. */
+.message-failed {
+  background: #fdecea;
+  border-color: #f1b0b0;
+  color: #5a1a1a;
+}
+
+.message-failed .message-header {
+  color: #8a4a4a;
+}
+
+.message-failed .message-role {
+  color: #b3261e;
+}
+
+.message-failed .message-text a {
+  color: #0645ad;
+}
+
+.message-failed .message-text code {
+  background: rgba(0, 0, 0, 0.06);
+  color: #5a1a1a;
+}
+
+.message-failed .message-options-button {
+  color: #8a4a4a;
+}
+
+.message-failed-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.message-failed-note {
+  color: #b3261e;
+  font-size: 12px;
+  font-weight: 700;
+  margin-right: auto;
+}
+
+.message-failed-resend,
+.message-failed-delete {
+  padding: 5px 11px;
+  border-radius: 5px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.message-failed-resend {
+  border: 1px solid #b3261e;
+  background: #fff;
+  color: #b3261e;
+}
+
+.message-failed-resend:hover {
+  background: #b3261e;
+  color: #fff;
+}
+
+.message-failed-delete {
+  border: 1px solid #d0a0a0;
+  background: transparent;
+  color: #8a2a2a;
+}
+
+.message-failed-delete:hover {
+  background: #f6dada;
+}
+
 .pending-label {
   color: var(--muted);
   font-size: 12px;

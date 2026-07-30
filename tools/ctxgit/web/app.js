@@ -2988,8 +2988,22 @@ async function monitorTrackedJob(jobId) {
                   : remembered.mode === "context-chat"
                     ? "컨텍스트 챗 실패"
                     : "채팅 실패";
-        showChatError(`${prefix}: ${remembered.message || "작업 실패"}`);
+        const errorText = `${prefix}: ${remembered.message || "작업 실패"}`;
+        showChatError(errorText);
         hideProgress();
+        // Re-render from history so the unanswered message shows in red with
+        // one-click resend/delete (the pending bubble is replaced by the real one).
+        // renderBranch clears the error banner, so re-show it afterwards.
+        if (remembered.mode !== "context-chat" && remembered.mode !== "merge" && state.activeBranch === branch) {
+          api(`/api/branch?id=${encodeURIComponent(branch)}`)
+            .then((payload) => {
+              if (state.activeBranch === branch && !state.activeContextChat) {
+                renderBranch(payload);
+                showChatError(errorText);
+              }
+            })
+            .catch(() => {});
+        }
       }
       updateComposerState();
       loadWorkerStatus().catch(() => {});
@@ -3044,11 +3058,22 @@ function renderBranch(payload) {
     ? `${meta.id} · archived branch · read only`
     : `${meta.id} · history.jsonl is Git-tracked conversation history`;
 
+  // A turn that got no answer leaves a trailing user message with no reply and no
+  // running job. Flag it so the user can resend or delete it in one click.
+  const branchBusy = Boolean(activeBranchRunningJob(meta.id)) || Boolean(state.startingBranches[meta.id]);
+  const failedUserIndex =
+    !archived &&
+    !sequenceRoom &&
+    !branchBusy &&
+    payload.history.length > 0 &&
+    payload.history[payload.history.length - 1].role === "user"
+      ? payload.history.length - 1
+      : -1;
   replaceMessageListHtml(
     payload.history
       .map(
         (message, index) => `
-          <article class="message message-${escapeHtml(message.role)}" data-history-message="${index}">
+          <article class="message message-${escapeHtml(message.role)}${index === failedUserIndex ? " message-failed" : ""}" data-history-message="${index}">
             <div class="message-header">
               <span class="message-role">${escapeHtml(message.sequenceSpeaker ? `Agent ${message.sequenceSpeaker.order} · ${message.sequenceSpeaker.title || message.sequenceSpeaker.sourceBranch}` : message.role)}</span>
                 <span class="message-meta-actions">
@@ -3115,6 +3140,21 @@ function renderBranch(payload) {
               </span>
             </div>
             <div class="message-text">${renderMessageText(message.text)}</div>
+            ${
+              index === failedUserIndex
+                ? `<div class="message-failed-actions">
+                    <span class="message-failed-note">답이 오지 않았습니다</span>
+                    <button class="message-failed-resend" data-failed-resend="${index}" type="button">↻ 재전송</button>
+                    <button
+                      class="message-failed-delete danger"
+                      data-failed-delete="${index}"
+                      data-history-created-at="${escapeHtml(message.createdAt || "")}"
+                      data-history-role="${escapeHtml(message.role || "")}"
+                      type="button"
+                    >🗑 삭제</button>
+                  </div>`
+                : ""
+            }
             ${renderSequenceEvaluation(message)}
             ${renderMessageResources(message.resources)}
             ${renderArtifacts(message.artifacts)}
@@ -3175,6 +3215,18 @@ function renderBranch(payload) {
       event.stopPropagation();
       closeMessageMenus();
       deleteHistoryMessage(button);
+    });
+  });
+  els.messageList.querySelectorAll("[data-failed-resend]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      resendFailedMessage(Number.parseInt(button.dataset.failedResend || "", 10));
+    });
+  });
+  els.messageList.querySelectorAll("[data-failed-delete]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      deleteFailedMessage(button);
     });
   });
   scrollChatToBottom();
@@ -3761,6 +3813,58 @@ async function deleteHistoryMessage(button) {
   } finally {
     button.disabled = false;
   }
+}
+
+// One-click delete of an unanswered message (no confirm; it never got a reply).
+async function deleteFailedMessage(button) {
+  const branch = state.activeBranch;
+  if (!branch) return;
+  const index = Number.parseInt(button.dataset.failedDelete || "", 10);
+  if (!Number.isInteger(index)) return;
+  button.disabled = true;
+  try {
+    const payload = await api("/api/history/delete", {
+      method: "POST",
+      body: JSON.stringify({
+        branch,
+        index,
+        createdAt: button.dataset.historyCreatedAt || "",
+        role: button.dataset.historyRole || "",
+      }),
+    });
+    if (state.activeBranch === branch) {
+      renderBranch(payload);
+      renderGit(await api("/api/git/status"));
+      await refreshBranchNavigation();
+    }
+  } catch (error) {
+    window.alert(`삭제 실패: ${error.message}`);
+    button.disabled = false;
+  }
+}
+
+// One-click resend: drop the unanswered message so it is not duplicated, then
+// send its text again with the same mode.
+async function resendFailedMessage(index) {
+  const branch = state.activeBranch;
+  const message = state.payload?.history?.[index];
+  if (!branch || !message || message.role !== "user") return;
+  const text = String(message.text || "");
+  if (!text.trim()) return;
+  const mode = ["chat", "info-chat", "research", "team"].includes(message.mode) ? message.mode : "info-chat";
+  try {
+    const payload = await api("/api/history/delete", {
+      method: "POST",
+      body: JSON.stringify({ branch, index, createdAt: message.createdAt || "", role: message.role || "" }),
+    });
+    if (state.activeBranch === branch) renderBranch(payload);
+  } catch (error) {
+    window.alert(`재전송 실패: ${error.message}`);
+    return;
+  }
+  els.messageInput.value = text;
+  resizeMessageInput();
+  await sendComposerMessage({ mode, runningAction: "stop" });
 }
 
 async function cutHistoryMessage(button) {
