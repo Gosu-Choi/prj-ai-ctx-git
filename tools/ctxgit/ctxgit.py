@@ -6956,6 +6956,27 @@ def parse_claude_result(raw: str) -> dict[str, Any]:
     return parse_chat_result(raw)
 
 
+def claude_error_summary(raw: str, stderr: str, returncode: int) -> str:
+    """Human-readable failure reason from Claude Code's stream-json, not the raw dump.
+
+    The CLI writes everything (init line, retries, result) to stdout, so on
+    failure the meaningful error (e.g. "API Error: 529 Overloaded") lives in the
+    final result event. Surface that instead of the whole blob.
+    """
+    payload = claude_final_result_payload(raw)
+    if isinstance(payload, dict):
+        result = payload.get("result")
+        if isinstance(result, str) and result.strip():
+            return result.strip()
+        subtype = str(payload.get("subtype") or "").strip()
+        if subtype:
+            return f"Claude Code error: {subtype}"
+    err = stderr.strip()
+    if err:
+        return compact_progress_text(err, 300)
+    return f"Claude Code failed with exit code {returncode}"
+
+
 def claude_structured_output_retry_failed(stdout: str, stderr: str) -> bool:
     detail = "\n".join(part for part in [stdout.strip(), stderr.strip()] if part)
     if not detail:
@@ -7096,8 +7117,9 @@ def call_claude_prompt(
             raise ChatTimeoutError(f"Claude Code fallback timed out after {timeout_seconds} seconds") from exc
         fallback_raw = fallback_completed.stdout.strip()
         if fallback_completed.returncode != 0:
-            detail = fallback_completed.stderr.strip() or fallback_raw or completed.stderr.strip() or raw
-            raise RuntimeError(detail or f"Claude Code failed with exit code {fallback_completed.returncode}")
+            raise RuntimeError(
+                claude_error_summary(fallback_raw or raw, fallback_completed.stderr, fallback_completed.returncode)
+            )
         emit_progress(progress, "Parsing Claude Code response")
         parsed = parse_claude_result(fallback_raw)
         parsed["provider"] = "claude"
@@ -7105,8 +7127,7 @@ def call_claude_prompt(
         parsed["structuredOutputFallback"] = True
         return parsed
     if completed.returncode != 0:
-        detail = completed.stderr.strip() or raw
-        raise RuntimeError(detail or f"Claude Code failed with exit code {completed.returncode}")
+        raise RuntimeError(claude_error_summary(raw, completed.stderr, completed.returncode))
     emit_progress(progress, "Parsing Claude Code response")
     parsed = parse_claude_result(raw)
     parsed["provider"] = "claude"
