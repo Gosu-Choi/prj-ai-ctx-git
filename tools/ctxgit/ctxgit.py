@@ -551,6 +551,23 @@ def instagram_mcp_server_spec() -> dict[str, Any]:
     }
 
 
+def apply_codex_instagram_mcp(cmd: list[str], root: Path) -> None:
+    """Register the Instagram MCP server on a Codex command (when active).
+
+    Must be applied to every user-facing Codex chat path (chat, context chat,
+    history chat, team pipeline) so the agent can use the tool — not just one.
+    default_tools_approval_mode="approve" auto-approves the server's tool calls
+    so the non-interactive `exec` run does not cancel them. `-c` overrides are
+    global options and are inserted before the `exec` subcommand.
+    """
+    if not instagram_active():
+        return
+    spec = instagram_mcp_server_spec()
+    cmd.extend(["-c", "mcp_servers.instagram.command=" + json.dumps(spec["command"])])
+    cmd.extend(["-c", "mcp_servers.instagram.args=" + json.dumps(spec["args"])])
+    cmd.extend(["-c", 'mcp_servers.instagram.default_tools_approval_mode="approve"'])
+
+
 def send_telegram_message(token: str, chat_id: str, text: str, timeout: int = 8) -> None:
     """Send a Telegram text message via the Bot API. Raises on failure."""
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -6697,6 +6714,7 @@ def call_codex_chat(
         output_path = tmp_path / "last-message.txt"
         write_text(schema_path, json.dumps(output_schema or chat_output_schema(), indent=2))
         cmd = resolve_codex_command(root)
+        apply_codex_instagram_mcp(cmd, root)
         if codex_config.get("webSearch") is not False:
             cmd.append("--search")
         cmd.extend([
@@ -6781,6 +6799,7 @@ def call_codex_history_chat(
         output_path = tmp_path / "last-message.txt"
         write_text(schema_path, json.dumps(output_schema or chat_output_schema(), indent=2))
         cmd = resolve_codex_command(root)
+        apply_codex_instagram_mcp(cmd, root)
         if codex_config.get("webSearch") is not False:
             cmd.append("--search")
         cmd.extend(
@@ -6858,6 +6877,7 @@ def call_codex_context_chat(
         output_path = tmp_path / "last-message.txt"
         write_text(schema_path, json.dumps(chat_output_schema(), indent=2))
         cmd = resolve_codex_command(root)
+        apply_codex_instagram_mcp(cmd, root)
         if codex_config.get("webSearch") is not False:
             cmd.append("--search")
         cmd.extend(
@@ -6936,15 +6956,7 @@ def call_codex_prompt(
         output_path = tmp_path / "last-message.txt"
         write_text(schema_path, json.dumps(output_schema or chat_output_schema(), indent=2))
         cmd = resolve_codex_command(root)
-        if instagram_active():
-            # Register the Instagram MCP server via TOML config overrides. Values
-            # are parsed as TOML; JSON strings/arrays are valid TOML literals.
-            # default_tools_approval_mode="approve" auto-approves this server's
-            # tool calls so the non-interactive `exec` run does not cancel them.
-            spec = instagram_mcp_server_spec()
-            cmd.extend(["-c", "mcp_servers.instagram.command=" + json.dumps(spec["command"])])
-            cmd.extend(["-c", "mcp_servers.instagram.args=" + json.dumps(spec["args"])])
-            cmd.extend(["-c", 'mcp_servers.instagram.default_tools_approval_mode="approve"'])
+        apply_codex_instagram_mcp(cmd, root)
         if config.get("webSearch") is not False:
             cmd.append("--search")
         cmd.extend(["--ask-for-approval", "never", "exec"])
