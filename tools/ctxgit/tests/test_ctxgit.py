@@ -3214,17 +3214,17 @@ class CtxgitTest(unittest.TestCase):
             config = ctxgit.load_json(root / ".ctxgit/config.json")
             config["llm"]["codex"]["model"] = ""
             ctxgit.dump_json(root / ".ctxgit/config.json", config)
-            self.assertEqual(ctxgit.read_llm_config(root)["codex"]["model"], "gpt-5.5")
+            self.assertEqual(ctxgit.read_llm_config(root)["codex"]["model"], "gpt-5.6-sol")
 
             original = ctxgit.provider_status
             ctxgit.provider_status = lambda _root: {"ok": True, "provider": "codex"}
             try:
-                ctxgit.write_provider_config(root, {"provider": "codex", "model": "gpt-5.4"})
+                ctxgit.write_provider_config(root, {"provider": "codex", "model": "gpt-5.6-terra"})
                 with self.assertRaises(ValueError):
                     ctxgit.write_provider_config(root, {"provider": "codex", "model": "opus"})
             finally:
                 ctxgit.provider_status = original
-            self.assertEqual(ctxgit.read_llm_config(root)["codex"]["model"], "gpt-5.4")
+            self.assertEqual(ctxgit.read_llm_config(root)["codex"]["model"], "gpt-5.6-terra")
 
     def test_llm_config_defaults_web_search_on(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
