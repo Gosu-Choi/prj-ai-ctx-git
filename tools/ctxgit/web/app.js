@@ -1607,6 +1607,8 @@ function renderBranches() {
     `;
   };
 
+  // Branches keep one global sort (orderedBranches); folders just partition that
+  // same ordered list, so within-folder order matches the ungrouped order.
   const ordered = orderedBranches();
   const folderOf = (branch) => (branch.folder || "").trim();
   const collapsed = getCollapsedFolders();
@@ -1616,7 +1618,8 @@ function renderBranches() {
   const folderNames = [
     ...new Set([...(state.folders || []), ...ordered.map(folderOf).filter(Boolean)]),
   ].sort((a, b) => a.localeCompare(b));
-  let branchHtml = ungrouped.map(buildBranchRow).join("");
+  // Folders render ABOVE the ungrouped branches.
+  let branchHtml = "";
   folderNames.forEach((folder) => {
     const items = ordered.filter((branch) => folderOf(branch) === folder);
     // Keep a folder open if the active branch lives inside it, even if collapsed.
@@ -1637,6 +1640,7 @@ function renderBranches() {
       </div>
     `;
   });
+  branchHtml += ungrouped.map(buildBranchRow).join("");
   els.branchList.innerHTML = branchHtml || '<div class="muted">No branches yet</div>';
   els.branchList.querySelectorAll("[data-folder]").forEach((button) => {
     button.addEventListener("click", () => toggleFolderCollapsed(button.dataset.folder));
