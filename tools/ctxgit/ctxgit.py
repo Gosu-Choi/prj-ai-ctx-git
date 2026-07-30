@@ -71,6 +71,8 @@ from orchestration import (  # noqa: E402
     run_team_pipeline,
 )
 
+import extensions  # noqa: E402
+
 
 BRAVE_WEB_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
 BRAVE_LLM_CONTEXT_URL = "https://api.search.brave.com/res/v1/llm/context"
@@ -101,7 +103,6 @@ PROJECT_ENV_ALLOWED_KEYS = {
     "BRAVE_API_KEY",
     "TELEGRAM_BOT_TOKEN",
     "TELEGRAM_CHAT_ID",
-    "ROCKETAPI_KEY",
 }
 REPO_ENV_FILES = (".env",)
 PROJECT_ENV_FILES = (".ctxgit/.env", ".env")
@@ -494,276 +495,60 @@ def telegram_config_for_root(root: Path) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# Extensions: Rocket API (Instagram)
+# Extensions: optional add-ons (see the `extensions/` package).
 #
-# An optional add-on, not a fundamental ctxgit feature. Needs a Rocket API key
-# (https://rocketapi.io) in the gitignored .env as ROCKETAPI_KEY.
+# Each add-on's implementation and its secrets live in extensions/<name>/ (its
+# own .env). ctxgit owns only the enable/disable state (global settings) and the
+# HTTP/MCP wiring below.
 # ---------------------------------------------------------------------------
-ROCKETAPI_BASE = "https://v1.rocketapi.io"
-INSTAGRAM_IMAGE_HOSTS = ("cdninstagram.com", "fbcdn.net")
+def extension_enabled(ext_id: str) -> bool:
+    """Whether an extension is activated. Defaults to enabled when unset."""
+    settings = read_global_settings()
+    registry = settings.get("extensions")
+    entry = registry.get(ext_id) if isinstance(registry, dict) else None
+    if isinstance(entry, dict) and "enabled" in entry:
+        return bool(entry.get("enabled"))
+    return True
 
 
-def rocketapi_key_for_root(root: Path) -> str:
-    try:
-        values, _ = read_project_env(root)
-    except Exception:  # noqa: BLE001 - config read must never break the request
-        return ""
-    return values.get("ROCKETAPI_KEY", "").strip()
+def set_extension_enabled(ext_id: str, enabled: bool) -> None:
+    settings = read_global_settings()
+    registry = settings.get("extensions")
+    if not isinstance(registry, dict):
+        registry = {}
+    entry = registry.get(ext_id)
+    if not isinstance(entry, dict):
+        entry = {}
+    entry["enabled"] = bool(enabled)
+    registry[ext_id] = entry
+    settings["extensions"] = registry
+    write_global_settings(settings)
 
 
-def rocketapi_post(key: str, path: str, payload: dict[str, Any], timeout: int = 20) -> dict[str, Any]:
-    """POST to Rocket API and return the parsed JSON body. Raises ValueError on failure."""
-    if not key:
-        raise ValueError("Rocket API key is not configured (set ROCKETAPI_KEY in .env)")
-    url = ROCKETAPI_BASE + path
-    data = json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(
-        url,
-        data=data,
-        method="POST",
-        headers={"Content-Type": "application/json", "Authorization": f"Token {key}"},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            body = response.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")[:300] if hasattr(exc, "read") else str(exc)
-        raise ValueError(f"Rocket API error {exc.code}: {detail}") from exc
-    except Exception as exc:  # noqa: BLE001 - surface network failures to the UI
-        raise ValueError(f"Rocket API request failed: {exc}") from exc
-    try:
-        return json.loads(body)
-    except json.JSONDecodeError as exc:
-        raise ValueError("Rocket API returned invalid JSON") from exc
+def extension_status_payload() -> list[dict[str, Any]]:
+    """Metadata + {configured, enabled} for every registered extension."""
+    payload = []
+    for ext in extensions.all_extensions():
+        meta = extensions.metadata(ext)
+        meta["enabled"] = extension_enabled(ext.ID)
+        payload.append(meta)
+    return payload
 
 
-def _first_dict_with(obj: Any, *keys: str) -> dict[str, Any] | None:
-    """Depth-first search for the first dict containing any of `keys`."""
-    if isinstance(obj, dict):
-        if any(k in obj for k in keys):
-            return obj
-        for value in obj.values():
-            found = _first_dict_with(value, *keys)
-            if found is not None:
-                return found
-    elif isinstance(obj, list):
-        for value in obj:
-            found = _first_dict_with(value, *keys)
-            if found is not None:
-                return found
-    return None
+def instagram_active() -> bool:
+    """The Instagram MCP/endpoints are usable only when enabled AND configured."""
+    return extension_enabled(extensions.instagram.ID) and extensions.instagram.configured()
 
 
-def instagram_profile_from_response(data: dict[str, Any]) -> dict[str, Any]:
-    """Normalize a get_web_profile_info response into a flat profile dict."""
-    user = _first_dict_with(data, "edge_followed_by", "biography") or {}
-    def count(node: Any) -> int:
-        return int(node.get("count", 0)) if isinstance(node, dict) else int(node or 0)
-    return {
-        "id": str(user.get("id") or user.get("pk") or ""),
-        "username": user.get("username") or "",
-        "full_name": user.get("full_name") or "",
-        "biography": user.get("biography") or "",
-        "profile_pic_url": user.get("profile_pic_url_hd") or user.get("profile_pic_url") or "",
-        "is_verified": bool(user.get("is_verified")),
-        "is_private": bool(user.get("is_private")),
-        "followers": count(user.get("edge_followed_by") or user.get("follower_count")),
-        "following": count(user.get("edge_follow") or user.get("following_count")),
-        "posts": count(user.get("edge_owner_to_timeline_media") or user.get("media_count")),
-        "external_url": user.get("external_url") or "",
-    }
+INSTAGRAM_MCP_TOOL_NAMES = extensions.mcp_tool_names(extensions.instagram)
 
 
-def _ig_media_thumbnail(item: dict[str, Any]) -> str:
-    versions = item.get("image_versions2")
-    if isinstance(versions, dict):
-        cands = versions.get("candidates")
-        if isinstance(cands, list) and cands and isinstance(cands[0], dict):
-            return str(cands[0].get("url") or "")
-    return str(item.get("thumbnail_url") or item.get("display_url") or "")
-
-
-def instagram_media_from_response(data: dict[str, Any], limit: int = 12) -> list[dict[str, Any]]:
-    """Normalize a get_media response into a list of post thumbnails."""
-    items = None
-    node = _first_dict_with(data, "items")
-    if isinstance(node, dict) and isinstance(node.get("items"), list):
-        items = node["items"]
-    if items is None:
-        # Fallback: graphql edges shape.
-        edges_node = _first_dict_with(data, "edges")
-        if isinstance(edges_node, dict) and isinstance(edges_node.get("edges"), list):
-            items = [e.get("node", {}) for e in edges_node["edges"] if isinstance(e, dict)]
-    if not isinstance(items, list):
-        return []
-    out: list[dict[str, Any]] = []
-    for raw in items[: max(0, limit)]:
-        if not isinstance(raw, dict):
-            continue
-        item = raw.get("media") if isinstance(raw.get("media"), dict) else raw
-        caption = item.get("caption")
-        caption_text = caption.get("text") if isinstance(caption, dict) else (caption or "")
-        code = item.get("code") or item.get("shortcode") or ""
-        out.append(
-            {
-                "id": str(item.get("id") or item.get("pk") or ""),
-                "shortcode": code,
-                "permalink": f"https://www.instagram.com/p/{code}/" if code else "",
-                "thumbnail_url": _ig_media_thumbnail(item),
-                "caption": str(caption_text or "")[:280],
-                "like_count": int(item.get("like_count") or 0),
-                "comment_count": int(item.get("comment_count") or 0),
-                "is_video": int(item.get("media_type") or 0) == 2 or bool(item.get("is_video")),
-            }
-        )
-    return out
-
-
-def is_instagram_image_url(url: str) -> bool:
-    try:
-        host = urllib.parse.urlparse(url).hostname or ""
-    except ValueError:
-        return False
-    return any(host == h or host.endswith("." + h) for h in INSTAGRAM_IMAGE_HOSTS)
-
-
-# --- Instagram as an MCP tool the chat agents can call mid-conversation -------
-INSTAGRAM_MCP_TOOLS = [
-    {
-        "name": "get_instagram_profile",
-        "description": (
-            "Fetch a public Instagram profile by username via Rocket API. Returns JSON with "
-            "id, username, full_name, biography, followers, following, posts, is_verified, "
-            "is_private, external_url. Use the returned `id` to then call get_instagram_media."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "username": {"type": "string", "description": "Instagram username without the @"},
-            },
-            "required": ["username"],
-            "additionalProperties": False,
-        },
-    },
-    {
-        "name": "get_instagram_media",
-        "description": (
-            "Fetch recent posts for an Instagram numeric user id (obtained from "
-            "get_instagram_profile) via Rocket API. Returns a JSON array of posts with "
-            "shortcode, permalink, caption, like_count, comment_count, is_video."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "id": {"type": "string", "description": "Instagram numeric user id"},
-                "count": {"type": "integer", "description": "Number of posts (1-24, default 12)"},
-            },
-            "required": ["id"],
-            "additionalProperties": False,
-        },
-    },
-]
-
-INSTAGRAM_MCP_TOOL_NAMES = tuple(f"mcp__instagram__{tool['name']}" for tool in INSTAGRAM_MCP_TOOLS)
-
-
-def instagram_mcp_available(root: Path) -> bool:
-    """Only advertise the Instagram tools when a Rocket API key is configured."""
-    return bool(rocketapi_key_for_root(root))
-
-
-def instagram_mcp_server_spec(root: Path) -> dict[str, Any]:
+def instagram_mcp_server_spec() -> dict[str, Any]:
     """How the chat agent should spawn the stdio MCP server (this same script)."""
     return {
         "command": sys.executable,
-        "args": [str(Path(__file__).resolve()), "mcp-instagram", "--root", str(root.resolve())],
+        "args": [str(Path(__file__).resolve()), "mcp-instagram"],
     }
-
-
-def _instagram_mcp_call(key: str, name: str, arguments: dict[str, Any]) -> Any:
-    if name == "get_instagram_profile":
-        username = str(arguments.get("username") or "").strip().lstrip("@")
-        if not username:
-            raise ValueError("username is required")
-        raw = rocketapi_post(key, "/instagram/user/get_web_profile_info", {"username": username})
-        return instagram_profile_from_response(raw)
-    if name == "get_instagram_media":
-        user_id = str(arguments.get("id") or "").strip()
-        if not user_id:
-            raise ValueError("id is required")
-        try:
-            count = int(arguments.get("count") or 12)
-        except (TypeError, ValueError):
-            count = 12
-        count = max(1, min(count, 24))
-        raw = rocketapi_post(key, "/instagram/user/get_media", {"id": user_id, "count": count})
-        return instagram_media_from_response(raw, limit=count)
-    raise ValueError(f"Unknown tool: {name}")
-
-
-def run_instagram_mcp_server(root: Path) -> int:
-    """Minimal stdio MCP (JSON-RPC 2.0) server exposing the Instagram tools.
-
-    Spawned by the Claude/Codex CLI during a chat turn so the agent can look up
-    Instagram data on its own. Reads ROCKETAPI_KEY from the project/repo .env.
-    """
-    key = rocketapi_key_for_root(root)
-
-    def send(message: dict[str, Any]) -> None:
-        sys.stdout.write(json.dumps(message) + "\n")
-        sys.stdout.flush()
-
-    for raw_line in sys.stdin:
-        line = raw_line.strip()
-        if not line:
-            continue
-        try:
-            msg = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        method = msg.get("method")
-        msg_id = msg.get("id")
-        if method == "initialize":
-            requested = (msg.get("params") or {}).get("protocolVersion") or "2025-06-18"
-            send({
-                "jsonrpc": "2.0",
-                "id": msg_id,
-                "result": {
-                    "protocolVersion": requested,
-                    "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "ctxgit-instagram", "version": "1.0.0"},
-                },
-            })
-        elif method == "notifications/initialized":
-            continue  # notification: no response expected
-        elif method == "ping":
-            send({"jsonrpc": "2.0", "id": msg_id, "result": {}})
-        elif method == "tools/list":
-            send({"jsonrpc": "2.0", "id": msg_id, "result": {"tools": INSTAGRAM_MCP_TOOLS}})
-        elif method == "tools/call":
-            params = msg.get("params") or {}
-            name = params.get("name")
-            arguments = params.get("arguments") or {}
-            try:
-                result = _instagram_mcp_call(key, str(name), arguments)
-                send({
-                    "jsonrpc": "2.0",
-                    "id": msg_id,
-                    "result": {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}]},
-                })
-            except Exception as exc:  # noqa: BLE001 - report failures back to the agent
-                send({
-                    "jsonrpc": "2.0",
-                    "id": msg_id,
-                    "result": {"content": [{"type": "text", "text": f"Error: {exc}"}], "isError": True},
-                })
-        elif msg_id is not None:
-            send({
-                "jsonrpc": "2.0",
-                "id": msg_id,
-                "error": {"code": -32601, "message": f"Method not found: {method}"},
-            })
-    return 0
 
 
 def send_telegram_message(token: str, chat_id: str, text: str, timeout: int = 8) -> None:
@@ -7151,12 +6936,12 @@ def call_codex_prompt(
         output_path = tmp_path / "last-message.txt"
         write_text(schema_path, json.dumps(output_schema or chat_output_schema(), indent=2))
         cmd = resolve_codex_command(root)
-        if instagram_mcp_available(root):
+        if instagram_active():
             # Register the Instagram MCP server via TOML config overrides. Values
             # are parsed as TOML; JSON strings/arrays are valid TOML literals.
             # default_tools_approval_mode="approve" auto-approves this server's
             # tool calls so the non-interactive `exec` run does not cancel them.
-            spec = instagram_mcp_server_spec(root)
+            spec = instagram_mcp_server_spec()
             cmd.extend(["-c", "mcp_servers.instagram.command=" + json.dumps(spec["command"])])
             cmd.extend(["-c", "mcp_servers.instagram.args=" + json.dumps(spec["args"])])
             cmd.extend(["-c", 'mcp_servers.instagram.default_tools_approval_mode="approve"'])
@@ -7330,7 +7115,7 @@ def call_claude_prompt(
         web_search=config.get("webSearch") is not False,
         subagents=subagents_enabled,
     )
-    mcp_available = instagram_mcp_available(root)
+    mcp_available = instagram_active()
     allowed_tools = tools
     if mcp_available:
         allowed_tools = ",".join([tools, *INSTAGRAM_MCP_TOOL_NAMES])
@@ -7366,7 +7151,7 @@ def call_claude_prompt(
         if mcp_available:
             command.extend([
                 "--mcp-config",
-                json.dumps({"mcpServers": {"instagram": instagram_mcp_server_spec(root)}}),
+                json.dumps({"mcpServers": {"instagram": instagram_mcp_server_spec()}}),
             ])
         command.extend([
             "--no-session-persistence",
@@ -10762,6 +10547,36 @@ def make_handler(
                 snapshot = jobs.snapshot(job_id, root=project_root)
                 self.send_json(snapshot, status=404 if snapshot.get("error") == "job_not_found" else 200)
                 return True
+            # Extensions are machine-level add-ons (no project context required).
+            if parsed.path == "/api/extensions":
+                self.send_json({"extensions": extension_status_payload()})
+                return True
+            if parsed.path == "/api/extensions/instagram/status":
+                self.send_json({
+                    "configured": extensions.instagram.configured(),
+                    "enabled": extension_enabled("instagram"),
+                    "active": instagram_active(),
+                })
+                return True
+            if parsed.path == "/api/extensions/instagram/image":
+                url = (query.get("url") or [""])[0]
+                if not extensions.instagram.is_image_url(url):
+                    self.send_text("Blocked host.", content_type="text/plain; charset=utf-8", status=400)
+                    return True
+                try:
+                    proxy_req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                    with urllib.request.urlopen(proxy_req, timeout=15) as resp:
+                        data = resp.read()
+                        content_type = resp.headers.get("Content-Type", "image/jpeg")
+                    self.send_response(200)
+                    self.send_header("Content-Type", content_type)
+                    self.send_header("Cache-Control", "public, max-age=3600")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                except Exception as exc:  # noqa: BLE001 - proxy failures are non-fatal
+                    self.send_text(f"Image fetch failed: {exc}", content_type="text/plain; charset=utf-8", status=502)
+                return True
             try:
                 root, store = self.request_context(require_initialized=True)
             except SystemExit as exc:
@@ -10913,28 +10728,6 @@ def make_handler(
                     self.send_json({"error": "summary_not_found", "message": "Summary file not found."}, status=404)
                 except (SystemExit, ValueError) as exc:
                     self.send_json({"error": "summary_read_failed", "message": str(exc)}, status=400)
-                return True
-            if parsed.path == "/api/extensions/instagram/status":
-                self.send_json({"configured": bool(rocketapi_key_for_root(root))})
-                return True
-            if parsed.path == "/api/extensions/instagram/image":
-                url = (query.get("url") or [""])[0]
-                if not is_instagram_image_url(url):
-                    self.send_text("Blocked host.", content_type="text/plain; charset=utf-8", status=400)
-                    return True
-                try:
-                    proxy_req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                    with urllib.request.urlopen(proxy_req, timeout=15) as resp:
-                        data = resp.read()
-                        content_type = resp.headers.get("Content-Type", "image/jpeg")
-                    self.send_response(200)
-                    self.send_header("Content-Type", content_type)
-                    self.send_header("Cache-Control", "public, max-age=3600")
-                    self.send_header("Content-Length", str(len(data)))
-                    self.end_headers()
-                    self.wfile.write(data)
-                except Exception as exc:  # noqa: BLE001 - proxy failures are non-fatal
-                    self.send_text(f"Image fetch failed: {exc}", content_type="text/plain; charset=utf-8", status=502)
                 return True
             return False
 
@@ -11176,6 +10969,33 @@ def make_handler(
                     project_root = None
                 payload = jobs.cancel(job_id, root=project_root)
                 self.send_json(payload, status=404 if payload.get("error") == "job_not_found" else 200)
+                return
+            # Extensions are machine-level add-ons (no project context required).
+            if parsed.path == "/api/extensions/toggle":
+                ext_id = str(body.get("id") or "").strip()
+                if not extensions.get_extension(ext_id):
+                    self.send_json({"error": "unknown_extension", "message": ext_id}, status=404)
+                    return
+                set_extension_enabled(ext_id, bool(body.get("enabled")))
+                self.send_json({"extensions": extension_status_payload()})
+                return
+            if parsed.path == "/api/extensions/instagram/profile":
+                if not extension_enabled("instagram"):
+                    self.send_json({"error": "extension_disabled", "message": "Instagram extension is disabled."}, status=403)
+                    return
+                try:
+                    self.send_json({"profile": extensions.instagram.profile(extensions.instagram.read_key(), body.get("username"))})
+                except ValueError as exc:
+                    self.send_json({"error": "rocketapi_failed", "message": str(exc)}, status=502)
+                return
+            if parsed.path == "/api/extensions/instagram/media":
+                if not extension_enabled("instagram"):
+                    self.send_json({"error": "extension_disabled", "message": "Instagram extension is disabled."}, status=403)
+                    return
+                try:
+                    self.send_json({"media": extensions.instagram.media(extensions.instagram.read_key(), body.get("id"), body.get("count") or 12)})
+                except ValueError as exc:
+                    self.send_json({"error": "rocketapi_failed", "message": str(exc)}, status=502)
                 return
             try:
                 root, store = self.request_context(require_initialized=True)
@@ -11639,35 +11459,6 @@ def make_handler(
                         "outputHumanizeEnabled": bool(settings.get("outputHumanizeEnabled", False)),
                     }
                 )
-                return
-            if parsed.path == "/api/extensions/instagram/profile":
-                key = rocketapi_key_for_root(root)
-                username = str(body.get("username") or "").strip().lstrip("@")
-                if not username:
-                    self.send_json({"error": "bad_request", "message": "username is required"}, status=400)
-                    return
-                try:
-                    raw = rocketapi_post(key, "/instagram/user/get_web_profile_info", {"username": username})
-                    self.send_json({"profile": instagram_profile_from_response(raw)})
-                except ValueError as exc:
-                    self.send_json({"error": "rocketapi_failed", "message": str(exc)}, status=502)
-                return
-            if parsed.path == "/api/extensions/instagram/media":
-                key = rocketapi_key_for_root(root)
-                user_id = str(body.get("id") or "").strip()
-                try:
-                    count = int(body.get("count") or 12)
-                except (TypeError, ValueError):
-                    count = 12
-                count = max(1, min(count, 24))
-                if not user_id:
-                    self.send_json({"error": "bad_request", "message": "id is required"}, status=400)
-                    return
-                try:
-                    raw = rocketapi_post(key, "/instagram/user/get_media", {"id": user_id, "count": count})
-                    self.send_json({"media": instagram_media_from_response(raw, limit=count)})
-                except ValueError as exc:
-                    self.send_json({"error": "rocketapi_failed", "message": str(exc)}, status=502)
                 return
             if parsed.path == "/api/branch/clone":
                 source_id = str(body.get("source") or "")
@@ -12733,8 +12524,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--no-auth", dest="auth_required", action="store_false", help="Disable the web login gate")
     serve.set_defaults(auth_required=False)
 
-    mcp_instagram = sub.add_parser("mcp-instagram", help="Run the Instagram MCP server over stdio (used by chat agents)")
-    mcp_instagram.add_argument("--root", default=".", help="Project root used to resolve ROCKETAPI_KEY from .env")
+    sub.add_parser("mcp-instagram", help="Run the Instagram MCP server over stdio (used by chat agents)")
 
     worker = sub.add_parser("worker", help="Run a local Codex worker for a ctxgit server")
     worker.add_argument("--server", required=True, help="ctxgit server URL, for example http://127.0.0.1:8765")
@@ -12768,7 +12558,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "mcp-instagram":
-        return run_instagram_mcp_server(Path(args.root).resolve())
+        return extensions.run_mcp_server(extensions.instagram)
 
     if args.command == "serve":
         root = resolve_serve_root(args.root) if args.root else None

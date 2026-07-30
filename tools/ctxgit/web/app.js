@@ -11,6 +11,7 @@ const state = {
   payload: null,
   provider: null,
   serverProjects: [],
+  extensions: [],
   worker: null,
   auth: null,
   authMode: "login",
@@ -4193,28 +4194,67 @@ els.branchGraphButton.addEventListener("click", () => {
 // Built-in registry rendered in the sidebar; opening one takes over the main
 // panel via a dedicated #extensionTab.
 // ---------------------------------------------------------------------------
-const EXTENSIONS = [
-  {
-    id: "instagram",
-    name: "Instagram",
-    icon: "📸",
-    description: "View a public profile and its recent posts (Rocket API).",
-    render: renderInstagramExtension,
-  },
-];
+// Client-side renderers, keyed by extension id. Metadata (name, icon,
+// enabled/configured) comes from the server registry (/api/extensions).
+const EXTENSION_RENDERERS = {
+  instagram: renderInstagramExtension,
+};
+
+let openExtensionId = null;
+
+async function loadExtensions() {
+  try {
+    const data = await api("/api/extensions");
+    state.extensions = data.extensions || [];
+  } catch (_error) {
+    state.extensions = [];
+  }
+  renderExtensionList();
+}
 
 function renderExtensionList() {
   if (!els.extensionList) return;
   els.extensionList.innerHTML = "";
-  EXTENSIONS.forEach((ext) => {
+  (state.extensions || []).forEach((ext) => {
+    const row = document.createElement("div");
+    row.className = `extension-row${ext.enabled ? "" : " disabled"}`;
+
     const button = document.createElement("button");
     button.type = "button";
-    button.className = "nav-item extension-item";
+    button.className = `nav-item extension-item${ext.id === openExtensionId ? " active" : ""}`;
     button.textContent = `${ext.icon} ${ext.name}`;
-    button.title = ext.description;
+    button.title = ext.description || "";
     button.addEventListener("click", () => openExtension(ext.id));
-    els.extensionList.appendChild(button);
+
+    const toggle = document.createElement("input");
+    toggle.type = "checkbox";
+    toggle.className = "extension-toggle";
+    toggle.checked = !!ext.enabled;
+    toggle.title = ext.enabled ? "Deactivate" : "Activate";
+    toggle.addEventListener("change", () => toggleExtension(ext.id, toggle.checked));
+
+    row.appendChild(button);
+    row.appendChild(toggle);
+    els.extensionList.appendChild(row);
   });
+}
+
+async function toggleExtension(id, enabled) {
+  try {
+    const data = await api("/api/extensions/toggle", {
+      method: "POST",
+      body: JSON.stringify({ id, enabled }),
+    });
+    state.extensions = data.extensions || [];
+  } catch (_error) {
+    // Leave state as-is; re-render reflects the last known server truth.
+  }
+  renderExtensionList();
+  if (openExtensionId === id) openExtension(id);
+}
+
+function extensionById(id) {
+  return (state.extensions || []).find((item) => item.id === id) || null;
 }
 
 function showExtensionPanel() {
@@ -4224,17 +4264,27 @@ function showExtensionPanel() {
 }
 
 function openExtension(id) {
-  const ext = EXTENSIONS.find((item) => item.id === id);
-  if (!ext || !els.extensionContent) return;
+  const ext = extensionById(id);
+  const render = EXTENSION_RENDERERS[id];
+  if (!ext || !render || !els.extensionContent) return;
+  openExtensionId = id;
   showExtensionPanel();
-  els.extensionList
-    ?.querySelectorAll(".extension-item")
-    .forEach((item) => item.classList.remove("active"));
-  const buttons = els.extensionList ? Array.from(els.extensionList.querySelectorAll(".extension-item")) : [];
-  const index = EXTENSIONS.findIndex((item) => item.id === id);
-  if (buttons[index]) buttons[index].classList.add("active");
+  renderExtensionList();
   els.extensionContent.innerHTML = "";
-  ext.render(els.extensionContent);
+  if (!ext.enabled) {
+    els.extensionContent.innerHTML = `
+      <div class="extension-header">
+        <h2>${escapeHtml(ext.icon)} ${escapeHtml(ext.name)}</h2>
+        <p class="extension-subtitle">This extension is deactivated.</p>
+      </div>
+      <button type="button" class="wide-button" id="extensionEnableButton">Activate ${escapeHtml(ext.name)}</button>
+    `;
+    els.extensionContent
+      .querySelector("#extensionEnableButton")
+      ?.addEventListener("click", () => toggleExtension(id, true));
+    return;
+  }
+  render(els.extensionContent);
 }
 
 function renderInstagramExtension(container) {
@@ -4258,7 +4308,7 @@ function renderInstagramExtension(container) {
   api("/api/extensions/instagram/status")
     .then((data) => {
       if (!data.configured) {
-        statusEl.textContent = "Rocket API key is not configured. Add ROCKETAPI_KEY to your .env.";
+        statusEl.textContent = "Rocket API key is not configured. Add ROCKETAPI_KEY to extensions/instagram/.env.";
         statusEl.className = "settings-status error";
       }
     })
@@ -4362,7 +4412,7 @@ function renderInstagramMedia(container, media) {
   container.appendChild(grid);
 }
 
-renderExtensionList();
+loadExtensions();
 
 els.summarySaveButton.addEventListener("click", saveSummary);
 

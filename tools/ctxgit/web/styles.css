@@ -2561,6 +2561,26 @@ button.section-toggle[aria-expanded="false"] .section-toggle-caret {
 }
 
 /* Extensions ------------------------------------------------------------- */
+.extension-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.extension-row .extension-item {
+  flex: 1;
+  min-width: 0;
+}
+
+.extension-row.disabled .extension-item {
+  opacity: 0.5;
+}
+
+.extension-toggle {
+  flex-shrink: 0;
+  cursor: pointer;
+}
+
 .extension-item.active {
   background: var(--accent-soft);
   color: var(--accent);
