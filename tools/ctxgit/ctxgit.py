@@ -627,6 +627,145 @@ def is_instagram_image_url(url: str) -> bool:
     return any(host == h or host.endswith("." + h) for h in INSTAGRAM_IMAGE_HOSTS)
 
 
+# --- Instagram as an MCP tool the chat agents can call mid-conversation -------
+INSTAGRAM_MCP_TOOLS = [
+    {
+        "name": "get_instagram_profile",
+        "description": (
+            "Fetch a public Instagram profile by username via Rocket API. Returns JSON with "
+            "id, username, full_name, biography, followers, following, posts, is_verified, "
+            "is_private, external_url. Use the returned `id` to then call get_instagram_media."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "username": {"type": "string", "description": "Instagram username without the @"},
+            },
+            "required": ["username"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "get_instagram_media",
+        "description": (
+            "Fetch recent posts for an Instagram numeric user id (obtained from "
+            "get_instagram_profile) via Rocket API. Returns a JSON array of posts with "
+            "shortcode, permalink, caption, like_count, comment_count, is_video."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "Instagram numeric user id"},
+                "count": {"type": "integer", "description": "Number of posts (1-24, default 12)"},
+            },
+            "required": ["id"],
+            "additionalProperties": False,
+        },
+    },
+]
+
+INSTAGRAM_MCP_TOOL_NAMES = tuple(f"mcp__instagram__{tool['name']}" for tool in INSTAGRAM_MCP_TOOLS)
+
+
+def instagram_mcp_available(root: Path) -> bool:
+    """Only advertise the Instagram tools when a Rocket API key is configured."""
+    return bool(rocketapi_key_for_root(root))
+
+
+def instagram_mcp_server_spec(root: Path) -> dict[str, Any]:
+    """How the chat agent should spawn the stdio MCP server (this same script)."""
+    return {
+        "command": sys.executable,
+        "args": [str(Path(__file__).resolve()), "mcp-instagram", "--root", str(root.resolve())],
+    }
+
+
+def _instagram_mcp_call(key: str, name: str, arguments: dict[str, Any]) -> Any:
+    if name == "get_instagram_profile":
+        username = str(arguments.get("username") or "").strip().lstrip("@")
+        if not username:
+            raise ValueError("username is required")
+        raw = rocketapi_post(key, "/instagram/user/get_web_profile_info", {"username": username})
+        return instagram_profile_from_response(raw)
+    if name == "get_instagram_media":
+        user_id = str(arguments.get("id") or "").strip()
+        if not user_id:
+            raise ValueError("id is required")
+        try:
+            count = int(arguments.get("count") or 12)
+        except (TypeError, ValueError):
+            count = 12
+        count = max(1, min(count, 24))
+        raw = rocketapi_post(key, "/instagram/user/get_media", {"id": user_id, "count": count})
+        return instagram_media_from_response(raw, limit=count)
+    raise ValueError(f"Unknown tool: {name}")
+
+
+def run_instagram_mcp_server(root: Path) -> int:
+    """Minimal stdio MCP (JSON-RPC 2.0) server exposing the Instagram tools.
+
+    Spawned by the Claude/Codex CLI during a chat turn so the agent can look up
+    Instagram data on its own. Reads ROCKETAPI_KEY from the project/repo .env.
+    """
+    key = rocketapi_key_for_root(root)
+
+    def send(message: dict[str, Any]) -> None:
+        sys.stdout.write(json.dumps(message) + "\n")
+        sys.stdout.flush()
+
+    for raw_line in sys.stdin:
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        method = msg.get("method")
+        msg_id = msg.get("id")
+        if method == "initialize":
+            requested = (msg.get("params") or {}).get("protocolVersion") or "2025-06-18"
+            send({
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {
+                    "protocolVersion": requested,
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "ctxgit-instagram", "version": "1.0.0"},
+                },
+            })
+        elif method == "notifications/initialized":
+            continue  # notification: no response expected
+        elif method == "ping":
+            send({"jsonrpc": "2.0", "id": msg_id, "result": {}})
+        elif method == "tools/list":
+            send({"jsonrpc": "2.0", "id": msg_id, "result": {"tools": INSTAGRAM_MCP_TOOLS}})
+        elif method == "tools/call":
+            params = msg.get("params") or {}
+            name = params.get("name")
+            arguments = params.get("arguments") or {}
+            try:
+                result = _instagram_mcp_call(key, str(name), arguments)
+                send({
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}]},
+                })
+            except Exception as exc:  # noqa: BLE001 - report failures back to the agent
+                send({
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {"content": [{"type": "text", "text": f"Error: {exc}"}], "isError": True},
+                })
+        elif msg_id is not None:
+            send({
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "error": {"code": -32601, "message": f"Method not found: {method}"},
+            })
+    return 0
+
+
 def send_telegram_message(token: str, chat_id: str, text: str, timeout: int = 8) -> None:
     """Send a Telegram text message via the Bot API. Raises on failure."""
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -7012,6 +7151,15 @@ def call_codex_prompt(
         output_path = tmp_path / "last-message.txt"
         write_text(schema_path, json.dumps(output_schema or chat_output_schema(), indent=2))
         cmd = resolve_codex_command(root)
+        if instagram_mcp_available(root):
+            # Register the Instagram MCP server via TOML config overrides. Values
+            # are parsed as TOML; JSON strings/arrays are valid TOML literals.
+            # default_tools_approval_mode="approve" auto-approves this server's
+            # tool calls so the non-interactive `exec` run does not cancel them.
+            spec = instagram_mcp_server_spec(root)
+            cmd.extend(["-c", "mcp_servers.instagram.command=" + json.dumps(spec["command"])])
+            cmd.extend(["-c", "mcp_servers.instagram.args=" + json.dumps(spec["args"])])
+            cmd.extend(["-c", 'mcp_servers.instagram.default_tools_approval_mode="approve"'])
         if config.get("webSearch") is not False:
             cmd.append("--search")
         cmd.extend(["--ask-for-approval", "never", "exec"])
@@ -7182,11 +7330,22 @@ def call_claude_prompt(
         web_search=config.get("webSearch") is not False,
         subagents=subagents_enabled,
     )
+    mcp_available = instagram_mcp_available(root)
+    allowed_tools = tools
+    if mcp_available:
+        allowed_tools = ",".join([tools, *INSTAGRAM_MCP_TOOL_NAMES])
     system_prompt = (
         "You are running inside ctxgit. Do not push, publish, deploy, or modify files outside "
         "the current working directory and explicitly added directories. Respect the requested "
         "read-only or writable mode. Return the required structured output."
     )
+    if mcp_available:
+        system_prompt += (
+            " An Instagram extension is available via MCP tools "
+            "(mcp__instagram__get_instagram_profile, mcp__instagram__get_instagram_media). "
+            "When the user asks about an Instagram account or post, call get_instagram_profile "
+            "first, then get_instagram_media with the returned id."
+        )
     if subagents_enabled:
         system_prompt += LEAD_ORCHESTRATION_PROTOCOL
 
@@ -7204,11 +7363,16 @@ def call_claude_prompt(
             command.extend([
                 "--json-schema", json.dumps(schema, ensure_ascii=False, separators=(",", ":")),
             ])
+        if mcp_available:
+            command.extend([
+                "--mcp-config",
+                json.dumps({"mcpServers": {"instagram": instagram_mcp_server_spec(root)}}),
+            ])
         command.extend([
             "--no-session-persistence",
             "--permission-mode", "auto" if writable else "bypassPermissions",
             "--tools", tools,
-            "--allowedTools", tools,
+            "--allowedTools", allowed_tools,
             "--append-system-prompt",
             system_prompt,
         ])
@@ -12569,6 +12733,9 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--no-auth", dest="auth_required", action="store_false", help="Disable the web login gate")
     serve.set_defaults(auth_required=False)
 
+    mcp_instagram = sub.add_parser("mcp-instagram", help="Run the Instagram MCP server over stdio (used by chat agents)")
+    mcp_instagram.add_argument("--root", default=".", help="Project root used to resolve ROCKETAPI_KEY from .env")
+
     worker = sub.add_parser("worker", help="Run a local Codex worker for a ctxgit server")
     worker.add_argument("--server", required=True, help="ctxgit server URL, for example http://127.0.0.1:8765")
     worker.add_argument("--token", default=os.environ.get("CTXGIT_WORKER_TOKEN", ""))
@@ -12599,6 +12766,9 @@ def main(argv: list[str] | None = None) -> int:
             provider=args.provider,
         )
         return 0
+
+    if args.command == "mcp-instagram":
+        return run_instagram_mcp_server(Path(args.root).resolve())
 
     if args.command == "serve":
         root = resolve_serve_root(args.root) if args.root else None
