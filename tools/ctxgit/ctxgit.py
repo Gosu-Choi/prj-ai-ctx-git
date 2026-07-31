@@ -7761,7 +7761,8 @@ def run_chat_turn(
     normalized_resources = normalize_branch_resource_paths(store, branch_id, resource_paths)
     if record_user:
         emit_progress(progress, "Recording user message")
-        user_extra: dict[str, Any] = {"turnId": turn_id}
+        # Record the mode so a resend (e.g. after a stop) reuses "send", not info.
+        user_extra: dict[str, Any] = {"turnId": turn_id, "mode": "chat"}
         if normalized_resources:
             user_extra["resources"] = normalized_resources
         store.append_history(branch_id, "user", user_message, extra=user_extra)

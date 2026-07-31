@@ -4007,7 +4007,16 @@ async function resendFailedMessage(index) {
   if (!branch || !message || message.role !== "user") return;
   const text = String(message.text || "");
   if (!text.trim()) return;
-  const mode = ["chat", "info-chat", "research", "team"].includes(message.mode) ? message.mode : "info-chat";
+  // Resend with the mode the message was originally sent in. Legacy "send"
+  // messages predate the stored mode and have none — treat those as "chat"
+  // (send), never info, so a stopped send resends as send.
+  const raw = String(message.mode || "");
+  const mode =
+    raw === "info-chat" || raw === "research"
+      ? raw
+      : raw === "team" || raw === "team-pipeline"
+      ? "team"
+      : "chat";
   try {
     const payload = await api("/api/history/delete", {
       method: "POST",
