@@ -83,7 +83,9 @@ class ClaudeCommandTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root, store = self._project(tmp, orchestration="omc")
             cmd = self._capture_chat_command(root, store, "b1")
-            self.assertIn("Task", cmd[cmd.index("--tools") + 1])
+            # Subagents enabled: Task is available, i.e. not on the denylist.
+            if "--disallowedTools" in cmd:
+                self.assertNotIn("Task", cmd[cmd.index("--disallowedTools") + 1])
             self.assertIn("--agents", cmd)
             agents = json.loads(cmd[cmd.index("--agents") + 1])
             self.assertEqual(len(agents), 19)
@@ -96,7 +98,9 @@ class ClaudeCommandTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root, store = self._project(tmp, orchestration="legacy")
             cmd = self._capture_chat_command(root, store, "b1")
-            self.assertNotIn("Task", cmd[cmd.index("--tools") + 1])
+            # No subagents: Task is gated, i.e. on the denylist.
+            self.assertIn("--disallowedTools", cmd)
+            self.assertIn("Task", cmd[cmd.index("--disallowedTools") + 1])
             self.assertNotIn("--agents", cmd)
             self.assertNotIn(
                 orch.LEAD_ORCHESTRATION_PROTOCOL.strip(),
