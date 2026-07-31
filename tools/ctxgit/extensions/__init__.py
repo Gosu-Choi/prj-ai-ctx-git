@@ -66,7 +66,13 @@ def mcp_tool_names(ext: Any) -> tuple[str, ...]:
 
 
 def remote_allow_names(ext: Any) -> tuple[str, ...]:
-    """Claude allowlist entries for a remote extension: mcp__<server> allows all its tools."""
+    """Claude allowlist entries for a remote extension.
+
+    Prefer an explicit read-only tool list (deny-by-default) when the extension
+    declares one; fall back to whole-server allow (mcp__<server>) otherwise.
+    """
+    if hasattr(ext, "read_tool_names"):
+        return tuple(ext.read_tool_names())
     return tuple(f"mcp__{server}" for server in getattr(ext, "MCP_SERVERS", ()))
 
 

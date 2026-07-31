@@ -577,6 +577,12 @@ def apply_codex_extension_mcps(cmd: list[str], root: Path) -> None:
             continue
         for server in ext.codex_configured_servers():
             cmd.extend(["-c", f'mcp_servers.{server}.default_tools_approval_mode="approve"'])
+            # Deny-by-default: expose only the read-only tools, so write tools
+            # (send/draft/label, create/copy file) are never available to codex.
+            if hasattr(ext, "codex_enabled_tools"):
+                read_tools = ext.codex_enabled_tools(server)
+                if read_tools:
+                    cmd.extend(["-c", f"mcp_servers.{server}.enabled_tools=" + json.dumps(read_tools)])
 
 
 def send_telegram_message(token: str, chat_id: str, text: str, timeout: int = 8) -> None:

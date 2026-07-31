@@ -32,6 +32,36 @@ SERVER_ENDPOINTS = {
     "drive": "https://drivemcp.googleapis.com/mcp/v1",
 }
 
+# READ-ONLY policy. ctxgit exposes only these (find + read) tools to the agent —
+# deny-by-default, so drafting/sending/labeling (Gmail) and creating/copying
+# files (Drive) are never callable, regardless of the granted OAuth scopes.
+READ_TOOLS = {
+    "gmail": ("search_threads", "get_thread", "get_message", "list_labels", "list_drafts"),
+    "drive": (
+        "search_files",
+        "read_file_content",
+        "download_file_content",
+        "get_file_metadata",
+        "list_recent_files",
+    ),
+}
+
+# Recommended (minimal, read-only) OAuth scopes for the consent screen.
+READ_SCOPES = {
+    "gmail": ("https://www.googleapis.com/auth/gmail.readonly",),
+    "drive": ("https://www.googleapis.com/auth/drive.readonly",),
+}
+
+
+def read_tool_names() -> list[str]:
+    """Fully-qualified read-only tool names, for a Claude allowlist."""
+    return [f"mcp__{server}__{tool}" for server, tools in READ_TOOLS.items() for tool in tools]
+
+
+def codex_enabled_tools(server: str) -> list[str]:
+    """Read-only tool allowlist for a given server, for Codex `enabled_tools`."""
+    return list(READ_TOOLS.get(server, ()))
+
 _CODEX_CONFIG = Path.home() / ".codex" / "config.toml"
 _CLAUDE_CONFIG = Path.home() / ".claude.json"
 
