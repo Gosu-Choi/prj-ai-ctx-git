@@ -236,9 +236,15 @@ def gmail_list_labels() -> list[str]:
 
 def drive_search(query: str, count: int = 10) -> list[dict[str, Any]]:
     count = max(1, min(int(count or 10), 20))
-    q = urllib.parse.quote(f"fullText contains '{(query or '').replace(chr(39), ' ')}' and trashed = false")
-    fields = urllib.parse.quote("files(id,name,mimeType,modifiedTime,webViewLink,owners(displayName))")
-    data = _api_get(f"{DRIVE_BASE}/files?q={q}&pageSize={count}&fields={fields}&orderBy=modifiedTime desc")
+    params = urllib.parse.urlencode(
+        {
+            "q": f"fullText contains '{(query or '').replace(chr(39), ' ')}' and trashed = false",
+            "pageSize": count,
+            "fields": "files(id,name,mimeType,modifiedTime,webViewLink,owners(displayName))",
+            "orderBy": "modifiedTime desc",
+        }
+    )
+    data = _api_get(f"{DRIVE_BASE}/files?{params}")
     out = []
     for f in data.get("files") or []:
         out.append(
