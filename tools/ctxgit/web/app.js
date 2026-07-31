@@ -4349,6 +4349,7 @@ els.branchGraphButton.addEventListener("click", () => {
 // enabled/configured) comes from the server registry (/api/extensions).
 const EXTENSION_RENDERERS = {
   instagram: renderInstagramExtension,
+  "google-workspace": renderGoogleWorkspaceExtension,
 };
 
 let openExtensionId = null;
@@ -4437,6 +4438,46 @@ function openExtension(id) {
   }
   render(els.extensionContent);
 }
+
+function renderGoogleWorkspaceExtension(container) {
+  const ext = extensionById("google-workspace") || {};
+  const servers = ext.servers || {};
+  const statusChip = (name, ok) =>
+    `<span class="gw-chip ${ok ? "ok" : "off"}">${escapeHtml(name)}: ${ok ? "연결됨" : "미설정"}</span>`;
+  container.innerHTML = `
+    <div class="extension-header">
+      <h2>📧 Google Workspace</h2>
+      <p class="extension-subtitle">Gmail·Drive를 Google 공식 원격 MCP(OAuth)로 읽습니다. 인증은 CLI에서 1회 설정합니다.</p>
+    </div>
+    <div class="gw-status">
+      ${statusChip("Gmail", !!servers.gmail)} ${statusChip("Drive", !!servers.drive)}
+      <button id="gwRefresh" type="button" class="gw-refresh">상태 새로고침</button>
+    </div>
+    <ol class="gw-steps">
+      <li><strong>Google Cloud</strong>: Gmail API + <code>gmailmcp.googleapis.com</code>, Drive API + <code>drivemcp.googleapis.com</code> 사용 설정. OAuth 동의화면 스코프 <code>gmail.readonly</code>, <code>gmail.compose</code>, <code>drive.readonly</code>, <code>drive.file</code>. OAuth 클라이언트("데스크톱 앱"으로 시도)에서 client id 발급.</li>
+      <li><strong>Codex에 등록 + 로그인</strong> (터미널에 <code>!</code> 붙여 실행):
+        <pre class="code-block">codex mcp add gmail --url ${escapeHtml(GW_ENDPOINTS.gmail)} --oauth-client-id &lt;CLIENT_ID&gt;
+codex mcp add drive --url ${escapeHtml(GW_ENDPOINTS.drive)} --oauth-client-id &lt;CLIENT_ID&gt;
+codex mcp login gmail
+codex mcp login drive
+codex mcp list   # gmail/drive 툴이 뜨면 성공</pre>
+      </li>
+      <li>또는 <strong>Claude</strong>: <pre class="code-block">claude mcp add --transport http gmail ${escapeHtml(GW_ENDPOINTS.gmail)} --client-id &lt;ID&gt; --callback-port 8899
+# 이후 claude 실행 → /mcp 에서 gmail 인증</pre></li>
+    </ol>
+    <p class="gw-note">위 설정이 끝나면 여기 상태가 "연결됨"으로 바뀝니다. ctxgit이 대화 중 자동으로 툴을 승인/허용하도록 이미 배선돼 있습니다. 왼쪽 토글로 언제든 끌 수 있습니다.</p>
+    <p class="gw-note gw-warn">⚠️ 이메일·드라이브 접근은 민감합니다. Gmail 공식 MCP는 발송 불가(초안만), 읽기 스코프만 권장. 토큰은 CLI의 로컬 OAuth 저장소에만 있습니다.</p>
+  `;
+  container.querySelector("#gwRefresh")?.addEventListener("click", async () => {
+    await loadExtensions();
+    if (openExtensionId === "google-workspace") openExtension("google-workspace");
+  });
+}
+
+const GW_ENDPOINTS = {
+  gmail: "https://gmailmcp.googleapis.com/mcp/v1",
+  drive: "https://drivemcp.googleapis.com/mcp/v1",
+};
 
 function renderInstagramExtension(container) {
   container.innerHTML = `

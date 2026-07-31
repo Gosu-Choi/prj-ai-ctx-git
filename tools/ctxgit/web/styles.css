@@ -2958,3 +2958,71 @@ button.section-toggle[aria-expanded="false"] .section-toggle-caret {
   cursor: pointer;
   font-weight: 600;
 }
+
+/* Google Workspace extension panel --------------------------------------- */
+.gw-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 12px 0 16px;
+}
+
+.gw-chip {
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.gw-chip.ok {
+  background: #e6f4ea;
+  color: #137333;
+}
+
+.gw-chip.off {
+  background: var(--line);
+  color: var(--muted);
+}
+
+.gw-refresh {
+  margin-left: auto;
+  padding: 5px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.gw-steps {
+  padding-left: 20px;
+  display: grid;
+  gap: 12px;
+  line-height: 1.5;
+}
+
+.gw-steps code {
+  background: var(--accent-soft);
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+.gw-steps .code-block {
+  margin: 6px 0 0;
+  white-space: pre;
+  overflow-x: auto;
+}
+
+.gw-note {
+  margin-top: 14px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.gw-warn {
+  color: var(--warn);
+}

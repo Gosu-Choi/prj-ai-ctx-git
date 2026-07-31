@@ -551,21 +551,32 @@ def instagram_mcp_server_spec() -> dict[str, Any]:
     }
 
 
-def apply_codex_instagram_mcp(cmd: list[str], root: Path) -> None:
-    """Register the Instagram MCP server on a Codex command (when active).
+def apply_codex_extension_mcps(cmd: list[str], root: Path) -> None:
+    """Wire enabled extensions' MCP tools onto a Codex command.
 
-    Must be applied to every user-facing Codex chat path (chat, context chat,
-    history chat, team pipeline) so the agent can use the tool — not just one.
+    Applied to every user-facing Codex chat path (chat, context chat, history
+    chat, team pipeline) so the agent can use the tools — not just one path.
+    `-c` overrides are global options inserted before the `exec` subcommand;
     default_tools_approval_mode="approve" auto-approves the server's tool calls
-    so the non-interactive `exec` run does not cancel them. `-c` overrides are
-    global options and are inserted before the `exec` subcommand.
+    so the non-interactive `exec` run does not cancel them.
+
+    - stdio extensions (Instagram): ctxgit spawns the server, so we register its
+      command/args here.
+    - remote extensions (Google Workspace): the user registers the server in
+      ~/.codex/config.toml (with OAuth) themselves; we only add the approval
+      override for servers that are actually configured, so exec doesn't cancel
+      them. We never define a partial server entry for an unconfigured server.
     """
-    if not instagram_active():
-        return
-    spec = instagram_mcp_server_spec()
-    cmd.extend(["-c", "mcp_servers.instagram.command=" + json.dumps(spec["command"])])
-    cmd.extend(["-c", "mcp_servers.instagram.args=" + json.dumps(spec["args"])])
-    cmd.extend(["-c", 'mcp_servers.instagram.default_tools_approval_mode="approve"'])
+    if instagram_active():
+        spec = instagram_mcp_server_spec()
+        cmd.extend(["-c", "mcp_servers.instagram.command=" + json.dumps(spec["command"])])
+        cmd.extend(["-c", "mcp_servers.instagram.args=" + json.dumps(spec["args"])])
+        cmd.extend(["-c", 'mcp_servers.instagram.default_tools_approval_mode="approve"'])
+    for ext in extensions.remote_extensions():
+        if not extension_enabled(ext.ID):
+            continue
+        for server in ext.codex_configured_servers():
+            cmd.extend(["-c", f'mcp_servers.{server}.default_tools_approval_mode="approve"'])
 
 
 def send_telegram_message(token: str, chat_id: str, text: str, timeout: int = 8) -> None:
@@ -6786,7 +6797,7 @@ def call_codex_chat(
         output_path = tmp_path / "last-message.txt"
         write_text(schema_path, json.dumps(output_schema or chat_output_schema(), indent=2))
         cmd = resolve_codex_command(root)
-        apply_codex_instagram_mcp(cmd, root)
+        apply_codex_extension_mcps(cmd, root)
         if codex_config.get("webSearch") is not False:
             cmd.append("--search")
         cmd.extend([
@@ -6871,7 +6882,7 @@ def call_codex_history_chat(
         output_path = tmp_path / "last-message.txt"
         write_text(schema_path, json.dumps(output_schema or chat_output_schema(), indent=2))
         cmd = resolve_codex_command(root)
-        apply_codex_instagram_mcp(cmd, root)
+        apply_codex_extension_mcps(cmd, root)
         if codex_config.get("webSearch") is not False:
             cmd.append("--search")
         cmd.extend(
@@ -6949,7 +6960,7 @@ def call_codex_context_chat(
         output_path = tmp_path / "last-message.txt"
         write_text(schema_path, json.dumps(chat_output_schema(), indent=2))
         cmd = resolve_codex_command(root)
-        apply_codex_instagram_mcp(cmd, root)
+        apply_codex_extension_mcps(cmd, root)
         if codex_config.get("webSearch") is not False:
             cmd.append("--search")
         cmd.extend(
@@ -7028,7 +7039,7 @@ def call_codex_prompt(
         output_path = tmp_path / "last-message.txt"
         write_text(schema_path, json.dumps(output_schema or chat_output_schema(), indent=2))
         cmd = resolve_codex_command(root)
-        apply_codex_instagram_mcp(cmd, root)
+        apply_codex_extension_mcps(cmd, root)
         if config.get("webSearch") is not False:
             cmd.append("--search")
         cmd.extend(["--ask-for-approval", "never", "exec"])
@@ -7199,21 +7210,35 @@ def call_claude_prompt(
         web_search=config.get("webSearch") is not False,
         subagents=subagents_enabled,
     )
-    mcp_available = instagram_active()
-    allowed_tools = tools
-    if mcp_available:
-        allowed_tools = ",".join([tools, *INSTAGRAM_MCP_TOOL_NAMES])
+    # Instagram (stdio, spawned by ctxgit) + any enabled remote extensions
+    # (Google Workspace, whose servers the user registered in `claude mcp add`,
+    # loaded automatically since we don't pass --strict-mcp-config).
+    instagram_available = instagram_active()
+    allowed_names: list[str] = []
+    if instagram_available:
+        allowed_names.extend(INSTAGRAM_MCP_TOOL_NAMES)
+    remote_hints: list[str] = []
+    for ext in extensions.remote_extensions():
+        if extension_enabled(ext.ID):
+            allowed_names.extend(extensions.remote_allow_names(ext))
+            remote_hints.append(ext.NAME)
+    allowed_tools = ",".join([tools, *allowed_names]) if allowed_names else tools
     system_prompt = (
         "You are running inside ctxgit. Do not push, publish, deploy, or modify files outside "
         "the current working directory and explicitly added directories. Respect the requested "
         "read-only or writable mode. Return the required structured output."
     )
-    if mcp_available:
+    if instagram_available:
         system_prompt += (
             " An Instagram extension is available via MCP tools "
             "(mcp__instagram__get_instagram_profile, mcp__instagram__get_instagram_media). "
             "When the user asks about an Instagram account or post, call get_instagram_profile "
             "first, then get_instagram_media with the returned id."
+        )
+    if remote_hints:
+        system_prompt += (
+            f" These integrations are also available via MCP tools: {', '.join(remote_hints)}. "
+            "Use them when the user asks about that data (e.g. Gmail threads, Drive files)."
         )
     if subagents_enabled:
         system_prompt += LEAD_ORCHESTRATION_PROTOCOL
@@ -7232,7 +7257,7 @@ def call_claude_prompt(
             command.extend([
                 "--json-schema", json.dumps(schema, ensure_ascii=False, separators=(",", ":")),
             ])
-        if mcp_available:
+        if instagram_available:
             command.extend([
                 "--mcp-config",
                 json.dumps({"mcpServers": {"instagram": instagram_mcp_server_spec()}}),
