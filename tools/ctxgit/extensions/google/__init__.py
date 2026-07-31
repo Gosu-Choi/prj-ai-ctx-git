@@ -155,8 +155,20 @@ def _api_get(url: str) -> dict[str, Any]:
 def _api_get_raw(url: str) -> str:
     token = _access_token()
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return resp.read().decode("utf-8", errors="replace")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:300] if hasattr(exc, "read") else str(exc)
+        raise ValueError(f"Google API error {exc.code}: {detail}") from exc
+
+
+# Google-native docs must be exported; pick a text-ish format per source type.
+_GOOGLE_EXPORT_MIME = {
+    "application/vnd.google-apps.document": "text/plain",
+    "application/vnd.google-apps.spreadsheet": "text/csv",
+    "application/vnd.google-apps.presentation": "text/plain",
+}
 
 
 def _header(headers: list[dict[str, Any]], name: str) -> str:
@@ -240,8 +252,12 @@ def drive_search(query: str, count: int = 10) -> list[dict[str, Any]]:
         {
             "q": f"fullText contains '{(query or '').replace(chr(39), ' ')}' and trashed = false",
             "pageSize": count,
-            "fields": "files(id,name,mimeType,modifiedTime,webViewLink,owners(displayName))",
+            "fields": "files(id,name,mimeType,modifiedTime,webViewLink,driveId,owners(displayName))",
             "orderBy": "modifiedTime desc",
+            # Include Shared Drives (Team Drives), not just My Drive.
+            "corpora": "allDrives",
+            "includeItemsFromAllDrives": "true",
+            "supportsAllDrives": "true",
         }
     )
     data = _api_get(f"{DRIVE_BASE}/files?{params}")
@@ -254,6 +270,7 @@ def drive_search(query: str, count: int = 10) -> list[dict[str, Any]]:
                 "mimeType": f.get("mimeType", ""),
                 "modifiedTime": f.get("modifiedTime", ""),
                 "link": f.get("webViewLink", ""),
+                "sharedDrive": bool(f.get("driveId")),
             }
         )
     return out
@@ -262,13 +279,15 @@ def drive_search(query: str, count: int = 10) -> list[dict[str, Any]]:
 def drive_read_file(file_id: str) -> dict[str, Any]:
     if not str(file_id or "").strip():
         raise ValueError("id is required")
-    meta = _api_get(f"{DRIVE_BASE}/files/{file_id}?fields=id,name,mimeType")
+    # supportsAllDrives=true is required to read files that live in a Shared Drive.
+    meta = _api_get(f"{DRIVE_BASE}/files/{file_id}?fields=id,name,mimeType&supportsAllDrives=true")
     mime = meta.get("mimeType", "")
     if mime.startswith("application/vnd.google-apps."):
-        # Google-native docs must be exported; text/plain covers Docs/Sheets/Slides reasonably.
-        content = _api_get_raw(f"{DRIVE_BASE}/files/{file_id}/export?mimeType=text/plain")
+        export_mime = _GOOGLE_EXPORT_MIME.get(mime, "text/plain")
+        params = urllib.parse.urlencode({"mimeType": export_mime, "supportsAllDrives": "true"})
+        content = _api_get_raw(f"{DRIVE_BASE}/files/{file_id}/export?{params}")
     else:
-        content = _api_get_raw(f"{DRIVE_BASE}/files/{file_id}?alt=media")
+        content = _api_get_raw(f"{DRIVE_BASE}/files/{file_id}?alt=media&supportsAllDrives=true")
     return {"id": meta.get("id", ""), "name": meta.get("name", ""), "mimeType": mime, "content": content[:12000]}
 
 
