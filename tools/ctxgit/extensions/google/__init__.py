@@ -246,11 +246,21 @@ def gmail_list_labels() -> list[str]:
     return [str(label.get("name", "")) for label in (data.get("labels") or []) if label.get("name")]
 
 
-def drive_search(query: str, count: int = 10) -> list[dict[str, Any]]:
+def drive_search(query: str = "", count: int = 10, filter_expr: str = "") -> list[dict[str, Any]]:
     count = max(1, min(int(count or 10), 20))
+    clauses = []
+    keyword = (query or "").strip()
+    if keyword:
+        clauses.append(f"fullText contains '{keyword.replace(chr(39), ' ')}'")
+    structured = (filter_expr or "").strip()
+    if structured:
+        clauses.append(f"({structured})")
+    if not clauses:
+        raise ValueError("provide a `query` keyword and/or a `filter` expression")
+    clauses.append("trashed = false")
     params = urllib.parse.urlencode(
         {
-            "q": f"fullText contains '{(query or '').replace(chr(39), ' ')}' and trashed = false",
+            "q": " and ".join(clauses),
             "pageSize": count,
             "fields": "files(id,name,mimeType,modifiedTime,webViewLink,driveId,owners(displayName))",
             "orderBy": "modifiedTime desc",
@@ -324,14 +334,22 @@ MCP_TOOLS = [
     },
     {
         "name": "drive_search",
-        "description": "Full-text search your Google Drive. Returns files (id, name, mimeType, modifiedTime, link).",
+        "description": (
+            "Search Google Drive, including Shared Drives. `query` = plain keywords matched as "
+            "full text. `filter` = optional Google Drive v3 query for structured filtering, e.g. "
+            "\"name contains 'report'\", \"mimeType = 'application/pdf'\", "
+            "\"modifiedTime > '2026-01-01'\", \"'FOLDER_ID' in parents\", \"sharedWithMe = true\"; "
+            "combine terms with 'and'/'or'. Provide `query`, `filter`, or both. Each result is "
+            "flagged with sharedDrive."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "Text to search for in file contents/names"},
+                "query": {"type": "string", "description": "Full-text keywords (optional)"},
+                "filter": {"type": "string", "description": "Drive v3 structured query (optional)"},
                 "count": {"type": "integer", "description": "Max files (1-20, default 10)"},
             },
-            "required": ["query"],
+            "required": [],
             "additionalProperties": False,
         },
     },
@@ -356,7 +374,11 @@ def mcp_call(key: str, name: str, arguments: dict[str, Any]) -> Any:
     if name == "gmail_list_labels":
         return gmail_list_labels()
     if name == "drive_search":
-        return drive_search(arguments.get("query", ""), arguments.get("count", 10))
+        return drive_search(
+            arguments.get("query", ""),
+            arguments.get("count", 10),
+            arguments.get("filter", ""),
+        )
     if name == "drive_read_file":
         return drive_read_file(arguments.get("id", ""))
     raise ValueError(f"Unknown tool: {name}")
