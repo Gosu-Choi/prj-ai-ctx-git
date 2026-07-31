@@ -7193,6 +7193,24 @@ def claude_tools(*, writable: bool, web_search: bool, subagents: bool = False) -
     return ",".join(tools)
 
 
+def claude_disallowed_tools(*, writable: bool, web_search: bool, subagents: bool = False) -> str:
+    """Built-in tools to block, expressed as a denylist instead of `--tools`.
+
+    `--tools` (a built-in allowlist) silently drops MCP servers' tools from the
+    session, so it can't coexist with remote MCP extensions (Gmail/Drive). We
+    achieve the same read-only / no-web / no-subagent restriction with
+    `--disallowedTools`, which leaves MCP tools untouched.
+    """
+    disallowed: list[str] = []
+    if not writable:
+        disallowed.extend(["Edit", "Write", "Bash", "NotebookEdit", "KillShell", "BashOutput"])
+    if not web_search:
+        disallowed.extend(["WebSearch", "WebFetch"])
+    if not subagents:
+        disallowed.append("Task")
+    return ",".join(disallowed)
+
+
 def call_claude_prompt(
     root: Path,
     prompt: str,
@@ -7212,6 +7230,11 @@ def call_claude_prompt(
     schema = output_schema or chat_output_schema()
     subagents_enabled = orchestration_mode(root) == "omc"
     tools = claude_tools(
+        writable=writable,
+        web_search=config.get("webSearch") is not False,
+        subagents=subagents_enabled,
+    )
+    disallowed_tools = claude_disallowed_tools(
         writable=writable,
         web_search=config.get("webSearch") is not False,
         subagents=subagents_enabled,
@@ -7271,11 +7294,13 @@ def call_claude_prompt(
         command.extend([
             "--no-session-persistence",
             "--permission-mode", "auto" if writable else "bypassPermissions",
-            "--tools", tools,
             "--allowedTools", allowed_tools,
             "--append-system-prompt",
             system_prompt,
         ])
+        # Denylist (not `--tools`) so remote MCP tools (Gmail/Drive) survive.
+        if disallowed_tools:
+            command.extend(["--disallowedTools", disallowed_tools])
         if subagents_enabled:
             command.extend([
                 "--agents",
