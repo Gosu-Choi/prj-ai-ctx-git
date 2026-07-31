@@ -4349,7 +4349,7 @@ els.branchGraphButton.addEventListener("click", () => {
 // enabled/configured) comes from the server registry (/api/extensions).
 const EXTENSION_RENDERERS = {
   instagram: renderInstagramExtension,
-  "google-workspace": renderGoogleWorkspaceExtension,
+  google: renderGoogleExtension,
 };
 
 let openExtensionId = null;
@@ -4439,45 +4439,35 @@ function openExtension(id) {
   render(els.extensionContent);
 }
 
-function renderGoogleWorkspaceExtension(container) {
-  const ext = extensionById("google-workspace") || {};
-  const servers = ext.servers || {};
-  const statusChip = (name, ok) =>
-    `<span class="gw-chip ${ok ? "ok" : "off"}">${escapeHtml(name)}: ${ok ? "연결됨" : "미설정"}</span>`;
+function renderGoogleExtension(container) {
+  const ext = extensionById("google") || {};
+  const connected = !!ext.configured;
   container.innerHTML = `
     <div class="extension-header">
-      <h2>📧 Google Workspace</h2>
-      <p class="extension-subtitle">Gmail·Drive를 Google 공식 원격 MCP(OAuth)로 읽습니다. 인증은 CLI에서 1회 설정합니다.</p>
+      <h2>📧 Google (Gmail + Drive)</h2>
+      <p class="extension-subtitle">내 Gmail·Drive를 <strong>읽기 전용</strong>으로 찾고 읽습니다. ctxgit이 표준 Google API를 직접 호출합니다.</p>
     </div>
     <div class="gw-status">
-      ${statusChip("Gmail", !!servers.gmail)} ${statusChip("Drive", !!servers.drive)}
+      <span class="gw-chip ${connected ? "ok" : "off"}">${connected ? "연결됨 (인증 완료)" : "미인증"}</span>
       <button id="gwRefresh" type="button" class="gw-refresh">상태 새로고침</button>
     </div>
     <ol class="gw-steps">
-      <li><strong>Google Cloud</strong>: Gmail API + <code>gmailmcp.googleapis.com</code>, Drive API + <code>drivemcp.googleapis.com</code> 사용 설정. OAuth 동의화면 스코프는 <strong>읽기 전용만</strong> — <code>gmail.readonly</code>, <code>drive.readonly</code> (<code>gmail.compose</code>·<code>drive.file</code> 는 넣지 마세요). OAuth 클라이언트("데스크톱 앱"으로 시도)에서 client id 발급.</li>
-      <li><strong>Codex에 등록 + 로그인</strong> (터미널에 <code>!</code> 붙여 실행):
-        <pre class="code-block">codex mcp add gmail --url ${escapeHtml(GW_ENDPOINTS.gmail)} --oauth-client-id &lt;CLIENT_ID&gt;
-codex mcp add drive --url ${escapeHtml(GW_ENDPOINTS.drive)} --oauth-client-id &lt;CLIENT_ID&gt;
-codex mcp login gmail
-codex mcp login drive
-codex mcp list   # gmail/drive 툴이 뜨면 성공</pre>
+      <li><strong>Google Cloud</strong>: Gmail API + Drive API 사용 설정. OAuth 동의화면 스코프는 <strong>읽기 전용만</strong> — <code>gmail.readonly</code>, <code>drive.readonly</code>. OAuth 클라이언트를 <strong>"데스크톱 앱"</strong> 타입으로 만들어 client id/secret 발급.</li>
+      <li><strong>인증</strong> — 터미널(또는 <code>!</code> 붙여) 한 번만 실행:
+        <pre class="code-block">/opt/homebrew/bin/python3.12 ${escapeHtml(GOOGLE_SCRIPT_PATH)} google-auth</pre>
+        브라우저가 열리면 로그인·동의 → 끝. (client id/secret 입력받고, refresh 토큰을 <code>extensions/google/.env</code>에 저장합니다.)
       </li>
-      <li>또는 <strong>Claude</strong>: <pre class="code-block">claude mcp add --transport http gmail ${escapeHtml(GW_ENDPOINTS.gmail)} --client-id &lt;ID&gt; --callback-port 8899
-# 이후 claude 실행 → /mcp 에서 gmail 인증</pre></li>
     </ol>
-    <p class="gw-note">위 설정이 끝나면 여기 상태가 "연결됨"으로 바뀝니다. ctxgit이 대화 중 자동으로 툴을 승인/허용하도록 이미 배선돼 있습니다. 왼쪽 토글로 언제든 끌 수 있습니다.</p>
-    <p class="gw-note gw-warn">🔒 읽기 전용으로 잠겨 있습니다. ctxgit이 에이전트에게 <strong>찾기·읽기 툴만</strong> 노출합니다(Gmail: search/get, Drive: search/read/download/metadata). 발송·초안·라벨·파일 생성/수정 툴은 스코프와 무관하게 호출 불가. 토큰은 CLI의 로컬 OAuth 저장소에만 있고, 왼쪽 토글로 언제든 차단됩니다.</p>
+    <p class="gw-note gw-warn">🔒 <strong>읽기 전용</strong>: 에이전트에게 찾기·읽기 툴만 노출됩니다 — <code>gmail_search</code>, <code>gmail_get_message</code>, <code>gmail_list_labels</code>, <code>drive_search</code>, <code>drive_read_file</code>. 발송·수정 툴은 아예 존재하지 않습니다. 토큰은 이 기기(<code>extensions/google/.env</code>)에만 있고, 왼쪽 토글로 언제든 차단됩니다.</p>
+    <p class="gw-note">인증 후 codex/claude 채팅에서 "내 Gmail에서 thehyundai 관련 메일 찾아 요약해줘"처럼 물어보면 자동으로 읽어옵니다.</p>
   `;
   container.querySelector("#gwRefresh")?.addEventListener("click", async () => {
     await loadExtensions();
-    if (openExtensionId === "google-workspace") openExtension("google-workspace");
+    if (openExtensionId === "google") openExtension("google");
   });
 }
 
-const GW_ENDPOINTS = {
-  gmail: "https://gmailmcp.googleapis.com/mcp/v1",
-  drive: "https://drivemcp.googleapis.com/mcp/v1",
-};
+const GOOGLE_SCRIPT_PATH = "tools/ctxgit/ctxgit.py";
 
 function renderInstagramExtension(container) {
   container.innerHTML = `

@@ -15,12 +15,13 @@ import json
 import sys
 from typing import Any
 
-from . import google_workspace, instagram
+from . import google, instagram
 
-# Ordered registry of available extensions (module objects).
+# Ordered registry of available extensions (module objects). Every extension is
+# a stdio MCP server ctxgit spawns; each keeps its own secrets in its own .env.
 _REGISTRY: dict[str, Any] = {
     instagram.ID: instagram,
-    google_workspace.ID: google_workspace,
+    google.ID: google,
 }
 
 
@@ -32,48 +33,19 @@ def get_extension(ext_id: str) -> Any | None:
     return _REGISTRY.get(ext_id)
 
 
-def extension_kind(ext: Any) -> str:
-    """"stdio" (ctxgit spawns the MCP server) or "remote" (user-configured CLI MCP)."""
-    return getattr(ext, "KIND", "stdio")
-
-
-def stdio_extensions() -> list[Any]:
-    return [ext for ext in _REGISTRY.values() if extension_kind(ext) == "stdio"]
-
-
-def remote_extensions() -> list[Any]:
-    return [ext for ext in _REGISTRY.values() if extension_kind(ext) == "remote"]
-
-
 def metadata(ext: Any) -> dict[str, Any]:
-    payload = {
+    return {
         "id": ext.ID,
         "name": ext.NAME,
         "icon": ext.ICON,
         "description": ext.DESCRIPTION,
-        "kind": extension_kind(ext),
         "configured": ext.configured(),
     }
-    if extension_kind(ext) == "remote":
-        # Per-server registration status, for the setup UI.
-        payload["servers"] = ext.server_status() if hasattr(ext, "server_status") else {}
-    return payload
 
 
 def mcp_tool_names(ext: Any) -> tuple[str, ...]:
-    """Fully-qualified tool names for a stdio extension (used in Claude allowlists)."""
+    """Fully-qualified tool names for an extension (used in Claude allowlists)."""
     return tuple(f"mcp__{ext.ID}__{tool['name']}" for tool in ext.MCP_TOOLS)
-
-
-def remote_allow_names(ext: Any) -> tuple[str, ...]:
-    """Claude allowlist entries for a remote extension.
-
-    Prefer an explicit read-only tool list (deny-by-default) when the extension
-    declares one; fall back to whole-server allow (mcp__<server>) otherwise.
-    """
-    if hasattr(ext, "read_tool_names"):
-        return tuple(ext.read_tool_names())
-    return tuple(f"mcp__{server}" for server in getattr(ext, "MCP_SERVERS", ()))
 
 
 def run_mcp_server(ext: Any) -> int:

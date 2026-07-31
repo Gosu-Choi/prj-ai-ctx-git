@@ -535,54 +535,107 @@ def extension_status_payload() -> list[dict[str, Any]]:
     return payload
 
 
-def instagram_active() -> bool:
-    """The Instagram MCP/endpoints are usable only when enabled AND configured."""
-    return extension_enabled(extensions.instagram.ID) and extensions.instagram.configured()
+def extension_active(ext: Any) -> bool:
+    """An extension's MCP tools are usable only when enabled AND configured."""
+    return extension_enabled(ext.ID) and ext.configured()
 
 
-INSTAGRAM_MCP_TOOL_NAMES = extensions.mcp_tool_names(extensions.instagram)
+def active_extensions() -> list[Any]:
+    return [ext for ext in extensions.all_extensions() if extension_active(ext)]
 
 
-def instagram_mcp_server_spec() -> dict[str, Any]:
-    """How the chat agent should spawn the stdio MCP server (this same script)."""
+def extension_mcp_server_spec(ext: Any) -> dict[str, Any]:
+    """How the chat agent spawns this extension's stdio MCP server (this script)."""
     return {
         "command": sys.executable,
-        "args": [str(Path(__file__).resolve()), "mcp-instagram"],
+        "args": [str(Path(__file__).resolve()), "mcp-extension", ext.ID],
     }
 
 
+def active_extension_mcp_tool_names() -> list[str]:
+    """Fully-qualified tool names of every active extension (for Claude allowlists)."""
+    names: list[str] = []
+    for ext in active_extensions():
+        names.extend(extensions.mcp_tool_names(ext))
+    return names
+
+
+def active_extension_mcp_config() -> dict[str, Any]:
+    """`mcpServers` config for every active extension (for Claude --mcp-config)."""
+    return {ext.ID: extension_mcp_server_spec(ext) for ext in active_extensions()}
+
+
 def apply_codex_extension_mcps(cmd: list[str], root: Path) -> None:
-    """Wire enabled extensions' MCP tools onto a Codex command.
+    """Register every active extension's stdio MCP server on a Codex command.
 
     Applied to every user-facing Codex chat path (chat, context chat, history
-    chat, team pipeline) so the agent can use the tools — not just one path.
-    `-c` overrides are global options inserted before the `exec` subcommand;
+    chat, team pipeline) so the agent can use the tools on any of them. `-c`
+    overrides are global options inserted before the `exec` subcommand;
     default_tools_approval_mode="approve" auto-approves the server's tool calls
     so the non-interactive `exec` run does not cancel them.
-
-    - stdio extensions (Instagram): ctxgit spawns the server, so we register its
-      command/args here.
-    - remote extensions (Google Workspace): the user registers the server in
-      ~/.codex/config.toml (with OAuth) themselves; we only add the approval
-      override for servers that are actually configured, so exec doesn't cancel
-      them. We never define a partial server entry for an unconfigured server.
     """
-    if instagram_active():
-        spec = instagram_mcp_server_spec()
-        cmd.extend(["-c", "mcp_servers.instagram.command=" + json.dumps(spec["command"])])
-        cmd.extend(["-c", "mcp_servers.instagram.args=" + json.dumps(spec["args"])])
-        cmd.extend(["-c", 'mcp_servers.instagram.default_tools_approval_mode="approve"'])
-    for ext in extensions.remote_extensions():
-        if not extension_enabled(ext.ID):
-            continue
-        for server in ext.codex_configured_servers():
-            cmd.extend(["-c", f'mcp_servers.{server}.default_tools_approval_mode="approve"'])
-            # Deny-by-default: expose only the read-only tools, so write tools
-            # (send/draft/label, create/copy file) are never available to codex.
-            if hasattr(ext, "codex_enabled_tools"):
-                read_tools = ext.codex_enabled_tools(server)
-                if read_tools:
-                    cmd.extend(["-c", f"mcp_servers.{server}.enabled_tools=" + json.dumps(read_tools)])
+    for ext in active_extensions():
+        spec = extension_mcp_server_spec(ext)
+        cmd.extend(["-c", f"mcp_servers.{ext.ID}.command=" + json.dumps(spec["command"])])
+        cmd.extend(["-c", f"mcp_servers.{ext.ID}.args=" + json.dumps(spec["args"])])
+        cmd.extend(["-c", f'mcp_servers.{ext.ID}.default_tools_approval_mode="approve"'])
+
+
+def run_google_auth() -> int:
+    """One-time OAuth (loopback) to grant ctxgit read-only Gmail + Drive access.
+
+    Reuses an existing OAuth client (id + secret). Opens the browser, receives the
+    code on a localhost callback, exchanges it for a refresh token, and stores the
+    credentials in extensions/google/.env.
+    """
+    import http.server
+    import webbrowser
+
+    google = extensions.get_extension("google")
+    env = google._read_env()  # noqa: SLF001 - reading the extension's own .env
+    client_id = env.get("GOOGLE_CLIENT_ID") or input("Google OAuth client ID: ").strip()
+    client_secret = env.get("GOOGLE_CLIENT_SECRET") or input("Google OAuth client secret: ").strip()
+    if not client_id or not client_secret:
+        die("client id and secret are required")
+
+    port = 8799
+    redirect_uri = f"http://localhost:{port}/"
+    holder: dict[str, str] = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            if "code" in query:
+                holder["code"] = query["code"][0]
+            if "error" in query:
+                holder["error"] = query["error"][0]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"<h2>ctxgit: authorization received. You can close this tab.</h2>")
+
+        def log_message(self, *args: Any) -> None:  # silence the default logging
+            return
+
+    httpd = http.server.HTTPServer(("127.0.0.1", port), Handler)
+    url = google.auth_url(client_id, redirect_uri)
+    print("\nOpen this URL and authorize read-only Gmail + Drive access:\n")
+    print(url + "\n")
+    print(f"(callback: {redirect_uri} — if your OAuth client is a 'Web application', add this exact URI to it)\n")
+    try:
+        webbrowser.open(url)
+    except Exception:  # noqa: BLE001 - headless machines just use the printed URL
+        pass
+    while "code" not in holder and "error" not in holder:
+        httpd.handle_request()
+    httpd.server_close()
+
+    if holder.get("error"):
+        die(f"authorization failed: {holder['error']}")
+    refresh_token = google.exchange_code(client_id, client_secret, holder["code"], redirect_uri)
+    google.write_credentials(client_id, client_secret, refresh_token)
+    print("\n✅ Saved read-only Gmail + Drive credentials. The Google extension is now configured.")
+    return 0
 
 
 def send_telegram_message(token: str, chat_id: str, text: str, timeout: int = 8) -> None:
@@ -7239,35 +7292,21 @@ def call_claude_prompt(
         web_search=config.get("webSearch") is not False,
         subagents=subagents_enabled,
     )
-    # Instagram (stdio, spawned by ctxgit) + any enabled remote extensions
-    # (Google Workspace, whose servers the user registered in `claude mcp add`,
-    # loaded automatically since we don't pass --strict-mcp-config).
-    instagram_available = instagram_active()
-    allowed_names: list[str] = []
-    if instagram_available:
-        allowed_names.extend(INSTAGRAM_MCP_TOOL_NAMES)
-    remote_hints: list[str] = []
-    for ext in extensions.remote_extensions():
-        if extension_enabled(ext.ID):
-            allowed_names.extend(extensions.remote_allow_names(ext))
-            remote_hints.append(ext.NAME)
+    # Every active extension is a stdio MCP server ctxgit spawns; allow-list its
+    # tools and hint the agent about it.
+    active_exts = active_extensions()
+    allowed_names = active_extension_mcp_tool_names()
     allowed_tools = ",".join([tools, *allowed_names]) if allowed_names else tools
     system_prompt = (
         "You are running inside ctxgit. Do not push, publish, deploy, or modify files outside "
         "the current working directory and explicitly added directories. Respect the requested "
         "read-only or writable mode. Return the required structured output."
     )
-    if instagram_available:
+    if active_exts:
+        names = ", ".join(f"{ext.NAME} (mcp__{ext.ID}__*)" for ext in active_exts)
         system_prompt += (
-            " An Instagram extension is available via MCP tools "
-            "(mcp__instagram__get_instagram_profile, mcp__instagram__get_instagram_media). "
-            "When the user asks about an Instagram account or post, call get_instagram_profile "
-            "first, then get_instagram_media with the returned id."
-        )
-    if remote_hints:
-        system_prompt += (
-            f" These integrations are also available via MCP tools: {', '.join(remote_hints)}. "
-            "Use them when the user asks about that data (e.g. Gmail threads, Drive files)."
+            f" These integrations are available via MCP tools: {names}. "
+            "Use them when the user asks about that data (e.g. Gmail/Drive, Instagram)."
         )
     if subagents_enabled:
         system_prompt += LEAD_ORCHESTRATION_PROTOCOL
@@ -7286,11 +7325,9 @@ def call_claude_prompt(
             command.extend([
                 "--json-schema", json.dumps(schema, ensure_ascii=False, separators=(",", ":")),
             ])
-        if instagram_available:
-            command.extend([
-                "--mcp-config",
-                json.dumps({"mcpServers": {"instagram": instagram_mcp_server_spec()}}),
-            ])
+        mcp_servers = active_extension_mcp_config()
+        if mcp_servers:
+            command.extend(["--mcp-config", json.dumps({"mcpServers": mcp_servers})])
         command.extend([
             "--no-session-persistence",
             "--permission-mode", "auto" if writable else "bypassPermissions",
@@ -10695,7 +10732,7 @@ def make_handler(
                 self.send_json({
                     "configured": extensions.instagram.configured(),
                     "enabled": extension_enabled("instagram"),
-                    "active": instagram_active(),
+                    "active": extension_active(extensions.instagram),
                 })
                 return True
             if parsed.path == "/api/extensions/instagram/image":
@@ -12705,7 +12742,10 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--no-auth", dest="auth_required", action="store_false", help="Disable the web login gate")
     serve.set_defaults(auth_required=False)
 
-    sub.add_parser("mcp-instagram", help="Run the Instagram MCP server over stdio (used by chat agents)")
+    mcp_ext = sub.add_parser("mcp-extension", help="Run an extension's MCP server over stdio (used by chat agents)")
+    mcp_ext.add_argument("extension", help="Extension id (e.g. instagram, google)")
+
+    sub.add_parser("google-auth", help="One-time OAuth to grant ctxgit read-only Gmail + Drive access")
 
     worker = sub.add_parser("worker", help="Run a local Codex worker for a ctxgit server")
     worker.add_argument("--server", required=True, help="ctxgit server URL, for example http://127.0.0.1:8765")
@@ -12738,8 +12778,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
-    if args.command == "mcp-instagram":
-        return extensions.run_mcp_server(extensions.instagram)
+    if args.command == "mcp-extension":
+        ext = extensions.get_extension(args.extension)
+        if ext is None:
+            die(f"unknown extension: {args.extension}")
+        return extensions.run_mcp_server(ext)
+
+    if args.command == "google-auth":
+        return run_google_auth()
 
     if args.command == "serve":
         root = resolve_serve_root(args.root) if args.root else None
