@@ -1477,16 +1477,35 @@ function getCollapsedFolders() {
   }
 }
 
+function setCollapsedFolders(list) {
+  try {
+    localStorage.setItem(FOLDER_COLLAPSED_STORAGE_KEY, JSON.stringify([...new Set(list)]));
+  } catch {
+    // localStorage may be unavailable; state still applies for this render.
+  }
+}
+
 function toggleFolderCollapsed(folder) {
   const set = new Set(getCollapsedFolders());
   if (set.has(folder)) set.delete(folder);
   else set.add(folder);
-  try {
-    localStorage.setItem(FOLDER_COLLAPSED_STORAGE_KEY, JSON.stringify([...set]));
-  } catch {
-    // localStorage may be unavailable; the toggle still works for this render.
-  }
+  setCollapsedFolders([...set]);
   renderBranches();
+}
+
+// Accordion: keep only the active branch's folder open, collapse the rest.
+// Runs on branch switch (not every render), so manually expanding another
+// folder still sticks until the next switch.
+function collapseFoldersExceptActive() {
+  const active = state.branches.find((item) => item.id === state.activeBranch);
+  const activeFolder = (active?.folder || "").trim();
+  const allFolders = [
+    ...new Set([
+      ...(state.folders || []),
+      ...state.branches.map((item) => (item.folder || "").trim()).filter(Boolean),
+    ]),
+  ];
+  setCollapsedFolders(allFolders.filter((folder) => folder !== activeFolder));
 }
 
 function applyFolderResponse(data) {
@@ -3804,6 +3823,7 @@ async function loadBranch(branch) {
   state.activeGlobalized = null;
   state.activeContextChat = false;
   selectTab("chat");
+  collapseFoldersExceptActive();
   renderBranches();
   const payload = await api(`/api/branch?id=${encodeURIComponent(branch)}`);
   if (state.activeBranch !== branch) return;
