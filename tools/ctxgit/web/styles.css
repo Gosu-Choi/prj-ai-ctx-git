@@ -641,8 +641,7 @@ button.section-toggle[aria-expanded="false"] .section-toggle-caret {
 .active-title-row {
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
+  gap: 10px;
   min-width: 0;
 }
 
@@ -2909,23 +2908,6 @@ button.section-toggle[aria-expanded="false"] .section-toggle-caret {
   padding: 6px 12px;
   max-height: 320px;
   overflow-y: auto;
-  overflow-x: hidden;
-}
-
-/* Guest-invite dialog: wider, and rows stay on one line so the layout doesn't
-   shift left/right as you hover different branches. */
-#guestDialog {
-  width: min(620px, 94vw);
-}
-
-#guestDialog .folder-dialog-list {
-  max-height: min(60vh, 460px);
-}
-
-#guestDialog .folder-pick {
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
 }
 
 .folder-pick {
@@ -3074,100 +3056,4 @@ button.section-toggle[aria-expanded="false"] .section-toggle-caret {
 .archived-restore:hover {
   background: var(--accent-soft);
   border-color: var(--accent);
-}
-
-/* Guest turns (lightweight second voice invited into a branch) ------------ */
-.message-guest {
-  border-left: 3px solid #7c3aed;
-  background: #f6f3ff;
-}
-
-.message-guest .message-role {
-  color: #6d28d9;
-  font-weight: 700;
-}
-
-.guest-chip {
-  display: grid;
-  gap: 8px;
-  margin: 2px 0 6px;
-  padding: 10px;
-  border: 1px solid #d9cffb;
-  background: #f6f3ff;
-  border-radius: 10px;
-  font-size: 12px;
-  color: var(--text);
-}
-
-.guest-chip[hidden] {
-  display: none;
-}
-
-.guest-room-head {
-  font-weight: 700;
-  color: #6d28d9;
-}
-
-/* Reuse the sequence-room order rows; add a controls cell on the right. */
-.guest-chip .merge-selected-item {
-  grid-template-columns: 22px minmax(0, 1fr) auto;
-  background: #fff;
-}
-
-.guest-chip .merge-selected-number {
-  background: #7c3aed;
-}
-
-.guest-row-controls {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-}
-
-.guest-move {
-  border: none;
-  background: transparent;
-  color: #6d28d9;
-  cursor: pointer;
-  font-size: 12px;
-  line-height: 1;
-  padding: 2px 5px;
-  border-radius: 6px;
-}
-
-.guest-move:hover {
-  background: #ece5fd;
-}
-
-.guest-rounds-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-weight: 600;
-  color: #6d28d9;
-}
-
-.guest-rounds-row input {
-  width: 56px;
-  padding: 4px 6px;
-  border: 1px solid #d9cffb;
-  border-radius: 6px;
-  background: #fff;
-  color: var(--text);
-}
-
-.guest-hint {
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 400;
-}
-
-/* Host row in the guest room order (the branch's own agent, not a guest). */
-.guest-chip .merge-selected-item.guest-host-row {
-  background: #ece5fd;
-}
-
-.guest-chip .merge-selected-item small {
-  color: var(--muted);
-  font-weight: 400;
 }

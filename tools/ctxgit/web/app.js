@@ -193,11 +193,6 @@ const els = {
   contextBranchButton: document.querySelector("#contextBranchButton"),
   historyChatButton: document.querySelector("#historyChatButton"),
   teamButton: document.querySelector("#teamButton"),
-  guestChip: document.querySelector("#guestChip"),
-  inviteGuestButton: document.querySelector("#inviteGuestButton"),
-  guestDialog: document.querySelector("#guestDialog"),
-  guestDialogHost: document.querySelector("#guestDialogHost"),
-  guestDialogList: document.querySelector("#guestDialogList"),
   refreshButton: document.querySelector("#refreshButton"),
   telegramNotifyInput: document.querySelector("#telegramNotifyInput"),
   telegramNotifyStatus: document.querySelector("#telegramNotifyStatus"),
@@ -2915,29 +2910,6 @@ async function interjectSequenceRoom(branch, job) {
   }
 }
 
-// Live-refresh the branch as each guest-room turn (host/guest) is saved, so a
-// multi-turn discussion shows up incrementally instead of only at the end.
-async function refreshGuestRoomProgress(job) {
-  if (!job?.id || String(job.mode || job.kind || "") !== "chat") return;
-  const saved = (job.events || []).reduce((highest, event) => {
-    const match = String(event?.message || "").match(/^Guest room turn (\d+) saved$/);
-    return match ? Math.max(highest, Number(match[1])) : highest;
-  }, 0);
-  if (!saved || saved <= (state.sequenceRenderedReplies[job.id] || 0)) return;
-  state.sequenceRenderedReplies[job.id] = saved;
-  if (activeChatKey() !== job.branch) return;
-  try {
-    const payload = await api(`/api/branch?id=${encodeURIComponent(job.branch)}`);
-    if (activeChatKey() === job.branch) {
-      renderBranch(payload);
-      updateComposerState();
-      scrollChatToBottom();
-    }
-  } catch {
-    // Best-effort live refresh; the final render at job completion is authoritative.
-  }
-}
-
 async function refreshSequenceRoomProgress(job) {
   if (!job?.id || !String(job.mode || job.kind || "").startsWith("sequence-room")) return;
   const savedReplies = (job.events || []).reduce((highest, event) => {
@@ -3007,165 +2979,6 @@ function updateComposerState() {
   els.teamButton.title = claudeProvider
     ? "Run the deterministic team pipeline: plan → prd → exec → verify → fix"
     : "Team pipeline requires the Claude provider";
-  // Invited guest branches (ordered speaking order); persist until removed.
-  const guests =
-    !contextMode && !isSequenceRoom && Array.isArray(state.payload?.meta?.guests)
-      ? state.payload.meta.guests
-      : [];
-  // Invite button: only on normal, non-archived branches.
-  if (els.inviteGuestButton) {
-    els.inviteGuestButton.hidden = contextMode || isSequenceRoom || archived || !activeKey;
-  }
-  renderGuestBar(guests, state.payload?.meta?.guestRounds || 1, disabled || Boolean(running));
-}
-
-// Guest room order panel — styled like the sequence-room order UI. Participants
-// are the host (this branch's own agent) AND the invited guests, all in one
-// reorderable speaking order; on Send they all speak (read-only) for N rounds.
-function renderGuestBar(guests, rounds, locked) {
-  if (!els.guestChip) return;
-  if (!guests.length) {
-    els.guestChip.hidden = true;
-    els.guestChip.innerHTML = "";
-    return;
-  }
-  els.guestChip.hidden = false;
-  const guestById = new Map(guests.map((g) => [g.sourceBranch, g]));
-  // Full order tokens: "host" + guest ids. Default host first.
-  const stored = Array.isArray(state.payload?.meta?.guestOrder) ? state.payload.meta.guestOrder : [];
-  const order = [];
-  for (const t of stored) if ((t === "host" || guestById.has(t)) && !order.includes(t)) order.push(t);
-  if (!order.includes("host")) order.unshift("host");
-  for (const g of guests) if (!order.includes(g.sourceBranch)) order.push(g.sourceBranch);
-
-  const hostLabel = `🏠 ${escapeHtml(state.payload?.meta?.title || state.activeBranch || "이 브랜치")} <small>· 이 브랜치 에이전트(게스트 아님)</small>`;
-  const rows = order
-    .map((token, i) => {
-      const up = i > 0 ? `<button class="guest-move" data-move-up="${escapeHtml(token)}" type="button" title="위로">↑</button>` : "";
-      const down = i < order.length - 1 ? `<button class="guest-move" data-move-down="${escapeHtml(token)}" type="button" title="아래로">↓</button>` : "";
-      const isHost = token === "host";
-      const label = isHost ? hostLabel : escapeHtml(guestById.get(token)?.title || token);
-      const remove = isHost
-        ? ""
-        : `<button class="merge-selected-remove" data-guest-remove="${escapeHtml(token)}" type="button" title="내보내기">×</button>`;
-      return `
-        <div class="merge-selected-item${isHost ? " guest-host-row" : ""}">
-          <span class="merge-selected-number">${i + 1}</span>
-          <span>${label}</span>
-          <span class="guest-row-controls">${up}${down}${remove}</span>
-        </div>`;
-    })
-    .join("");
-  els.guestChip.innerHTML = `
-    <div class="guest-room-head">🎙 게스트 방 · 발언 순서 (고정 ${rounds}턴)</div>
-    <div class="merge-selected-order">${rows}</div>
-    <label class="guest-rounds-row">고정 턴 수
-      <input id="guestRoundsInput" type="number" min="1" max="10" value="${rounds}" />
-      <span class="guest-hint">Send 하면 이 순서로 ${rounds}턴 돕니다 (호스트 에이전트도 게스트처럼 참여).</span>
-    </label>`;
-  if (locked) return;
-  els.guestChip.querySelectorAll("[data-guest-remove]").forEach((b) =>
-    b.addEventListener("click", () => removeGuest(b.dataset.guestRemove)),
-  );
-  els.guestChip.querySelectorAll("[data-move-up]").forEach((b) =>
-    b.addEventListener("click", () => reorderGuests(moveInArray(order, b.dataset.moveUp, -1))),
-  );
-  els.guestChip.querySelectorAll("[data-move-down]").forEach((b) =>
-    b.addEventListener("click", () => reorderGuests(moveInArray(order, b.dataset.moveDown, 1))),
-  );
-  els.guestChip.querySelector("#guestRoundsInput")?.addEventListener("change", (event) => {
-    saveGuestRounds(Number(event.target.value) || 1);
-  });
-}
-
-async function saveGuestRounds(rounds) {
-  const branch = state.activeBranch;
-  if (!branch) return;
-  try {
-    const payload = await api("/api/branch/guest/rounds", {
-      method: "POST",
-      body: JSON.stringify({ branch, rounds }),
-    });
-    if (state.activeBranch === branch) renderBranch(payload);
-  } catch (error) {
-    window.alert(`턴 수 변경 실패: ${error.message}`);
-  }
-}
-
-function moveInArray(arr, id, delta) {
-  const list = [...arr];
-  const i = list.indexOf(id);
-  const j = i + delta;
-  if (i < 0 || j < 0 || j >= list.length) return list;
-  [list[i], list[j]] = [list[j], list[i]];
-  return list;
-}
-
-async function reorderGuests(order) {
-  const branch = state.activeBranch;
-  if (!branch) return;
-  try {
-    const payload = await api("/api/branch/guest/reorder", {
-      method: "POST",
-      body: JSON.stringify({ branch, order }),
-    });
-    if (state.activeBranch === branch) renderBranch(payload);
-  } catch (error) {
-    window.alert(`순서 변경 실패: ${error.message}`);
-  }
-}
-
-function openGuestPicker() {
-  const dialog = els.guestDialog;
-  const host = state.activeBranch;
-  if (!dialog || !host) return;
-  if (els.guestDialogHost) els.guestDialogHost.textContent = host;
-  const invited = new Set((state.payload?.meta?.guests || []).map((g) => g.sourceBranch));
-  const current = "";
-  const candidates = (state.branches || []).filter((item) => item.id !== host && !invited.has(item.id));
-  els.guestDialogList.innerHTML = candidates.length
-    ? candidates
-        .map(
-          (item) =>
-            `<button class="folder-pick ${item.id === current ? "active" : ""}" data-guest-branch="${escapeHtml(item.id)}" type="button"><strong>${escapeHtml(item.title || item.id)}</strong> · ${escapeHtml(item.id)}</button>`,
-        )
-        .join("")
-    : '<div class="muted">초대할 다른 브랜치가 없습니다.</div>';
-  els.guestDialogList.querySelectorAll("[data-guest-branch]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      dialog.close();
-      await inviteGuest(button.dataset.guestBranch);
-    });
-  });
-  dialog.showModal();
-}
-
-async function inviteGuest(guestBranch) {
-  const branch = state.activeBranch;
-  if (!branch || !guestBranch) return;
-  try {
-    const payload = await api("/api/branch/guest/invite", {
-      method: "POST",
-      body: JSON.stringify({ branch, guest: guestBranch }),
-    });
-    if (state.activeBranch === branch) renderBranch(payload);
-  } catch (error) {
-    window.alert(`게스트 초대 실패: ${error.message}`);
-  }
-}
-
-async function removeGuest(guestBranch) {
-  const branch = state.activeBranch;
-  if (!branch) return;
-  try {
-    const payload = await api("/api/branch/guest/remove", {
-      method: "POST",
-      body: JSON.stringify({ branch, guest: guestBranch || "" }),
-    });
-    if (state.activeBranch === branch) renderBranch(payload);
-  } catch (error) {
-    window.alert(`게스트 내보내기 실패: ${error.message}`);
-  }
 }
 
 function renderActiveBranchJob() {
@@ -3335,7 +3148,6 @@ async function monitorTrackedJob(jobId) {
       renderEventPanel(remembered);
       updateComposerState();
       await refreshSequenceRoomProgress(remembered);
-      await refreshGuestRoomProgress(remembered);
     }
     if (remembered.status === "done") {
       // Do not auto-clear the "done" indicator just because this branch is open;
@@ -3458,17 +3270,9 @@ function renderBranch(payload) {
     payload.history
       .map(
         (message, index) => `
-          <article class="message message-${escapeHtml(message.role)}${message.mode === "guest" ? " message-guest" : ""}${index === failedUserIndex ? " message-failed" : ""}" data-history-message="${index}">
+          <article class="message message-${escapeHtml(message.role)}${index === failedUserIndex ? " message-failed" : ""}" data-history-message="${index}">
             <div class="message-header">
-              <span class="message-role">${
-                message.mode === "guest"
-                  ? `🎙 ${escapeHtml("Guest")}${message.guest?.title ? `: ${escapeHtml(message.guest.title)}` : ""}`
-                  : escapeHtml(
-                      message.sequenceSpeaker
-                        ? `Agent ${message.sequenceSpeaker.order} · ${message.sequenceSpeaker.title || message.sequenceSpeaker.sourceBranch}`
-                        : message.role,
-                    )
-              }</span>
+              <span class="message-role">${escapeHtml(message.sequenceSpeaker ? `Agent ${message.sequenceSpeaker.order} · ${message.sequenceSpeaker.title || message.sequenceSpeaker.sourceBranch}` : message.role)}</span>
                 <span class="message-meta-actions">
                   <span class="message-number">${index + 1}</span>
                   <span>${escapeHtml(message.createdAt)}</span>
@@ -5521,8 +5325,6 @@ els.historyChatButton.addEventListener("click", async () => {
 els.teamButton.addEventListener("click", async () => {
   await sendComposerMessage({ mode: "team", runningAction: "stop" });
 });
-
-els.inviteGuestButton?.addEventListener("click", () => openGuestPicker());
 
 function setBranchDirButton(branchId) {
   if (!els.openBranchDirButton) return;

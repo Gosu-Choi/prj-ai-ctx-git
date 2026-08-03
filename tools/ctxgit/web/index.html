@@ -210,13 +210,6 @@
                 hidden
                 title="Create a new branch seeded with this contexts chat"
               >🌱 New branch from chat</button>
-              <button
-                id="inviteGuestButton"
-                class="open-dir-button"
-                type="button"
-                hidden
-                title="다른 브랜치를 이 방에 게스트로 초대 (그 브랜치 페르소나로 참여)"
-              >🎙 게스트 초대</button>
             </div>
             <div id="activeMeta" class="active-meta"></div>
           </div>
@@ -260,7 +253,6 @@
               <div id="progressEvents" class="progress-events"></div>
             </div>
             <div id="chatError" class="error-banner chat-error" hidden></div>
-            <div id="guestChip" class="guest-chip" hidden></div>
             <div id="branchResourceStage" class="resource-stage" hidden></div>
             <form id="composer" class="composer">
               <textarea id="messageInput" rows="3" placeholder="Ask the branch-aware AI"></textarea>
@@ -383,15 +375,6 @@
         </section>
       </main>
     </div>
-
-    <dialog id="guestDialog" class="folder-dialog">
-      <div class="folder-dialog-head">
-        <strong>🎙 게스트로 초대할 브랜치</strong>
-        <button type="button" onclick="this.closest('dialog').close()" aria-label="Close">✕</button>
-      </div>
-      <div class="folder-dialog-target-row">이 방(<code id="guestDialogHost"></code>)에 다른 브랜치를 그 페르소나 그대로 초대합니다. 새 룸은 안 만들어집니다.</div>
-      <div id="guestDialogList" class="folder-dialog-list"></div>
-    </dialog>
 
     <dialog id="folderDialog" class="folder-dialog">
       <div class="folder-dialog-head">
