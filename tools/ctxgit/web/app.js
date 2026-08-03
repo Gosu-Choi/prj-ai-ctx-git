@@ -2993,11 +2993,13 @@ function updateComposerState() {
   if (els.inviteGuestButton) {
     els.inviteGuestButton.hidden = contextMode || isSequenceRoom || archived || !activeKey;
   }
-  renderGuestBar(guests, disabled || Boolean(running));
+  renderGuestBar(guests, state.payload?.meta?.guestRounds || 1, disabled || Boolean(running));
 }
 
-// The ordered guests bar: host speaks first on Send, then these guests in order.
-function renderGuestBar(guests, locked) {
+// Guest room order panel — styled like the sequence-room order UI: a numbered
+// speaking order (host first, then guests) with reorder/remove, plus a fixed
+// turn count. On Send the host replies once, then the guests cycle N rounds.
+function renderGuestBar(guests, rounds, locked) {
   if (!els.guestChip) return;
   if (!guests.length) {
     els.guestChip.hidden = true;
@@ -3005,19 +3007,31 @@ function renderGuestBar(guests, locked) {
     return;
   }
   els.guestChip.hidden = false;
-  const rows = guests
+  const ids = guests.map((g) => g.sourceBranch);
+  const row = (num, label, controls) => `
+    <div class="merge-selected-item">
+      <span class="merge-selected-number">${num}</span>
+      <span>${label}</span>
+      <span class="guest-row-controls">${controls}</span>
+    </div>`;
+  const guestRows = guests
     .map((g, i) => {
-      const label = escapeHtml(g.title || g.sourceBranch);
       const up = i > 0 ? `<button class="guest-move" data-guest-up="${escapeHtml(g.sourceBranch)}" type="button" title="위로">↑</button>` : "";
       const down = i < guests.length - 1 ? `<button class="guest-move" data-guest-down="${escapeHtml(g.sourceBranch)}" type="button" title="아래로">↓</button>` : "";
-      return `<span class="guest-item"><span class="guest-order">${i + 2}</span>${label}${up}${down}<button class="guest-chip-remove" data-guest-remove="${escapeHtml(g.sourceBranch)}" type="button" title="내보내기">✕</button></span>`;
+      return row(i + 2, escapeHtml(g.title || g.sourceBranch), `${up}${down}<button class="merge-selected-remove" data-guest-remove="${escapeHtml(g.sourceBranch)}" type="button" title="내보내기">×</button>`);
     })
     .join("");
-  els.guestChip.innerHTML =
-    `<span class="guest-chip-label">🎙 발언 순서</span><span class="guest-item guest-host"><span class="guest-order">1</span>호스트(나)</span>${rows}` +
-    `<span class="guest-hint">Send 하면 이 순서로 자동 진행</span>`;
+  els.guestChip.innerHTML = `
+    <div class="guest-room-head">🎙 게스트 방 · 발언 순서 (고정 ${rounds}턴)</div>
+    <div class="merge-selected-order">
+      ${row(1, "호스트(나)", "")}
+      ${guestRows}
+    </div>
+    <label class="guest-rounds-row">고정 턴 수
+      <input id="guestRoundsInput" type="number" min="1" max="10" value="${rounds}" />
+      <span class="guest-hint">Send 하면 호스트가 답한 뒤 게스트들이 이 순서로 ${rounds}턴 돕니다.</span>
+    </label>`;
   if (locked) return;
-  const ids = guests.map((g) => g.sourceBranch);
   els.guestChip.querySelectorAll("[data-guest-remove]").forEach((b) =>
     b.addEventListener("click", () => removeGuest(b.dataset.guestRemove)),
   );
@@ -3027,6 +3041,23 @@ function renderGuestBar(guests, locked) {
   els.guestChip.querySelectorAll("[data-guest-down]").forEach((b) =>
     b.addEventListener("click", () => reorderGuests(moveInArray(ids, b.dataset.guestDown, 1))),
   );
+  els.guestChip.querySelector("#guestRoundsInput")?.addEventListener("change", (event) => {
+    saveGuestRounds(Number(event.target.value) || 1);
+  });
+}
+
+async function saveGuestRounds(rounds) {
+  const branch = state.activeBranch;
+  if (!branch) return;
+  try {
+    const payload = await api("/api/branch/guest/rounds", {
+      method: "POST",
+      body: JSON.stringify({ branch, rounds }),
+    });
+    if (state.activeBranch === branch) renderBranch(payload);
+  } catch (error) {
+    window.alert(`턴 수 변경 실패: ${error.message}`);
+  }
 }
 
 function moveInArray(arr, id, delta) {

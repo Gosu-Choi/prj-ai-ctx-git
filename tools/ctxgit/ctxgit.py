@@ -2296,6 +2296,30 @@ class ContextStore:
         self._write_branch_guests(safe_branch, guests)
         return guests
 
+    def branch_guest_rounds(self, branch_id: str) -> int:
+        """How many times the guest speaking order cycles per turn (fixed, 1-10)."""
+        paths = self.branch_paths(branch_id)
+        if not paths.root.exists():
+            return 1
+        raw = load_json(paths.meta).get("guestRounds")
+        try:
+            return max(1, min(int(raw), 10))
+        except (TypeError, ValueError):
+            return 1
+
+    def set_branch_guest_rounds(self, branch_id: str, rounds: int) -> int:
+        self.require_initialized()
+        safe_branch = validate_id(branch_id, "branch")
+        paths = self.branch_paths(safe_branch)
+        if not paths.root.exists():
+            die(f"branch does not exist: {branch_id}")
+        clamped = max(1, min(int(rounds or 1), 10))
+        meta = load_json(paths.meta)
+        meta["guestRounds"] = clamped
+        meta["updatedAt"] = utc_now()
+        dump_json(paths.meta, meta)
+        return clamped
+
     def reorder_branch_guests(self, branch_id: str, order: list[str]) -> list[dict[str, Any]]:
         """Set the guest speaking order to `order` (guest branch ids)."""
         self.require_initialized()
@@ -7973,8 +7997,14 @@ def run_chat_turn_with_guests(
     selected_provider = str(provider or read_llm_config(root).get("provider") or "codex")
     if selected_provider == "codex-worker":
         selected_provider = "codex"
-    for guest in guests:
-        run_one_guest(root, store, branch_id, guest, selected_provider, progress=progress)
+    rounds = store.branch_guest_rounds(branch_id)
+    for round_index in range(rounds):
+        for guest in guests:
+            emit_progress(
+                progress,
+                f"Round {round_index + 1}/{rounds} · guest {guest.get('title') or guest.get('sourceBranch')}",
+            )
+            run_one_guest(root, store, branch_id, guest, selected_provider, progress=progress)
     return branch_payload(store, branch_id)
 
 
@@ -12479,6 +12509,18 @@ def make_handler(
                     self.send_json(branch_payload(store, branch_id))
                 except SystemExit as exc:
                     self.send_json({"error": "guest_reorder_failed"}, status=int(exc.code or 400))
+                return
+            if parsed.path == "/api/branch/guest/rounds":
+                branch_id = str(body.get("branch") or "")
+                try:
+                    rounds = int(body.get("rounds") or 1)
+                except (TypeError, ValueError):
+                    rounds = 1
+                try:
+                    store.set_branch_guest_rounds(branch_id, rounds)
+                    self.send_json(branch_payload(store, branch_id))
+                except SystemExit as exc:
+                    self.send_json({"error": "guest_rounds_failed"}, status=int(exc.code or 400))
                 return
             if parsed.path in {"/api/history-chat/start", "/api/info-chat/start"}:
                 branch_id = str(body.get("branch") or "")
