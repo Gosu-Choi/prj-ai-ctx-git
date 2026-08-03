@@ -2800,7 +2800,9 @@ button.section-toggle[aria-expanded="false"] .section-toggle-caret {
   text-align: center;
 }
 
-.branch-folder.collapsed .folder-body {
+/* Collapsed folders keep their (JS-filtered) body visible — only the active
+   branch is rendered inside, so we no longer hide the whole body here. */
+.branch-folder.collapsed .folder-body:empty {
   display: none;
 }
 

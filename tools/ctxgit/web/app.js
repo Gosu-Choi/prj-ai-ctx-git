@@ -1493,21 +1493,6 @@ function toggleFolderCollapsed(folder) {
   renderBranches();
 }
 
-// Accordion: keep only the active branch's folder open, collapse the rest.
-// Runs on branch switch (not every render), so manually expanding another
-// folder still sticks until the next switch.
-function collapseFoldersExceptActive() {
-  const active = state.branches.find((item) => item.id === state.activeBranch);
-  const activeFolder = (active?.folder || "").trim();
-  const allFolders = [
-    ...new Set([
-      ...(state.folders || []),
-      ...state.branches.map((item) => (item.folder || "").trim()).filter(Boolean),
-    ]),
-  ];
-  setCollapsedFolders(allFolders.filter((folder) => folder !== activeFolder));
-}
-
 function applyFolderResponse(data) {
   if (data.branches) state.branches = data.branches;
   if (data.folders) state.folders = data.folders;
@@ -1641,17 +1626,27 @@ function renderBranches() {
   let branchHtml = "";
   folderNames.forEach((folder) => {
     const items = ordered.filter((branch) => folderOf(branch) === folder);
-    // Keep a folder open if the active branch lives inside it, even if collapsed.
-    const hasActive = items.some((branch) => branch.id === state.activeBranch);
-    const isCollapsed = collapsed.includes(folder) && !hasActive;
-    const body = items.length
-      ? items.map(buildBranchRow).join("")
-      : '<div class="folder-empty muted">비어 있음 — 브랜치의 ⋯ → Move to folder</div>';
+    const isCollapsed = collapsed.includes(folder);
+    // Collapsed: keep only the active branch visible (if it lives here), hide the
+    // rest. Expanded: show all. The count badge always shows the full total.
+    const visibleItems = isCollapsed
+      ? items.filter((branch) => branch.id === state.activeBranch)
+      : items;
+    let body;
+    if (!items.length) {
+      body = '<div class="folder-empty muted">비어 있음 — 브랜치의 ⋯ → Move to folder</div>';
+    } else if (visibleItems.length) {
+      body = visibleItems.map(buildBranchRow).join("");
+    } else {
+      body = ""; // collapsed and the active branch is elsewhere → fully hidden
+    }
+    const hiddenCount = items.length - visibleItems.length;
+    const countLabel = isCollapsed && hiddenCount > 0 ? `${visibleItems.length}/${items.length}` : `${items.length}`;
     branchHtml += `
       <div class="branch-folder ${isCollapsed ? "collapsed" : ""}">
         <div class="folder-header-row">
           <button class="folder-header" data-folder="${escapeHtml(folder)}" type="button" title="${escapeHtml(folder)}">
-            <span class="folder-caret" aria-hidden="true">▾</span><span class="folder-name">${escapeHtml(folder)}</span><span class="folder-count">${items.length}</span>
+            <span class="folder-caret" aria-hidden="true">▾</span><span class="folder-name">${escapeHtml(folder)}</span><span class="folder-count">${countLabel}</span>
           </button>
           <button class="folder-delete" data-folder-delete="${escapeHtml(folder)}" type="button" title="폴더 삭제 (브랜치는 유지)" aria-label="Delete folder">✕</button>
         </div>
@@ -3851,7 +3846,6 @@ async function loadBranch(branch) {
   state.activeGlobalized = null;
   state.activeContextChat = false;
   selectTab("chat");
-  collapseFoldersExceptActive();
   renderBranches();
   const payload = await api(`/api/branch?id=${encodeURIComponent(branch)}`);
   if (state.activeBranch !== branch) return;
