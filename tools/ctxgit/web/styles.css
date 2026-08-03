@@ -3029,34 +3029,29 @@ button.section-toggle[aria-expanded="false"] .section-toggle-caret {
 
 /* Archived branch restore ------------------------------------------------ */
 .archived-row {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 34px;
+  gap: 5px;
   align-items: center;
-  gap: 4px;
 }
 
 .archived-row .archived-main {
-  flex: 1;
   min-width: 0;
 }
 
 .archived-restore {
-  flex-shrink: 0;
-  border: none;
-  background: transparent;
-  color: var(--muted);
+  width: 34px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--accent);
   cursor: pointer;
-  padding: 6px 9px;
+  padding: 8px 0;
   border-radius: 6px;
-  font-size: 14px;
-  opacity: 0;
-  transition: opacity 0.12s ease;
-}
-
-.archived-row:hover .archived-restore {
-  opacity: 1;
+  font-size: 15px;
+  line-height: 1;
 }
 
 .archived-restore:hover {
   background: var(--accent-soft);
-  color: var(--accent);
+  border-color: var(--accent);
 }
