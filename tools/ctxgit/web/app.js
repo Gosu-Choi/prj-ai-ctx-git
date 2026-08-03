@@ -2996,9 +2996,9 @@ function updateComposerState() {
   renderGuestBar(guests, state.payload?.meta?.guestRounds || 1, disabled || Boolean(running));
 }
 
-// Guest room order panel — styled like the sequence-room order UI: a numbered
-// speaking order (host first, then guests) with reorder/remove, plus a fixed
-// turn count. On Send the host replies once, then the guests cycle N rounds.
+// Guest room order panel — styled like the sequence-room order UI. Participants
+// are the host (this branch's own agent) AND the invited guests, all in one
+// reorderable speaking order; on Send they all speak (read-only) for N rounds.
 function renderGuestBar(guests, rounds, locked) {
   if (!els.guestChip) return;
   if (!guests.length) {
@@ -3007,39 +3007,48 @@ function renderGuestBar(guests, rounds, locked) {
     return;
   }
   els.guestChip.hidden = false;
-  const ids = guests.map((g) => g.sourceBranch);
-  const row = (num, label, controls) => `
-    <div class="merge-selected-item">
-      <span class="merge-selected-number">${num}</span>
-      <span>${label}</span>
-      <span class="guest-row-controls">${controls}</span>
-    </div>`;
-  const guestRows = guests
-    .map((g, i) => {
-      const up = i > 0 ? `<button class="guest-move" data-guest-up="${escapeHtml(g.sourceBranch)}" type="button" title="위로">↑</button>` : "";
-      const down = i < guests.length - 1 ? `<button class="guest-move" data-guest-down="${escapeHtml(g.sourceBranch)}" type="button" title="아래로">↓</button>` : "";
-      return row(i + 2, escapeHtml(g.title || g.sourceBranch), `${up}${down}<button class="merge-selected-remove" data-guest-remove="${escapeHtml(g.sourceBranch)}" type="button" title="내보내기">×</button>`);
+  const guestById = new Map(guests.map((g) => [g.sourceBranch, g]));
+  // Full order tokens: "host" + guest ids. Default host first.
+  const stored = Array.isArray(state.payload?.meta?.guestOrder) ? state.payload.meta.guestOrder : [];
+  const order = [];
+  for (const t of stored) if ((t === "host" || guestById.has(t)) && !order.includes(t)) order.push(t);
+  if (!order.includes("host")) order.unshift("host");
+  for (const g of guests) if (!order.includes(g.sourceBranch)) order.push(g.sourceBranch);
+
+  const hostLabel = `🏠 ${escapeHtml(state.payload?.meta?.title || state.activeBranch || "이 브랜치")} <small>· 이 브랜치 에이전트(게스트 아님)</small>`;
+  const rows = order
+    .map((token, i) => {
+      const up = i > 0 ? `<button class="guest-move" data-move-up="${escapeHtml(token)}" type="button" title="위로">↑</button>` : "";
+      const down = i < order.length - 1 ? `<button class="guest-move" data-move-down="${escapeHtml(token)}" type="button" title="아래로">↓</button>` : "";
+      const isHost = token === "host";
+      const label = isHost ? hostLabel : escapeHtml(guestById.get(token)?.title || token);
+      const remove = isHost
+        ? ""
+        : `<button class="merge-selected-remove" data-guest-remove="${escapeHtml(token)}" type="button" title="내보내기">×</button>`;
+      return `
+        <div class="merge-selected-item${isHost ? " guest-host-row" : ""}">
+          <span class="merge-selected-number">${i + 1}</span>
+          <span>${label}</span>
+          <span class="guest-row-controls">${up}${down}${remove}</span>
+        </div>`;
     })
     .join("");
   els.guestChip.innerHTML = `
     <div class="guest-room-head">🎙 게스트 방 · 발언 순서 (고정 ${rounds}턴)</div>
-    <div class="merge-selected-order">
-      ${row(1, "호스트(나)", "")}
-      ${guestRows}
-    </div>
+    <div class="merge-selected-order">${rows}</div>
     <label class="guest-rounds-row">고정 턴 수
       <input id="guestRoundsInput" type="number" min="1" max="10" value="${rounds}" />
-      <span class="guest-hint">Send 하면 호스트가 답한 뒤 게스트들이 이 순서로 ${rounds}턴 돕니다.</span>
+      <span class="guest-hint">Send 하면 이 순서로 ${rounds}턴 돕니다 (호스트 에이전트도 게스트처럼 참여).</span>
     </label>`;
   if (locked) return;
   els.guestChip.querySelectorAll("[data-guest-remove]").forEach((b) =>
     b.addEventListener("click", () => removeGuest(b.dataset.guestRemove)),
   );
-  els.guestChip.querySelectorAll("[data-guest-up]").forEach((b) =>
-    b.addEventListener("click", () => reorderGuests(moveInArray(ids, b.dataset.guestUp, -1))),
+  els.guestChip.querySelectorAll("[data-move-up]").forEach((b) =>
+    b.addEventListener("click", () => reorderGuests(moveInArray(order, b.dataset.moveUp, -1))),
   );
-  els.guestChip.querySelectorAll("[data-guest-down]").forEach((b) =>
-    b.addEventListener("click", () => reorderGuests(moveInArray(ids, b.dataset.guestDown, 1))),
+  els.guestChip.querySelectorAll("[data-move-down]").forEach((b) =>
+    b.addEventListener("click", () => reorderGuests(moveInArray(order, b.dataset.moveDown, 1))),
   );
   els.guestChip.querySelector("#guestRoundsInput")?.addEventListener("change", (event) => {
     saveGuestRounds(Number(event.target.value) || 1);

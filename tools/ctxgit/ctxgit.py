@@ -2320,18 +2320,44 @@ class ContextStore:
         dump_json(paths.meta, meta)
         return clamped
 
-    def reorder_branch_guests(self, branch_id: str, order: list[str]) -> list[dict[str, Any]]:
-        """Set the guest speaking order to `order` (guest branch ids)."""
+    def branch_guest_order(self, branch_id: str) -> list[str]:
+        """Full speaking order as tokens: "host" (the branch's own agent) + guest ids.
+
+        The host participates in the discussion like any other agent. Defaults to
+        the host first, then guests in invite order.
+        """
+        guest_ids = [g["sourceBranch"] for g in self.branch_guests(branch_id)]
+        paths = self.branch_paths(branch_id)
+        stored = load_json(paths.meta).get("guestOrder") if paths.root.exists() else None
+        valid = {"host", *guest_ids}
+        order = [t for t in stored if t in valid] if isinstance(stored, list) else []
+        if "host" not in order:
+            order.insert(0, "host")
+        for gid in guest_ids:
+            if gid not in order:
+                order.append(gid)
+        return order
+
+    def set_branch_guest_order(self, branch_id: str, order: list[str]) -> list[str]:
+        """Set the full speaking order (tokens: "host" + guest ids)."""
         self.require_initialized()
         safe_branch = validate_id(branch_id, "branch")
-        if not self.branch_paths(safe_branch).root.exists():
+        paths = self.branch_paths(safe_branch)
+        if not paths.root.exists():
             die(f"branch does not exist: {branch_id}")
-        by_id = {g["sourceBranch"]: g for g in self.branch_guests(safe_branch)}
-        reordered = [by_id[gid] for gid in order if gid in by_id]
-        # Keep any not named in `order` at the end, preserving their relative order.
-        reordered += [g for gid, g in by_id.items() if gid not in set(order)]
-        self._write_branch_guests(safe_branch, reordered)
-        return reordered
+        guest_ids = [g["sourceBranch"] for g in self.branch_guests(safe_branch)]
+        valid = {"host", *guest_ids}
+        cleaned = [t for t in order if t in valid]
+        if "host" not in cleaned:
+            cleaned.insert(0, "host")
+        for gid in guest_ids:
+            if gid not in cleaned:
+                cleaned.append(gid)
+        meta = load_json(paths.meta)
+        meta["guestOrder"] = cleaned
+        meta["updatedAt"] = utc_now()
+        dump_json(paths.meta, meta)
+        return cleaned
 
     def remove_branch(self, branch_id: str) -> None:
         self.require_initialized()
@@ -7988,24 +8014,69 @@ def run_chat_turn_with_guests(
     present — no new room/directory. When there are no guests it's just a normal
     chat turn.
     """
-    payload = run_chat_turn(
-        root, store, branch_id, user_message, provider=provider, resource_paths=resource_paths, progress=progress
-    )
     guests = store.branch_guests(branch_id)
     if not guests:
-        return payload
+        # No guests → an ordinary single-agent chat turn.
+        return run_chat_turn(
+            root, store, branch_id, user_message, provider=provider, resource_paths=resource_paths, progress=progress
+        )
+    # Discussion mode: the host agent and every guest speak (read-only), in the
+    # set order, for a fixed number of rounds. No new room/directory.
     selected_provider = str(provider or read_llm_config(root).get("provider") or "codex")
     if selected_provider == "codex-worker":
         selected_provider = "codex"
+    turn_id = new_turn_id()
+    emit_progress(progress, "Preparing branch context")
+    store.auto_ingest_branch_sources(branch_id)
+    normalized = normalize_branch_resource_paths(store, branch_id, resource_paths)
+    user_extra: dict[str, Any] = {"turnId": turn_id, "mode": "chat"}
+    if normalized:
+        user_extra["resources"] = normalized
+    store.append_history(branch_id, "user", user_message, extra=user_extra)
+    order = store.branch_guest_order(branch_id)
+    guests_by_id = {g["sourceBranch"]: g for g in guests}
     rounds = store.branch_guest_rounds(branch_id)
     for round_index in range(rounds):
-        for guest in guests:
-            emit_progress(
-                progress,
-                f"Round {round_index + 1}/{rounds} · guest {guest.get('title') or guest.get('sourceBranch')}",
-            )
-            run_one_guest(root, store, branch_id, guest, selected_provider, progress=progress)
+        for token in order:
+            if token == "host":
+                run_host_discussion_turn(
+                    root, store, branch_id, selected_provider,
+                    normalized if round_index == 0 else None, progress,
+                )
+            elif token in guests_by_id:
+                run_one_guest(root, store, branch_id, guests_by_id[token], selected_provider, progress=progress)
     return branch_payload(store, branch_id)
+
+
+def run_host_discussion_turn(
+    root: Path,
+    store: ContextStore,
+    branch_id: str,
+    provider: str,
+    resource_paths: list[str] | None,
+    progress: ProgressCallback | None = None,
+) -> None:
+    """The host branch's own agent takes a read-only turn in the guest discussion."""
+    turn_id = new_turn_id()
+    emit_progress(progress, "Host agent is responding")
+    prompt = build_chat_prompt(store, branch_id, "", resource_paths=resource_paths)
+    result = call_provider_prompt(provider, root, prompt, writable=False, cwd=root, progress=progress)
+    assistant = str(result.get("assistant") or "").strip() or "(No host reply returned.)"
+    store.append_history(
+        branch_id,
+        "assistant",
+        assistant,
+        extra={"provider": provider, "turnId": turn_id, "mode": "host", "artifacts": [], "approvalRequests": []},
+    )
+    internal_git_commit_turn(
+        store,
+        kind="guest-host",
+        actor="host",
+        summary=f"Host turn on {branch_id}",
+        branch_id=branch_id,
+        turn_id=turn_id,
+        metadata={"provider": provider},
+    )
 
 
 def run_chat_turn(
@@ -12505,7 +12576,7 @@ def make_handler(
                 branch_id = str(body.get("branch") or "")
                 order = [str(item) for item in body.get("order") or [] if str(item)]
                 try:
-                    store.reorder_branch_guests(branch_id, order)
+                    store.set_branch_guest_order(branch_id, order)
                     self.send_json(branch_payload(store, branch_id))
                 except SystemExit as exc:
                     self.send_json({"error": "guest_reorder_failed"}, status=int(exc.code or 400))
