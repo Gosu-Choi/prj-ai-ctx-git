@@ -2237,22 +2237,46 @@ class ContextStore:
         dump_json(paths.meta, meta)
         self.write_index()
 
-    def set_branch_guest(self, branch_id: str, provider: str) -> None:
-        """Mark a branch as having an active guest (persists until removed)."""
+    def branch_guest(self, branch_id: str) -> dict[str, Any] | None:
+        """The guest branch invited into this branch, or None."""
         paths = self.branch_paths(branch_id)
         if not paths.root.exists():
-            return
+            return None
+        guest = load_json(paths.meta).get("guest")
+        return guest if isinstance(guest, dict) and guest.get("active") and guest.get("sourceBranch") else None
+
+    def invite_branch_guest(self, branch_id: str, guest_branch: str) -> dict[str, Any]:
+        """Invite another branch as a guest into this one (persists until removed).
+
+        Lightweight, sequence-room-like: no new room/directory is created and the
+        guest branch is read live — inviting just records a pointer in this branch's
+        meta. The guest branch responds from its own persona/context.
+        """
+        self.require_initialized()
+        safe_branch = validate_id(branch_id, "branch")
+        safe_guest = validate_id(guest_branch, "guest branch")
+        if safe_guest == safe_branch:
+            raise ValueError("a branch cannot invite itself as a guest")
+        if not self.branch_paths(safe_branch).root.exists():
+            raise ValueError(f"branch does not exist: {branch_id}")
+        guest_paths = self.branch_paths(safe_guest)
+        if not guest_paths.root.exists():
+            raise ValueError(f"guest branch does not exist: {guest_branch}")
+        guest_title = str(load_json(guest_paths.meta).get("title") or safe_guest)
+        paths = self.branch_paths(safe_branch)
         meta = load_json(paths.meta)
-        existing = meta.get("guest") if isinstance(meta.get("guest"), dict) else {}
         meta["guest"] = {
             "active": True,
-            "provider": provider,
-            "invitedAt": existing.get("invitedAt") or utc_now(),
+            "sourceBranch": safe_guest,
+            "title": guest_title,
+            "invitedAt": utc_now(),
         }
+        meta["updatedAt"] = utc_now()
         dump_json(paths.meta, meta)
+        return meta["guest"]
 
     def clear_branch_guest(self, branch_id: str) -> None:
-        """Remove a branch's active guest (its past guest messages stay in history)."""
+        """Remove a branch's guest (its past guest messages stay in history)."""
         self.require_initialized()
         paths = self.branch_paths(branch_id)
         if not paths.root.exists():
@@ -7803,11 +7827,63 @@ def call_provider_prompt(
     raise RuntimeError(f"Unsupported chat provider: {provider}")
 
 
-GUEST_FEEDBACK_INSTRUCTION = (
-    "You've been invited into this conversation as a guest for a brief, candid second "
-    "opinion. Don't restate what was already said — add your own perspective, flag anything "
-    "missed or worth reconsidering, or offer a different angle. Keep it short."
-)
+def build_guest_agent_prompt(store: ContextStore, branch_id: str, guest_branch: str, guest_title: str) -> str:
+    """Prompt for an invited guest branch to speak in the host branch's conversation.
+
+    Sequence-room-like but lightweight: the guest branch is read LIVE (no snapshot)
+    and only its persona (context + history) plus the host conversation are supplied.
+    """
+    guest_paths = store.branch_paths(guest_branch)
+    host_paths = store.branch_paths(branch_id)
+    guest_history = list(store.iter_history(guest_branch))
+    host_history = list(store.iter_history(branch_id))
+    config = active_llm_provider_config(store.root)
+    total_budget = max(
+        coerce_positive_int(config.get("sequenceContextBudgetCharacters"), DEFAULT_SEQUENCE_CONTEXT_BUDGET_CHARS),
+        DEFAULT_SEQUENCE_CONTEXT_BUDGET_CHARS,
+    )
+    guest_context_budget = max(5000, int(total_budget * 0.24))
+    guest_history_budget = max(8000, int(total_budget * 0.30))
+    host_context_budget = max(1500, int(total_budget * 0.08))
+    host_history_budget = max(9000, int(total_budget * 0.30))
+    return "\n".join(
+        [
+            "You are being brought in as a GUEST into another ctxgit branch's conversation.",
+            f"Your identity is the branch `{guest_branch}` (\"{guest_title}\"). Speak as that branch — "
+            "from its perspective, goals, and accumulated knowledge — as a distinct guest voice, not the host.",
+            "This is a lightweight, read-only guest visit: do not create, edit, move, or delete any files, "
+            "and do not modify your own source branch.",
+            "Give your own take, feedback, or contribution to the host conversation below. Be concise.",
+            "",
+            "Your own branch (guest identity) context and memory:",
+            "<guest_context>",
+            truncate_middle(read_text(guest_paths.context), guest_context_budget),
+            "</guest_context>",
+            "<guest_history>",
+            sequence_history_text(
+                guest_history,
+                guest_history_budget,
+                compacted_count=store.compacted_history_count(guest_branch),
+                compaction_label="guest compactions above",
+            ),
+            "</guest_history>",
+            "",
+            "The host conversation you are joining (respond to this):",
+            "<host_context>",
+            truncate_middle(read_text(host_paths.context), host_context_budget),
+            "</host_context>",
+            "<host_history>",
+            sequence_history_text(
+                host_history,
+                host_history_budget,
+                compacted_count=store.compacted_history_count(branch_id),
+                compaction_label="host compactions above",
+            ),
+            "</host_history>",
+            "",
+            "Respond now as the guest. Return the required structured output (assistant text only; no artifacts).",
+        ]
+    )
 
 
 def run_guest_turn(
@@ -7817,24 +7893,24 @@ def run_guest_turn(
     user_message: str = "",
     progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
-    """A lightweight one-off 'guest' turn in the current branch.
+    """Have the invited guest branch take a turn in this (host) branch's conversation.
 
-    Reuses the branch context but runs read-only (no file edits, no artifacts) and
-    labels the reply as a guest — so you can pull a second voice in for quick mutual
-    feedback without creating a whole sequence room. No new persona/prompt: the guest
-    just sees the conversation and responds (or gives feedback when no text is typed).
+    No new room/directory: the guest branch is read live and responds from its own
+    persona, appended to this branch's history and labeled as the guest.
     """
+    guest = store.branch_guest(branch_id)
+    if not guest:
+        raise ValueError("No guest is invited on this branch. Invite a branch first.")
+    guest_branch = str(guest.get("sourceBranch"))
+    guest_title = str(guest.get("title") or guest_branch)
     selected_provider = str(read_llm_config(root).get("provider") or "codex")
     turn_id = new_turn_id()
-    emit_progress(progress, "Preparing branch context")
-    store.auto_ingest_branch_sources(branch_id)
-    # Mark the guest as active on this branch — it persists until explicitly removed.
-    store.set_branch_guest(branch_id, selected_provider)
+    emit_progress(progress, "Preparing guest context")
     text = (user_message or "").strip()
     if text:
         store.append_history(branch_id, "user", text, extra={"turnId": turn_id, "mode": "chat"})
-    prompt = build_chat_prompt(store, branch_id, text or GUEST_FEEDBACK_INSTRUCTION)
-    emit_progress(progress, "Guest is thinking")
+    prompt = build_guest_agent_prompt(store, branch_id, guest_branch, guest_title)
+    emit_progress(progress, f"Guest {guest_title} is responding")
     result = call_provider_prompt(selected_provider, root, prompt, writable=False, cwd=root, progress=progress)
     assistant = str(result.get("assistant") or "").strip() or "(No guest reply returned.)"
     emit_progress(progress, "Saving guest reply")
@@ -7846,7 +7922,7 @@ def run_guest_turn(
             "provider": selected_provider,
             "turnId": turn_id,
             "mode": "guest",
-            "guest": True,
+            "guest": {"sourceBranch": guest_branch, "title": guest_title},
             "artifacts": [],
             "approvalRequests": [],
         },
@@ -7855,10 +7931,10 @@ def run_guest_turn(
         store,
         kind="guest",
         actor="user+guest",
-        summary=f"Guest turn on {branch_id}",
+        summary=f"Guest {guest_branch} turn on {branch_id}",
         branch_id=branch_id,
         turn_id=turn_id,
-        metadata={"provider": selected_provider, "mode": "guest"},
+        metadata={"provider": selected_provider, "guest": guest_branch},
     )
     emit_progress(progress, "Refreshing branch view")
     return branch_payload(store, branch_id)
@@ -12340,6 +12416,25 @@ def make_handler(
                     return run_guest_turn(root, store, branch_id, text, progress=progress)
 
                 self.send_json(jobs.create("guest", guest_work, root=root, branch=branch_id, mode="guest"), status=202)
+                return
+            if parsed.path == "/api/branch/guest/invite":
+                branch_id = str(body.get("branch") or "")
+                guest_branch = str(body.get("guest") or "")
+                try:
+                    store.invite_branch_guest(branch_id, guest_branch)
+                    internal_git_commit_turn(
+                        store,
+                        kind="guest-invite",
+                        actor="user",
+                        summary=f"Invite {guest_branch} as guest into {branch_id}",
+                        branch_id=branch_id,
+                        metadata={"branch": branch_id, "guest": guest_branch},
+                    )
+                    self.send_json(branch_payload(store, branch_id))
+                except ValueError as exc:
+                    self.send_json({"error": "guest_invite_failed", "message": str(exc)}, status=400)
+                except SystemExit as exc:
+                    self.send_json({"error": "guest_invite_failed"}, status=int(exc.code or 400))
                 return
             if parsed.path == "/api/branch/guest/remove":
                 branch_id = str(body.get("branch") or "")

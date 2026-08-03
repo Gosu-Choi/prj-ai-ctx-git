@@ -195,6 +195,10 @@ const els = {
   teamButton: document.querySelector("#teamButton"),
   guestButton: document.querySelector("#guestButton"),
   guestChip: document.querySelector("#guestChip"),
+  inviteGuestButton: document.querySelector("#inviteGuestButton"),
+  guestDialog: document.querySelector("#guestDialog"),
+  guestDialogHost: document.querySelector("#guestDialogHost"),
+  guestDialogList: document.querySelector("#guestDialogList"),
   refreshButton: document.querySelector("#refreshButton"),
   telegramNotifyInput: document.querySelector("#telegramNotifyInput"),
   telegramNotifyStatus: document.querySelector("#telegramNotifyStatus"),
@@ -2981,24 +2985,73 @@ function updateComposerState() {
   els.teamButton.title = claudeProvider
     ? "Run the deterministic team pipeline: plan → prd → exec → verify → fix"
     : "Team pipeline requires the Claude provider";
-  if (els.guestButton) {
-    els.guestButton.hidden = contextMode || isSequenceRoom;
-    els.guestButton.disabled = disabled || Boolean(running);
-    els.guestButton.textContent = archived ? "Archived" : running ? "Busy" : "Guest";
+  // An invited guest branch — persists until explicitly removed.
+  const guest =
+    !contextMode && !isSequenceRoom && guestActiveInfo(state.payload?.meta?.guest);
+  // Invite button: only on normal, non-archived branches.
+  if (els.inviteGuestButton) {
+    els.inviteGuestButton.hidden = contextMode || isSequenceRoom || archived || !activeKey;
   }
-  // Persistent guest chip: shown until the guest is explicitly removed.
-  const guest = !contextMode && !isSequenceRoom ? state.payload?.meta?.guest : null;
+  // Composer "Guest" button only makes sense once a guest is invited (it makes
+  // the guest speak). Otherwise hide it — invite from the top button first.
+  if (els.guestButton) {
+    els.guestButton.hidden = contextMode || isSequenceRoom || !guest;
+    els.guestButton.disabled = disabled || Boolean(running);
+    els.guestButton.textContent = archived ? "Archived" : running ? "Busy" : "Guest 발언";
+  }
   if (els.guestChip) {
-    if (guest && guest.active) {
+    if (guest) {
       els.guestChip.hidden = false;
-      els.guestChip.innerHTML = `<span class="guest-chip-label">🎙 게스트 참여 중${
-        guest.provider ? ` · ${escapeHtml(guest.provider)}` : ""
-      }</span><button type="button" class="guest-chip-remove" id="guestChipRemove" title="이 브랜치에서 게스트 내보내기">✕ 내보내기</button>`;
+      els.guestChip.innerHTML = `<span class="guest-chip-label">🎙 게스트: ${escapeHtml(
+        guest.title || guest.sourceBranch,
+      )}</span><button type="button" class="guest-chip-remove" id="guestChipRemove" title="이 방에서 게스트 내보내기">✕ 내보내기</button>`;
       els.guestChip.querySelector("#guestChipRemove")?.addEventListener("click", removeGuest);
     } else {
       els.guestChip.hidden = true;
       els.guestChip.innerHTML = "";
     }
+  }
+}
+
+function guestActiveInfo(guest) {
+  return guest && guest.active && guest.sourceBranch ? guest : null;
+}
+
+function openGuestPicker() {
+  const dialog = els.guestDialog;
+  const host = state.activeBranch;
+  if (!dialog || !host) return;
+  if (els.guestDialogHost) els.guestDialogHost.textContent = host;
+  const current = state.payload?.meta?.guest?.sourceBranch || "";
+  const candidates = (state.branches || []).filter((item) => item.id !== host);
+  els.guestDialogList.innerHTML = candidates.length
+    ? candidates
+        .map(
+          (item) =>
+            `<button class="folder-pick ${item.id === current ? "active" : ""}" data-guest-branch="${escapeHtml(item.id)}" type="button"><strong>${escapeHtml(item.title || item.id)}</strong> · ${escapeHtml(item.id)}</button>`,
+        )
+        .join("")
+    : '<div class="muted">초대할 다른 브랜치가 없습니다.</div>';
+  els.guestDialogList.querySelectorAll("[data-guest-branch]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      dialog.close();
+      await inviteGuest(button.dataset.guestBranch);
+    });
+  });
+  dialog.showModal();
+}
+
+async function inviteGuest(guestBranch) {
+  const branch = state.activeBranch;
+  if (!branch || !guestBranch) return;
+  try {
+    const payload = await api("/api/branch/guest/invite", {
+      method: "POST",
+      body: JSON.stringify({ branch, guest: guestBranch }),
+    });
+    if (state.activeBranch === branch) renderBranch(payload);
+  } catch (error) {
+    window.alert(`게스트 초대 실패: ${error.message}`);
   }
 }
 
@@ -3309,7 +3362,7 @@ function renderBranch(payload) {
             <div class="message-header">
               <span class="message-role">${
                 message.mode === "guest"
-                  ? `🎙 ${escapeHtml("Guest")}${message.provider ? ` · ${escapeHtml(message.provider)}` : ""}`
+                  ? `🎙 ${escapeHtml("Guest")}${message.guest?.title ? `: ${escapeHtml(message.guest.title)}` : ""}`
                   : escapeHtml(
                       message.sequenceSpeaker
                         ? `Agent ${message.sequenceSpeaker.order} · ${message.sequenceSpeaker.title || message.sequenceSpeaker.sourceBranch}`
@@ -5387,6 +5440,8 @@ els.teamButton.addEventListener("click", async () => {
 els.guestButton?.addEventListener("click", async () => {
   await sendComposerMessage({ mode: "guest", runningAction: "stop" });
 });
+
+els.inviteGuestButton?.addEventListener("click", () => openGuestPicker());
 
 function setBranchDirButton(branchId) {
   if (!els.openBranchDirButton) return;
