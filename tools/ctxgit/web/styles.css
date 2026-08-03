@@ -3026,3 +3026,37 @@ button.section-toggle[aria-expanded="false"] .section-toggle-caret {
 .gw-warn {
   color: var(--warn);
 }
+
+/* Archived branch restore ------------------------------------------------ */
+.archived-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.archived-row .archived-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.archived-restore {
+  flex-shrink: 0;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 6px 9px;
+  border-radius: 6px;
+  font-size: 14px;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+
+.archived-row:hover .archived-restore {
+  opacity: 1;
+}
+
+.archived-restore:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+}

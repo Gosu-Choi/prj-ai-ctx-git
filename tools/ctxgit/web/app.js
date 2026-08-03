@@ -1749,10 +1749,13 @@ function renderGlobalizedList() {
   const archivedBranchMarkup = (state.archived || [])
     .map(
       (branch) => `
-        <button class="nav-item ${branch.id === state.activeBranch ? "active" : ""}" data-archived-branch="${escapeHtml(branch.id)}" type="button" title="${escapeHtml(`${branch.title || branch.id} (${branch.id})`)}">
-          <span class="nav-title" title="${escapeHtml(branch.title || branch.id)}">${escapeHtml(branch.title || branch.id)}</span>
-          <span class="nav-meta" title="${escapeHtml(`${branch.id} · ${branch.historyCount || 0} messages · archived branch`)}">${escapeHtml(branch.id)} · ${branch.historyCount || 0} messages · branch</span>
-        </button>
+        <div class="archived-row">
+          <button class="nav-item archived-main ${branch.id === state.activeBranch ? "active" : ""}" data-archived-branch="${escapeHtml(branch.id)}" type="button" title="${escapeHtml(`${branch.title || branch.id} (${branch.id})`)}">
+            <span class="nav-title" title="${escapeHtml(branch.title || branch.id)}">${escapeHtml(branch.title || branch.id)}</span>
+            <span class="nav-meta" title="${escapeHtml(`${branch.id} · ${branch.historyCount || 0} messages · archived branch`)}">${escapeHtml(branch.id)} · ${branch.historyCount || 0} messages · branch</span>
+          </button>
+          <button class="archived-restore" data-unarchive="${escapeHtml(branch.id)}" type="button" title="브랜치로 복구 (Branches로 되돌리기)" aria-label="Restore branch">↩</button>
+        </div>
       `,
     )
     .join("");
@@ -1773,9 +1776,34 @@ function renderGlobalizedList() {
   els.globalizedList.querySelectorAll("[data-archived-branch]").forEach((button) => {
     button.addEventListener("click", () => loadBranch(button.dataset.archivedBranch));
   });
+  els.globalizedList.querySelectorAll("[data-unarchive]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      unarchiveBranch(button.dataset.unarchive);
+    });
+  });
   els.globalizedList.querySelectorAll("[data-globalized]").forEach((button) => {
     button.addEventListener("click", () => loadGlobalizedArchive(button.dataset.globalized));
   });
+}
+
+async function unarchiveBranch(branch) {
+  if (!branch) return;
+  if (!window.confirm(`아카이브된 브랜치 "${branch}" 를 Branches로 복구할까요?`)) return;
+  try {
+    const payload = await api("/api/branch/unarchive", {
+      method: "POST",
+      body: JSON.stringify({ branch }),
+    });
+    state.branches = payload.branches || state.branches;
+    state.folders = payload.folders || state.folders;
+    state.archived = payload.archived || [];
+    state.globalized = payload.globalized || [];
+    state.views = payload.views || state.views;
+    await loadBranch(branch); // open the restored branch (also refreshes the view)
+  } catch (error) {
+    window.alert(`복구 실패: ${error.message}`);
+  }
 }
 
 function graphLabel(value, max = 24) {

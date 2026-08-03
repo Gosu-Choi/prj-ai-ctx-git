@@ -2443,6 +2443,42 @@ class ContextStore:
             "path": relpath(self.root, archived_branch_root),
         }
 
+    def unarchive_branch(self, branch_id: str) -> dict[str, Any]:
+        """Restore a whole-branch archive back to active storage (reverse of archive_branch)."""
+        self.require_initialized()
+        safe_branch = validate_id(branch_id, "branch")
+        archived_paths = self.archived_branch_paths(safe_branch)
+        active_paths = self.branch_paths(safe_branch)
+        if not archived_paths.root.exists():
+            die(f"archived branch does not exist: {branch_id}")
+        if active_paths.root.exists():
+            die(f"an active branch named {branch_id} already exists")
+        restored_at = utc_now()
+        # Clear the archive markers first, so migrate_archived_branch_storage
+        # won't immediately re-archive the branch after we move it back.
+        meta = load_json(archived_paths.meta)
+        for key in (
+            "archivedAt",
+            "archiveMode",
+            "archivedPath",
+            "archivedAs",
+            "archivedRangeStart",
+            "archivedRangeEnd",
+            "branchArchivePath",
+            "archivedBranchPath",
+        ):
+            meta.pop(key, None)
+        meta["updatedAt"] = restored_at
+        dump_json(archived_paths.meta, meta)
+        active_paths.root.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(archived_paths.root), str(active_paths.root))
+        self.write_index()
+        return {
+            "id": safe_branch,
+            "title": meta.get("title") or safe_branch,
+            "restoredAt": restored_at,
+        }
+
     def ensure_initial_branch(self) -> bool:
         if self.branch_paths(INITIAL_BRANCH_ID).meta.exists():
             return False
@@ -11798,6 +11834,34 @@ def make_handler(
                     self.send_json({"error": "archive_failed", "message": str(exc)}, status=400)
                 except SystemExit as exc:
                     self.send_json({"error": "archive_failed"}, status=int(exc.code or 400))
+                return
+            if parsed.path == "/api/branch/unarchive":
+                branch_id = str(body.get("branch") or "")
+                try:
+                    restored = store.unarchive_branch(branch_id)
+                    turn_commit = internal_git_commit_turn(
+                        store,
+                        kind="branch-unarchive",
+                        actor="user",
+                        summary=f"Restore archived branch {branch_id}",
+                        branch_id=branch_id,
+                        metadata={"branch": branch_id},
+                    )
+                    self.send_json(
+                        {
+                            "restored": restored,
+                            "branches": store.list_branches(),
+                            "folders": store.list_branch_folders(),
+                            "archived": store.list_archived_branches(),
+                            "globalized": store.list_globalized_archives(),
+                            "views": store.list_views(),
+                            "turnCommit": turn_commit,
+                        }
+                    )
+                except ValueError as exc:
+                    self.send_json({"error": "unarchive_failed", "message": str(exc)}, status=400)
+                except SystemExit as exc:
+                    self.send_json({"error": "unarchive_failed"}, status=int(exc.code or 400))
                 return
             if parsed.path == "/api/ingest":
                 branch_id = str(body.get("branch") or "")
