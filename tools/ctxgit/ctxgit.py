@@ -2237,20 +2237,32 @@ class ContextStore:
         dump_json(paths.meta, meta)
         self.write_index()
 
-    def branch_guest(self, branch_id: str) -> dict[str, Any] | None:
-        """The guest branch invited into this branch, or None."""
+    def branch_guests(self, branch_id: str) -> list[dict[str, Any]]:
+        """Ordered list of guest branches invited into this branch (speaking order)."""
         paths = self.branch_paths(branch_id)
         if not paths.root.exists():
-            return None
-        guest = load_json(paths.meta).get("guest")
-        return guest if isinstance(guest, dict) and guest.get("active") and guest.get("sourceBranch") else None
+            return []
+        guests = load_json(paths.meta).get("guests")
+        if not isinstance(guests, list):
+            return []
+        return [g for g in guests if isinstance(g, dict) and g.get("sourceBranch")]
 
-    def invite_branch_guest(self, branch_id: str, guest_branch: str) -> dict[str, Any]:
-        """Invite another branch as a guest into this one (persists until removed).
+    def _write_branch_guests(self, branch_id: str, guests: list[dict[str, Any]]) -> None:
+        paths = self.branch_paths(branch_id)
+        meta = load_json(paths.meta)
+        if guests:
+            meta["guests"] = guests
+        else:
+            meta.pop("guests", None)
+        meta.pop("guest", None)  # drop the legacy single-guest field
+        meta["updatedAt"] = utc_now()
+        dump_json(paths.meta, meta)
 
-        Lightweight, sequence-room-like: no new room/directory is created and the
-        guest branch is read live — inviting just records a pointer in this branch's
-        meta. The guest branch responds from its own persona/context.
+    def invite_branch_guest(self, branch_id: str, guest_branch: str) -> list[dict[str, Any]]:
+        """Add another branch as a guest (appended to the speaking order).
+
+        Lightweight, sequence-room-like: no new room/directory is created; the guest
+        branch is read live and responds from its own persona. Persists until removed.
         """
         self.require_initialized()
         safe_branch = validate_id(branch_id, "branch")
@@ -2263,28 +2275,39 @@ class ContextStore:
         if not guest_paths.root.exists():
             raise ValueError(f"guest branch does not exist: {guest_branch}")
         guest_title = str(load_json(guest_paths.meta).get("title") or safe_guest)
-        paths = self.branch_paths(safe_branch)
-        meta = load_json(paths.meta)
-        meta["guest"] = {
-            "active": True,
-            "sourceBranch": safe_guest,
-            "title": guest_title,
-            "invitedAt": utc_now(),
-        }
-        meta["updatedAt"] = utc_now()
-        dump_json(paths.meta, meta)
-        return meta["guest"]
+        guests = self.branch_guests(safe_branch)
+        if any(g.get("sourceBranch") == safe_guest for g in guests):
+            return guests  # already invited
+        guests.append({"sourceBranch": safe_guest, "title": guest_title, "invitedAt": utc_now()})
+        self._write_branch_guests(safe_branch, guests)
+        return guests
 
-    def clear_branch_guest(self, branch_id: str) -> None:
-        """Remove a branch's guest (its past guest messages stay in history)."""
+    def remove_branch_guest(self, branch_id: str, guest_branch: str = "") -> list[dict[str, Any]]:
+        """Remove one guest (by branch id) or all guests when guest_branch is empty."""
         self.require_initialized()
-        paths = self.branch_paths(branch_id)
-        if not paths.root.exists():
+        safe_branch = validate_id(branch_id, "branch")
+        if not self.branch_paths(safe_branch).root.exists():
             die(f"branch does not exist: {branch_id}")
-        meta = load_json(paths.meta)
-        meta.pop("guest", None)
-        meta["updatedAt"] = utc_now()
-        dump_json(paths.meta, meta)
+        guests = self.branch_guests(safe_branch)
+        if guest_branch:
+            guests = [g for g in guests if g.get("sourceBranch") != guest_branch]
+        else:
+            guests = []
+        self._write_branch_guests(safe_branch, guests)
+        return guests
+
+    def reorder_branch_guests(self, branch_id: str, order: list[str]) -> list[dict[str, Any]]:
+        """Set the guest speaking order to `order` (guest branch ids)."""
+        self.require_initialized()
+        safe_branch = validate_id(branch_id, "branch")
+        if not self.branch_paths(safe_branch).root.exists():
+            die(f"branch does not exist: {branch_id}")
+        by_id = {g["sourceBranch"]: g for g in self.branch_guests(safe_branch)}
+        reordered = [by_id[gid] for gid in order if gid in by_id]
+        # Keep any not named in `order` at the end, preserving their relative order.
+        reordered += [g for gid, g in by_id.items() if gid not in set(order)]
+        self._write_branch_guests(safe_branch, reordered)
+        return reordered
 
     def remove_branch(self, branch_id: str) -> None:
         self.require_initialized()
@@ -7886,40 +7909,28 @@ def build_guest_agent_prompt(store: ContextStore, branch_id: str, guest_branch: 
     )
 
 
-def run_guest_turn(
+def run_one_guest(
     root: Path,
     store: ContextStore,
     branch_id: str,
-    user_message: str = "",
+    guest: dict[str, Any],
+    provider: str,
     progress: ProgressCallback | None = None,
-) -> dict[str, Any]:
-    """Have the invited guest branch take a turn in this (host) branch's conversation.
-
-    No new room/directory: the guest branch is read live and responds from its own
-    persona, appended to this branch's history and labeled as the guest.
-    """
-    guest = store.branch_guest(branch_id)
-    if not guest:
-        raise ValueError("No guest is invited on this branch. Invite a branch first.")
+) -> None:
+    """Run a single invited guest branch's read-only turn, appended to the host branch."""
     guest_branch = str(guest.get("sourceBranch"))
     guest_title = str(guest.get("title") or guest_branch)
-    selected_provider = str(read_llm_config(root).get("provider") or "codex")
     turn_id = new_turn_id()
-    emit_progress(progress, "Preparing guest context")
-    text = (user_message or "").strip()
-    if text:
-        store.append_history(branch_id, "user", text, extra={"turnId": turn_id, "mode": "chat"})
-    prompt = build_guest_agent_prompt(store, branch_id, guest_branch, guest_title)
     emit_progress(progress, f"Guest {guest_title} is responding")
-    result = call_provider_prompt(selected_provider, root, prompt, writable=False, cwd=root, progress=progress)
+    prompt = build_guest_agent_prompt(store, branch_id, guest_branch, guest_title)
+    result = call_provider_prompt(provider, root, prompt, writable=False, cwd=root, progress=progress)
     assistant = str(result.get("assistant") or "").strip() or "(No guest reply returned.)"
-    emit_progress(progress, "Saving guest reply")
     store.append_history(
         branch_id,
         "assistant",
         assistant,
         extra={
-            "provider": selected_provider,
+            "provider": provider,
             "turnId": turn_id,
             "mode": "guest",
             "guest": {"sourceBranch": guest_branch, "title": guest_title},
@@ -7930,13 +7941,40 @@ def run_guest_turn(
     internal_git_commit_turn(
         store,
         kind="guest",
-        actor="user+guest",
+        actor="guest",
         summary=f"Guest {guest_branch} turn on {branch_id}",
         branch_id=branch_id,
         turn_id=turn_id,
-        metadata={"provider": selected_provider, "guest": guest_branch},
+        metadata={"provider": provider, "guest": guest_branch},
     )
-    emit_progress(progress, "Refreshing branch view")
+
+
+def run_chat_turn_with_guests(
+    root: Path,
+    store: ContextStore,
+    branch_id: str,
+    user_message: str,
+    provider: str | None = None,
+    resource_paths: list[str] | None = None,
+    progress: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    """One turn where the host agent replies, then each invited guest speaks in order.
+
+    This makes a branch behave like a lightweight sequence room when guests are
+    present — no new room/directory. When there are no guests it's just a normal
+    chat turn.
+    """
+    payload = run_chat_turn(
+        root, store, branch_id, user_message, provider=provider, resource_paths=resource_paths, progress=progress
+    )
+    guests = store.branch_guests(branch_id)
+    if not guests:
+        return payload
+    selected_provider = str(provider or read_llm_config(root).get("provider") or "codex")
+    if selected_provider == "codex-worker":
+        selected_provider = "codex"
+    for guest in guests:
+        run_one_guest(root, store, branch_id, guest, selected_provider, progress=progress)
     return branch_payload(store, branch_id)
 
 
@@ -12371,7 +12409,8 @@ def make_handler(
 
                     self.send_json(jobs.create("sequence-room", sequence_work, root=root, branch=branch_id, mode="sequence-room"), status=202)
                     return
-                if provider == "codex-worker" or (jobs.prefer_worker and provider in {None, "codex"}):
+                has_guests = bool(store.branch_guests(branch_id))
+                if not has_guests and (provider == "codex-worker" or (jobs.prefer_worker and provider in {None, "codex"})):
                     self.send_json(
                         jobs.create_worker(
                             "chat",
@@ -12390,7 +12429,9 @@ def make_handler(
                     return
 
                 def work(progress: ProgressCallback) -> dict[str, Any]:
-                    return run_chat_turn(
+                    # With guests present, the host replies then each guest speaks in
+                    # order (lightweight sequence room); otherwise it's a normal turn.
+                    return run_chat_turn_with_guests(
                         root,
                         store,
                         branch_id,
@@ -12401,21 +12442,6 @@ def make_handler(
                     )
 
                 self.send_json(jobs.create("chat", work, root=root, branch=branch_id, mode="chat"), status=202)
-                return
-            if parsed.path == "/api/guest/start":
-                branch_id = str(body.get("branch") or "")
-                text = str(body.get("text") or "").strip()
-                if branch_is_sequence_room(store, branch_id):
-                    self.send_json(
-                        {"error": "guest_unsupported", "message": "Guest turns are for normal branches, not sequence rooms."},
-                        status=400,
-                    )
-                    return
-
-                def guest_work(progress: ProgressCallback) -> dict[str, Any]:
-                    return run_guest_turn(root, store, branch_id, text, progress=progress)
-
-                self.send_json(jobs.create("guest", guest_work, root=root, branch=branch_id, mode="guest"), status=202)
                 return
             if parsed.path == "/api/branch/guest/invite":
                 branch_id = str(body.get("branch") or "")
@@ -12438,11 +12464,21 @@ def make_handler(
                 return
             if parsed.path == "/api/branch/guest/remove":
                 branch_id = str(body.get("branch") or "")
+                guest_branch = str(body.get("guest") or "")
                 try:
-                    store.clear_branch_guest(branch_id)
+                    store.remove_branch_guest(branch_id, guest_branch)
                     self.send_json(branch_payload(store, branch_id))
                 except SystemExit as exc:
                     self.send_json({"error": "guest_remove_failed"}, status=int(exc.code or 400))
+                return
+            if parsed.path == "/api/branch/guest/reorder":
+                branch_id = str(body.get("branch") or "")
+                order = [str(item) for item in body.get("order") or [] if str(item)]
+                try:
+                    store.reorder_branch_guests(branch_id, order)
+                    self.send_json(branch_payload(store, branch_id))
+                except SystemExit as exc:
+                    self.send_json({"error": "guest_reorder_failed"}, status=int(exc.code or 400))
                 return
             if parsed.path in {"/api/history-chat/start", "/api/info-chat/start"}:
                 branch_id = str(body.get("branch") or "")

@@ -193,7 +193,6 @@ const els = {
   contextBranchButton: document.querySelector("#contextBranchButton"),
   historyChatButton: document.querySelector("#historyChatButton"),
   teamButton: document.querySelector("#teamButton"),
-  guestButton: document.querySelector("#guestButton"),
   guestChip: document.querySelector("#guestChip"),
   inviteGuestButton: document.querySelector("#inviteGuestButton"),
   guestDialog: document.querySelector("#guestDialog"),
@@ -2985,36 +2984,72 @@ function updateComposerState() {
   els.teamButton.title = claudeProvider
     ? "Run the deterministic team pipeline: plan → prd → exec → verify → fix"
     : "Team pipeline requires the Claude provider";
-  // An invited guest branch — persists until explicitly removed.
-  const guest =
-    !contextMode && !isSequenceRoom && guestActiveInfo(state.payload?.meta?.guest);
+  // Invited guest branches (ordered speaking order); persist until removed.
+  const guests =
+    !contextMode && !isSequenceRoom && Array.isArray(state.payload?.meta?.guests)
+      ? state.payload.meta.guests
+      : [];
   // Invite button: only on normal, non-archived branches.
   if (els.inviteGuestButton) {
     els.inviteGuestButton.hidden = contextMode || isSequenceRoom || archived || !activeKey;
   }
-  // Composer "Guest" button only makes sense once a guest is invited (it makes
-  // the guest speak). Otherwise hide it — invite from the top button first.
-  if (els.guestButton) {
-    els.guestButton.hidden = contextMode || isSequenceRoom || !guest;
-    els.guestButton.disabled = disabled || Boolean(running);
-    els.guestButton.textContent = archived ? "Archived" : running ? "Busy" : "Guest 발언";
-  }
-  if (els.guestChip) {
-    if (guest) {
-      els.guestChip.hidden = false;
-      els.guestChip.innerHTML = `<span class="guest-chip-label">🎙 게스트: ${escapeHtml(
-        guest.title || guest.sourceBranch,
-      )}</span><button type="button" class="guest-chip-remove" id="guestChipRemove" title="이 방에서 게스트 내보내기">✕ 내보내기</button>`;
-      els.guestChip.querySelector("#guestChipRemove")?.addEventListener("click", removeGuest);
-    } else {
-      els.guestChip.hidden = true;
-      els.guestChip.innerHTML = "";
-    }
-  }
+  renderGuestBar(guests, disabled || Boolean(running));
 }
 
-function guestActiveInfo(guest) {
-  return guest && guest.active && guest.sourceBranch ? guest : null;
+// The ordered guests bar: host speaks first on Send, then these guests in order.
+function renderGuestBar(guests, locked) {
+  if (!els.guestChip) return;
+  if (!guests.length) {
+    els.guestChip.hidden = true;
+    els.guestChip.innerHTML = "";
+    return;
+  }
+  els.guestChip.hidden = false;
+  const rows = guests
+    .map((g, i) => {
+      const label = escapeHtml(g.title || g.sourceBranch);
+      const up = i > 0 ? `<button class="guest-move" data-guest-up="${escapeHtml(g.sourceBranch)}" type="button" title="위로">↑</button>` : "";
+      const down = i < guests.length - 1 ? `<button class="guest-move" data-guest-down="${escapeHtml(g.sourceBranch)}" type="button" title="아래로">↓</button>` : "";
+      return `<span class="guest-item"><span class="guest-order">${i + 2}</span>${label}${up}${down}<button class="guest-chip-remove" data-guest-remove="${escapeHtml(g.sourceBranch)}" type="button" title="내보내기">✕</button></span>`;
+    })
+    .join("");
+  els.guestChip.innerHTML =
+    `<span class="guest-chip-label">🎙 발언 순서</span><span class="guest-item guest-host"><span class="guest-order">1</span>호스트(나)</span>${rows}` +
+    `<span class="guest-hint">Send 하면 이 순서로 자동 진행</span>`;
+  if (locked) return;
+  const ids = guests.map((g) => g.sourceBranch);
+  els.guestChip.querySelectorAll("[data-guest-remove]").forEach((b) =>
+    b.addEventListener("click", () => removeGuest(b.dataset.guestRemove)),
+  );
+  els.guestChip.querySelectorAll("[data-guest-up]").forEach((b) =>
+    b.addEventListener("click", () => reorderGuests(moveInArray(ids, b.dataset.guestUp, -1))),
+  );
+  els.guestChip.querySelectorAll("[data-guest-down]").forEach((b) =>
+    b.addEventListener("click", () => reorderGuests(moveInArray(ids, b.dataset.guestDown, 1))),
+  );
+}
+
+function moveInArray(arr, id, delta) {
+  const list = [...arr];
+  const i = list.indexOf(id);
+  const j = i + delta;
+  if (i < 0 || j < 0 || j >= list.length) return list;
+  [list[i], list[j]] = [list[j], list[i]];
+  return list;
+}
+
+async function reorderGuests(order) {
+  const branch = state.activeBranch;
+  if (!branch) return;
+  try {
+    const payload = await api("/api/branch/guest/reorder", {
+      method: "POST",
+      body: JSON.stringify({ branch, order }),
+    });
+    if (state.activeBranch === branch) renderBranch(payload);
+  } catch (error) {
+    window.alert(`순서 변경 실패: ${error.message}`);
+  }
 }
 
 function openGuestPicker() {
@@ -3022,8 +3057,9 @@ function openGuestPicker() {
   const host = state.activeBranch;
   if (!dialog || !host) return;
   if (els.guestDialogHost) els.guestDialogHost.textContent = host;
-  const current = state.payload?.meta?.guest?.sourceBranch || "";
-  const candidates = (state.branches || []).filter((item) => item.id !== host);
+  const invited = new Set((state.payload?.meta?.guests || []).map((g) => g.sourceBranch));
+  const current = "";
+  const candidates = (state.branches || []).filter((item) => item.id !== host && !invited.has(item.id));
   els.guestDialogList.innerHTML = candidates.length
     ? candidates
         .map(
@@ -3055,13 +3091,13 @@ async function inviteGuest(guestBranch) {
   }
 }
 
-async function removeGuest() {
+async function removeGuest(guestBranch) {
   const branch = state.activeBranch;
   if (!branch) return;
   try {
     const payload = await api("/api/branch/guest/remove", {
       method: "POST",
-      body: JSON.stringify({ branch }),
+      body: JSON.stringify({ branch, guest: guestBranch || "" }),
     });
     if (state.activeBranch === branch) renderBranch(payload);
   } catch (error) {
@@ -5136,9 +5172,7 @@ async function sendComposerMessage({ mode, runningAction = "stop" }) {
   }
   const text = els.messageInput.value.trim();
   const stagedFiles = isContextChat ? [] : stagedBranchResources(branch);
-  const isGuest = mode === "guest";
-  // Guest may run with no typed text (it just gives feedback on the conversation).
-  if (!text && !stagedFiles.length && !isGuest) return;
+  if (!text && !stagedFiles.length) return;
   hideChatError();
   const isChat = mode === "chat";
   const isResearch = mode === "research";
@@ -5152,7 +5186,7 @@ async function sendComposerMessage({ mode, runningAction = "stop" }) {
     );
     return;
   }
-  const requestedMode = isContextChat ? "context-chat" : isResearch ? "research" : isTeam ? "team" : isGuest ? "guest" : isInfoChat ? "info-chat" : "chat";
+  const requestedMode = isContextChat ? "context-chat" : isResearch ? "research" : isTeam ? "team" : isInfoChat ? "info-chat" : "chat";
   // Ask for desktop-notification permission on this user gesture so a finished
   // background job can pop a native notification (best-effort; tab badge works regardless).
   ensureNotificationPermission();
@@ -5160,11 +5194,7 @@ async function sendComposerMessage({ mode, runningAction = "stop" }) {
   markBranchActivity(branch);
   updateComposerState();
   renderBranches();
-  // A typed message is always a normal user message (even when it's the guest
-  // that will answer it), so show the optimistic bubble as "chat".
-  const pendingMessageId = text
-    ? appendPendingUserMessage({ branch, text, mode: isGuest ? "chat" : requestedMode })
-    : "";
+  const pendingMessageId = text ? appendPendingUserMessage({ branch, text, mode: requestedMode }) : "";
   let turnResourcePaths = [];
   try {
     if (stagedFiles.length) {
@@ -5214,15 +5244,6 @@ async function sendComposerMessage({ mode, runningAction = "stop" }) {
         "/api/team/start",
         { branch, text },
         { branch, mode: "team", title: "Team pipeline running" },
-      );
-      clearDraft(branch);
-      return;
-    }
-    if (isGuest) {
-      await startTrackedJob(
-        "/api/guest/start",
-        { branch, text },
-        { branch, mode: "guest", title: "게스트 응답 중" },
       );
       clearDraft(branch);
       return;
@@ -5435,10 +5456,6 @@ els.historyChatButton.addEventListener("click", async () => {
 
 els.teamButton.addEventListener("click", async () => {
   await sendComposerMessage({ mode: "team", runningAction: "stop" });
-});
-
-els.guestButton?.addEventListener("click", async () => {
-  await sendComposerMessage({ mode: "guest", runningAction: "stop" });
 });
 
 els.inviteGuestButton?.addEventListener("click", () => openGuestPicker());
