@@ -2909,6 +2909,23 @@ button.section-toggle[aria-expanded="false"] .section-toggle-caret {
   padding: 6px 12px;
   max-height: 320px;
   overflow-y: auto;
+  overflow-x: hidden;
+}
+
+/* Guest-invite dialog: wider, and rows stay on one line so the layout doesn't
+   shift left/right as you hover different branches. */
+#guestDialog {
+  width: min(620px, 94vw);
+}
+
+#guestDialog .folder-dialog-list {
+  max-height: min(60vh, 460px);
+}
+
+#guestDialog .folder-pick {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .folder-pick {
