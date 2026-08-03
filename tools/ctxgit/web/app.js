@@ -2915,6 +2915,29 @@ async function interjectSequenceRoom(branch, job) {
   }
 }
 
+// Live-refresh the branch as each guest-room turn (host/guest) is saved, so a
+// multi-turn discussion shows up incrementally instead of only at the end.
+async function refreshGuestRoomProgress(job) {
+  if (!job?.id || String(job.mode || job.kind || "") !== "chat") return;
+  const saved = (job.events || []).reduce((highest, event) => {
+    const match = String(event?.message || "").match(/^Guest room turn (\d+) saved$/);
+    return match ? Math.max(highest, Number(match[1])) : highest;
+  }, 0);
+  if (!saved || saved <= (state.sequenceRenderedReplies[job.id] || 0)) return;
+  state.sequenceRenderedReplies[job.id] = saved;
+  if (activeChatKey() !== job.branch) return;
+  try {
+    const payload = await api(`/api/branch?id=${encodeURIComponent(job.branch)}`);
+    if (activeChatKey() === job.branch) {
+      renderBranch(payload);
+      updateComposerState();
+      scrollChatToBottom();
+    }
+  } catch {
+    // Best-effort live refresh; the final render at job completion is authoritative.
+  }
+}
+
 async function refreshSequenceRoomProgress(job) {
   if (!job?.id || !String(job.mode || job.kind || "").startsWith("sequence-room")) return;
   const savedReplies = (job.events || []).reduce((highest, event) => {
@@ -3312,6 +3335,7 @@ async function monitorTrackedJob(jobId) {
       renderEventPanel(remembered);
       updateComposerState();
       await refreshSequenceRoomProgress(remembered);
+      await refreshGuestRoomProgress(remembered);
     }
     if (remembered.status === "done") {
       // Do not auto-clear the "done" indicator just because this branch is open;

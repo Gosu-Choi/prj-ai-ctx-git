@@ -8036,6 +8036,7 @@ def run_chat_turn_with_guests(
     order = store.branch_guest_order(branch_id)
     guests_by_id = {g["sourceBranch"]: g for g in guests}
     rounds = store.branch_guest_rounds(branch_id)
+    saved = 0
     for round_index in range(rounds):
         for token in order:
             if token == "host":
@@ -8045,6 +8046,11 @@ def run_chat_turn_with_guests(
                 )
             elif token in guests_by_id:
                 run_one_guest(root, store, branch_id, guests_by_id[token], selected_provider, progress=progress)
+            else:
+                continue
+            saved += 1
+            # Marker the UI watches to refresh the branch live after each turn.
+            emit_progress(progress, f"Guest room turn {saved} saved")
     return branch_payload(store, branch_id)
 
 
