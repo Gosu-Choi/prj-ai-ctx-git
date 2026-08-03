@@ -2237,6 +2237,31 @@ class ContextStore:
         dump_json(paths.meta, meta)
         self.write_index()
 
+    def set_branch_guest(self, branch_id: str, provider: str) -> None:
+        """Mark a branch as having an active guest (persists until removed)."""
+        paths = self.branch_paths(branch_id)
+        if not paths.root.exists():
+            return
+        meta = load_json(paths.meta)
+        existing = meta.get("guest") if isinstance(meta.get("guest"), dict) else {}
+        meta["guest"] = {
+            "active": True,
+            "provider": provider,
+            "invitedAt": existing.get("invitedAt") or utc_now(),
+        }
+        dump_json(paths.meta, meta)
+
+    def clear_branch_guest(self, branch_id: str) -> None:
+        """Remove a branch's active guest (its past guest messages stay in history)."""
+        self.require_initialized()
+        paths = self.branch_paths(branch_id)
+        if not paths.root.exists():
+            die(f"branch does not exist: {branch_id}")
+        meta = load_json(paths.meta)
+        meta.pop("guest", None)
+        meta["updatedAt"] = utc_now()
+        dump_json(paths.meta, meta)
+
     def remove_branch(self, branch_id: str) -> None:
         self.require_initialized()
         paths = self.branch_paths(branch_id)
@@ -7778,6 +7803,67 @@ def call_provider_prompt(
     raise RuntimeError(f"Unsupported chat provider: {provider}")
 
 
+GUEST_FEEDBACK_INSTRUCTION = (
+    "You've been invited into this conversation as a guest for a brief, candid second "
+    "opinion. Don't restate what was already said — add your own perspective, flag anything "
+    "missed or worth reconsidering, or offer a different angle. Keep it short."
+)
+
+
+def run_guest_turn(
+    root: Path,
+    store: ContextStore,
+    branch_id: str,
+    user_message: str = "",
+    progress: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    """A lightweight one-off 'guest' turn in the current branch.
+
+    Reuses the branch context but runs read-only (no file edits, no artifacts) and
+    labels the reply as a guest — so you can pull a second voice in for quick mutual
+    feedback without creating a whole sequence room. No new persona/prompt: the guest
+    just sees the conversation and responds (or gives feedback when no text is typed).
+    """
+    selected_provider = str(read_llm_config(root).get("provider") or "codex")
+    turn_id = new_turn_id()
+    emit_progress(progress, "Preparing branch context")
+    store.auto_ingest_branch_sources(branch_id)
+    # Mark the guest as active on this branch — it persists until explicitly removed.
+    store.set_branch_guest(branch_id, selected_provider)
+    text = (user_message or "").strip()
+    if text:
+        store.append_history(branch_id, "user", text, extra={"turnId": turn_id, "mode": "chat"})
+    prompt = build_chat_prompt(store, branch_id, text or GUEST_FEEDBACK_INSTRUCTION)
+    emit_progress(progress, "Guest is thinking")
+    result = call_provider_prompt(selected_provider, root, prompt, writable=False, cwd=root, progress=progress)
+    assistant = str(result.get("assistant") or "").strip() or "(No guest reply returned.)"
+    emit_progress(progress, "Saving guest reply")
+    store.append_history(
+        branch_id,
+        "assistant",
+        assistant,
+        extra={
+            "provider": selected_provider,
+            "turnId": turn_id,
+            "mode": "guest",
+            "guest": True,
+            "artifacts": [],
+            "approvalRequests": [],
+        },
+    )
+    internal_git_commit_turn(
+        store,
+        kind="guest",
+        actor="user+guest",
+        summary=f"Guest turn on {branch_id}",
+        branch_id=branch_id,
+        turn_id=turn_id,
+        metadata={"provider": selected_provider, "mode": "guest"},
+    )
+    emit_progress(progress, "Refreshing branch view")
+    return branch_payload(store, branch_id)
+
+
 def run_chat_turn(
     root: Path,
     store: ContextStore,
@@ -12239,6 +12325,29 @@ def make_handler(
                     )
 
                 self.send_json(jobs.create("chat", work, root=root, branch=branch_id, mode="chat"), status=202)
+                return
+            if parsed.path == "/api/guest/start":
+                branch_id = str(body.get("branch") or "")
+                text = str(body.get("text") or "").strip()
+                if branch_is_sequence_room(store, branch_id):
+                    self.send_json(
+                        {"error": "guest_unsupported", "message": "Guest turns are for normal branches, not sequence rooms."},
+                        status=400,
+                    )
+                    return
+
+                def guest_work(progress: ProgressCallback) -> dict[str, Any]:
+                    return run_guest_turn(root, store, branch_id, text, progress=progress)
+
+                self.send_json(jobs.create("guest", guest_work, root=root, branch=branch_id, mode="guest"), status=202)
+                return
+            if parsed.path == "/api/branch/guest/remove":
+                branch_id = str(body.get("branch") or "")
+                try:
+                    store.clear_branch_guest(branch_id)
+                    self.send_json(branch_payload(store, branch_id))
+                except SystemExit as exc:
+                    self.send_json({"error": "guest_remove_failed"}, status=int(exc.code or 400))
                 return
             if parsed.path in {"/api/history-chat/start", "/api/info-chat/start"}:
                 branch_id = str(body.get("branch") or "")

@@ -193,6 +193,8 @@ const els = {
   contextBranchButton: document.querySelector("#contextBranchButton"),
   historyChatButton: document.querySelector("#historyChatButton"),
   teamButton: document.querySelector("#teamButton"),
+  guestButton: document.querySelector("#guestButton"),
+  guestChip: document.querySelector("#guestChip"),
   refreshButton: document.querySelector("#refreshButton"),
   telegramNotifyInput: document.querySelector("#telegramNotifyInput"),
   telegramNotifyStatus: document.querySelector("#telegramNotifyStatus"),
@@ -2979,6 +2981,39 @@ function updateComposerState() {
   els.teamButton.title = claudeProvider
     ? "Run the deterministic team pipeline: plan → prd → exec → verify → fix"
     : "Team pipeline requires the Claude provider";
+  if (els.guestButton) {
+    els.guestButton.hidden = contextMode || isSequenceRoom;
+    els.guestButton.disabled = disabled || Boolean(running);
+    els.guestButton.textContent = archived ? "Archived" : running ? "Busy" : "Guest";
+  }
+  // Persistent guest chip: shown until the guest is explicitly removed.
+  const guest = !contextMode && !isSequenceRoom ? state.payload?.meta?.guest : null;
+  if (els.guestChip) {
+    if (guest && guest.active) {
+      els.guestChip.hidden = false;
+      els.guestChip.innerHTML = `<span class="guest-chip-label">🎙 게스트 참여 중${
+        guest.provider ? ` · ${escapeHtml(guest.provider)}` : ""
+      }</span><button type="button" class="guest-chip-remove" id="guestChipRemove" title="이 브랜치에서 게스트 내보내기">✕ 내보내기</button>`;
+      els.guestChip.querySelector("#guestChipRemove")?.addEventListener("click", removeGuest);
+    } else {
+      els.guestChip.hidden = true;
+      els.guestChip.innerHTML = "";
+    }
+  }
+}
+
+async function removeGuest() {
+  const branch = state.activeBranch;
+  if (!branch) return;
+  try {
+    const payload = await api("/api/branch/guest/remove", {
+      method: "POST",
+      body: JSON.stringify({ branch }),
+    });
+    if (state.activeBranch === branch) renderBranch(payload);
+  } catch (error) {
+    window.alert(`게스트 내보내기 실패: ${error.message}`);
+  }
 }
 
 function renderActiveBranchJob() {
@@ -3270,9 +3305,17 @@ function renderBranch(payload) {
     payload.history
       .map(
         (message, index) => `
-          <article class="message message-${escapeHtml(message.role)}${index === failedUserIndex ? " message-failed" : ""}" data-history-message="${index}">
+          <article class="message message-${escapeHtml(message.role)}${message.mode === "guest" ? " message-guest" : ""}${index === failedUserIndex ? " message-failed" : ""}" data-history-message="${index}">
             <div class="message-header">
-              <span class="message-role">${escapeHtml(message.sequenceSpeaker ? `Agent ${message.sequenceSpeaker.order} · ${message.sequenceSpeaker.title || message.sequenceSpeaker.sourceBranch}` : message.role)}</span>
+              <span class="message-role">${
+                message.mode === "guest"
+                  ? `🎙 ${escapeHtml("Guest")}${message.provider ? ` · ${escapeHtml(message.provider)}` : ""}`
+                  : escapeHtml(
+                      message.sequenceSpeaker
+                        ? `Agent ${message.sequenceSpeaker.order} · ${message.sequenceSpeaker.title || message.sequenceSpeaker.sourceBranch}`
+                        : message.role,
+                    )
+              }</span>
                 <span class="message-meta-actions">
                   <span class="message-number">${index + 1}</span>
                   <span>${escapeHtml(message.createdAt)}</span>
@@ -5040,7 +5083,9 @@ async function sendComposerMessage({ mode, runningAction = "stop" }) {
   }
   const text = els.messageInput.value.trim();
   const stagedFiles = isContextChat ? [] : stagedBranchResources(branch);
-  if (!text && !stagedFiles.length) return;
+  const isGuest = mode === "guest";
+  // Guest may run with no typed text (it just gives feedback on the conversation).
+  if (!text && !stagedFiles.length && !isGuest) return;
   hideChatError();
   const isChat = mode === "chat";
   const isResearch = mode === "research";
@@ -5054,7 +5099,7 @@ async function sendComposerMessage({ mode, runningAction = "stop" }) {
     );
     return;
   }
-  const requestedMode = isContextChat ? "context-chat" : isResearch ? "research" : isTeam ? "team" : isInfoChat ? "info-chat" : "chat";
+  const requestedMode = isContextChat ? "context-chat" : isResearch ? "research" : isTeam ? "team" : isGuest ? "guest" : isInfoChat ? "info-chat" : "chat";
   // Ask for desktop-notification permission on this user gesture so a finished
   // background job can pop a native notification (best-effort; tab badge works regardless).
   ensureNotificationPermission();
@@ -5062,7 +5107,11 @@ async function sendComposerMessage({ mode, runningAction = "stop" }) {
   markBranchActivity(branch);
   updateComposerState();
   renderBranches();
-  const pendingMessageId = text ? appendPendingUserMessage({ branch, text, mode: requestedMode }) : "";
+  // A typed message is always a normal user message (even when it's the guest
+  // that will answer it), so show the optimistic bubble as "chat".
+  const pendingMessageId = text
+    ? appendPendingUserMessage({ branch, text, mode: isGuest ? "chat" : requestedMode })
+    : "";
   let turnResourcePaths = [];
   try {
     if (stagedFiles.length) {
@@ -5112,6 +5161,15 @@ async function sendComposerMessage({ mode, runningAction = "stop" }) {
         "/api/team/start",
         { branch, text },
         { branch, mode: "team", title: "Team pipeline running" },
+      );
+      clearDraft(branch);
+      return;
+    }
+    if (isGuest) {
+      await startTrackedJob(
+        "/api/guest/start",
+        { branch, text },
+        { branch, mode: "guest", title: "게스트 응답 중" },
       );
       clearDraft(branch);
       return;
@@ -5324,6 +5382,10 @@ els.historyChatButton.addEventListener("click", async () => {
 
 els.teamButton.addEventListener("click", async () => {
   await sendComposerMessage({ mode: "team", runningAction: "stop" });
+});
+
+els.guestButton?.addEventListener("click", async () => {
+  await sendComposerMessage({ mode: "guest", runningAction: "stop" });
 });
 
 function setBranchDirButton(branchId) {
