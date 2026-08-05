@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import unittest
@@ -554,6 +555,106 @@ class CtxgitTest(unittest.TestCase):
             self.assertTrue(auth["authenticated"])
             self.assertEqual(project_status, 200)
             self.assertEqual(project["path"], str(root.resolve()))
+
+    def test_die_errors_return_a_real_http_status_and_message(self) -> None:
+        # die() raises SystemExit with a *process* exit code of 1. Handlers used to
+        # pass that straight through as the HTTP status, emitting "HTTP/1.0 1" and
+        # dropping the connection, so every such error looked like a network
+        # failure in the browser instead of an error message.
+        self.assertEqual(ctxgit.http_status_from_exit(SystemExit(1), 400), 400)
+        self.assertEqual(ctxgit.http_status_from_exit(SystemExit(404), 400), 404)
+        self.assertEqual(ctxgit.http_status_from_exit(SystemExit(None), 409), 409)
+        self.assertEqual(ctxgit.http_status_from_exit(SystemExit("boom"), 400), 400)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ctxgit.ContextStore(root).init()
+            handler = ctxgit.make_handler(ctxgit.ProjectState(root), auth_required=False)
+            with ctxgit.ReusableThreadingHTTPServer(("127.0.0.1", 0), handler) as server:
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                base_url = f"http://127.0.0.1:{server.server_port}"
+                try:
+                    with self.assertRaises(urllib.error.HTTPError) as caught:
+                        urllib.request.urlopen(f"{base_url}/api/branch?id=missing", timeout=5)
+                    status = caught.exception.code
+                    payload = json.loads(caught.exception.read().decode("utf-8"))
+                finally:
+                    server.shutdown()
+                    thread.join(timeout=5)
+
+            self.assertEqual(status, 404)
+            self.assertEqual(payload["error"], "branch_not_found")
+            # die()'s message must survive to the client, not just stderr.
+            self.assertIn("missing", payload["message"])
+
+    def test_knowledging_api_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.init()
+            store.create_branch("AItrust")
+            project_state = ctxgit.ProjectState(root)
+            handler = ctxgit.make_handler(project_state, auth_required=False)
+            captured: dict[str, str] = {}
+
+            def fake_provider(provider, provider_root, prompt, **kwargs):
+                captured["prompt"] = prompt
+                return {"entry": "## Trust Rubric\n\nSTORED_FACT", "summary": "저장 완료"}
+
+            original_provider = ctxgit.call_provider_prompt
+            ctxgit.call_provider_prompt = fake_provider
+
+            def post(base_url, path, payload):
+                request = urllib.request.Request(
+                    f"{base_url}{path}",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    return json.loads(response.read().decode("utf-8"))
+
+            try:
+                with ctxgit.ReusableThreadingHTTPServer(("127.0.0.1", 0), handler) as server:
+                    thread = threading.Thread(target=server.serve_forever, daemon=True)
+                    thread.start()
+                    base_url = f"http://127.0.0.1:{server.server_port}"
+                    try:
+                        created = post(base_url, "/api/knowledge/create", {"title": "Trust Rubric"})
+                        doc_id = created["document"]["id"]
+                        guiding = post(
+                            base_url, "/api/branch/guiding", {"branch": "AItrust", "docs": [doc_id]}
+                        )
+                        appended = post(
+                            base_url,
+                            "/api/knowledge/append",
+                            {
+                                "branch": "AItrust",
+                                "doc": doc_id,
+                                "instruction": "이 기준을 계속 기억해",
+                                "source": "SOURCE_MESSAGE_TEXT",
+                            },
+                        )
+                        with urllib.request.urlopen(
+                            f"{base_url}/api/knowledge?branch=AItrust", timeout=5
+                        ) as response:
+                            listed = json.loads(response.read().decode("utf-8"))
+                    finally:
+                        server.shutdown()
+                        thread.join(timeout=5)
+            finally:
+                ctxgit.call_provider_prompt = original_provider
+
+            self.assertEqual(guiding["guiding"], [doc_id])
+            self.assertEqual(listed["guiding"], [doc_id])
+            self.assertIn("SOURCE_MESSAGE_TEXT", captured["prompt"])
+            self.assertIn("이 기준을 계속 기억해", captured["prompt"])
+            self.assertEqual(appended["summary"], "저장 완료")
+            stored = (root / "contexts/knowledge" / f"{doc_id}.md").read_text()
+            self.assertIn("STORED_FACT", stored)
+            # The stored entry now reaches the branch prompt without any tool call.
+            self.assertIn("STORED_FACT", ctxgit.build_chat_prompt(store, "AItrust", "Continue."))
 
     def test_choose_directory_api_handles_non_ascii_git_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2508,6 +2609,89 @@ class CtxgitTest(unittest.TestCase):
             self.assertIn("BRANCH_CONTEXT_FACT", prompt)
             self.assertIn("Live web search", prompt)
             self.assertIn("Do not edit files", prompt)
+
+    def test_guiding_knowledge_is_injected_only_into_branches_that_enabled_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.init()
+            store.create_branch("AItrust")
+            store.create_branch("AIdiscipline")
+            document = store.create_knowledge_document("Trust Rubric")
+            store.append_knowledge_entry(document["id"], "## Rubric\n\nGUIDING_KNOWLEDGE_FACT")
+
+            store.set_branch_guiding("AItrust", [document["id"]])
+
+            guided_chat = ctxgit.build_chat_prompt(store, "AItrust", "Continue.")
+            guided_info = ctxgit.build_history_chat_prompt(store, "AItrust", "Continue.")
+            other_chat = ctxgit.build_chat_prompt(store, "AIdiscipline", "Continue.")
+
+            self.assertIn("GUIDING_KNOWLEDGE_FACT", guided_chat)
+            self.assertIn("<guiding_knowledge>", guided_chat)
+            self.assertIn("GUIDING_KNOWLEDGE_FACT", guided_info)
+            self.assertNotIn("GUIDING_KNOWLEDGE_FACT", other_chat)
+            # A branch with nothing switched on carries no empty guiding block.
+            self.assertNotIn("<guiding_knowledge>", other_chat)
+            self.assertEqual(store.branch_guiding_ids("AItrust"), [document["id"]])
+
+    def test_guiding_selection_survives_and_drops_deleted_documents(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.init()
+            store.create_branch("AItrust")
+            kept = store.create_knowledge_document("Kept")
+            removed = store.create_knowledge_document("Removed")
+            store.set_branch_guiding("AItrust", [kept["id"], removed["id"]])
+
+            (root / "contexts/knowledge" / f"{removed['id']}.md").unlink()
+
+            self.assertEqual(store.branch_guiding_ids("AItrust"), [kept["id"]])
+            with self.assertRaises(SystemExit):
+                store.set_branch_guiding("AItrust", ["does-not-exist"])
+            store.set_branch_guiding("AItrust", [])
+            meta = json.loads((root / "contexts/branches/AItrust/branch.json").read_text())
+            self.assertNotIn("guiding", meta)
+
+    def test_knowledge_append_is_append_only_and_lists_documents(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.init()
+            document = store.create_knowledge_document("Metric Definitions")
+
+            store.append_knowledge_entry(document["id"], "## First\n\nFIRST_ENTRY")
+            updated = store.append_knowledge_entry(document["id"], "## Second\n\nSECOND_ENTRY")
+
+            text = (root / "contexts/knowledge" / f"{document['id']}.md").read_text()
+            self.assertIn("# Metric Definitions", text)
+            self.assertLess(text.index("FIRST_ENTRY"), text.index("SECOND_ENTRY"))
+            self.assertEqual(updated["id"], document["id"])
+            listed = [item["id"] for item in store.list_knowledge_documents()]
+            self.assertIn(document["id"], listed)
+            # The folder README documents the feature and must never be injected.
+            self.assertNotIn("README", listed)
+            with self.assertRaises(SystemExit):
+                store.create_knowledge_document("Metric Definitions")
+
+    def test_knowledge_documents_keep_non_ascii_titles_distinct(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.init()
+
+            first = store.create_knowledge_document("리서치 방법론")
+            second = store.create_knowledge_document("지표 정의")
+
+            # The slug cannot carry the Korean title, but the documents must not
+            # collide and the title must survive in the file itself.
+            self.assertNotEqual(first["id"], second["id"])
+            self.assertEqual(first["title"], "리서치 방법론")
+            self.assertEqual(second["title"], "지표 정의")
+            self.assertEqual({item["title"] for item in store.list_knowledge_documents()},
+                             {"리서치 방법론", "지표 정의"})
+            with self.assertRaises(SystemExit):
+                store.create_knowledge_document("리서치 방법론")
 
     def test_prompts_include_branch_resources_and_current_turn_attachments(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

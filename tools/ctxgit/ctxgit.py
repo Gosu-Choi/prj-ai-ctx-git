@@ -133,6 +133,13 @@ PROJECT_CONTEXT_FILES = (
     ("User Preferences", "USER.md"),
     ("Project Memory", "MEMORY.md"),
 )
+# Guiding knowledge: project-global markdown documents that a branch can switch
+# on so they are injected into every prompt for that branch, the way AGENTS.md is
+# always injected. Selection is per branch (`guiding` in branch.json); the
+# documents themselves are shared across branches.
+KNOWLEDGE_DIR_NAME = "knowledge"
+KNOWLEDGE_INDEX_FILE = "README.md"
+DEFAULT_GUIDING_BUDGET_CHARS = 24000
 WORKSPACE_IMPORT_DIR_NAMES = (
     "workspace",
     "openclaw-workspace",
@@ -176,6 +183,19 @@ class ChatTimeoutError(RuntimeError):
     pass
 
 
+def codex_timeout_error(what: str, timeout_seconds: int) -> ChatTimeoutError:
+    """Every Codex timeout should tell the user which knob to turn.
+
+    Kept in one place because the Codex call sites are near-copies of each other
+    and the actionable half of this message previously existed in only one.
+    """
+    return ChatTimeoutError(
+        f"{what} timed out after {timeout_seconds} seconds. "
+        "Narrow the request, or increase `llm.codex.timeoutSeconds` in "
+        "`.ctxgit/config.json`."
+    )
+
+
 class JobCancelledError(RuntimeError):
     pass
 
@@ -205,9 +225,39 @@ def parse_utc(value: Any) -> datetime | None:
         return None
 
 
+class CtxgitExit(SystemExit):
+    """SystemExit from die() that also carries the human-readable message.
+
+    `code` stays a *process* exit status so CLI behavior is unchanged. It is not
+    an HTTP status: web handlers must use http_status_from_exit() instead of
+    reading `exc.code`, or they emit an invalid status line and the browser sees
+    a dropped connection rather than the error.
+    """
+
+    def __init__(self, message: str, code: int = 1) -> None:
+        super().__init__(code)
+        self.message = message
+
+
 def die(message: str, code: int = 1) -> None:
     print(f"ctxgit: {message}", file=sys.stderr)
-    raise SystemExit(code)
+    raise CtxgitExit(message, code)
+
+
+def http_status_from_exit(exc: BaseException, default: int) -> int:
+    code = getattr(exc, "code", None)
+    if isinstance(code, int) and not isinstance(code, bool) and 100 <= code <= 599:
+        return code
+    return default
+
+
+def die_payload(error: str, exc: BaseException) -> dict[str, str]:
+    """Build an API error body that keeps die()'s message instead of dropping it."""
+    payload = {"error": error}
+    message = str(getattr(exc, "message", "") or "")
+    if message:
+        payload["message"] = message
+    return payload
 
 
 def validate_id(value: str, label: str = "id") -> str:
@@ -1470,6 +1520,7 @@ class ContextStore:
         self.views = self.contexts / "views"
         self.globalized = self.contexts / "globalized"
         self.agents = self.contexts / "agents"
+        self.knowledge = self.contexts / KNOWLEDGE_DIR_NAME
         self.config_dir = self.root / ".ctxgit"
         self.config = self.config_dir / "config.json"
 
@@ -1511,6 +1562,7 @@ class ContextStore:
         self.archived_branches.mkdir(parents=True, exist_ok=True)
         self.views.mkdir(parents=True, exist_ok=True)
         self.globalized.mkdir(parents=True, exist_ok=True)
+        self.knowledge.mkdir(parents=True, exist_ok=True)
         (self.contexts / "turns").mkdir(parents=True, exist_ok=True)
         if not self.context_history_path().exists():
             write_text(self.context_history_path(), "")
@@ -1547,6 +1599,7 @@ class ContextStore:
                 },
             )
         self.ensure_agent_files()
+        self.ensure_knowledge_index()
         if not (self.contexts / "README.md").exists():
             write_text(
                 self.contexts / "README.md",
@@ -1557,6 +1610,7 @@ class ContextStore:
                     This directory is managed by `ctxgit`.
 
                     - `AGENTS.md`, `USER.md`, `MEMORY.md`, and `agents/` contain project-level AI context.
+                    - `knowledge/` contains guiding knowledge documents branches can switch on.
                     - `imports/` contains copied workspace imports used by AI context.
                     - `branches/` contains separate conversation or research contexts.
                     - `branches/archived/` contains archived branch directories removed from the active branch list.
@@ -1625,6 +1679,170 @@ class ContextStore:
             if not path.exists():
                 legacy = self.config_dir / rel
                 write_text(path, read_text(legacy).strip() + "\n" if legacy.exists() else text)
+
+    # --- Guiding knowledge -------------------------------------------------
+    #
+    # Knowledge documents are shared project-wide. A branch turns individual
+    # documents on through `guiding` in its branch.json, and every prompt built
+    # for that branch then carries those documents verbatim. Nothing is stored
+    # automatically: entries are appended only when the user runs Knowledging.
+
+    def ensure_knowledge_index(self) -> None:
+        self.knowledge.mkdir(parents=True, exist_ok=True)
+        index_path = self.knowledge / KNOWLEDGE_INDEX_FILE
+        if index_path.exists():
+            return
+        write_text(
+            index_path,
+            textwrap.dedent(
+                """\
+                # Guiding Knowledge
+
+                Each `*.md` file beside this one is a guiding knowledge document.
+
+                - A branch switches documents on from the `Guiding` button in the topbar.
+                - Every document a branch has switched on is injected into that branch's
+                  prompts verbatim, like `AGENTS.md`, so the agent starts already knowing it.
+                - Entries are appended through `Knowledging` on a chat message. Nothing is
+                  written here automatically.
+                - This `README.md` is documentation only and is never injected.
+                """
+            ),
+        )
+
+    def knowledge_path(self, doc_id: str) -> Path:
+        return self.knowledge / f"{validate_id(doc_id, 'knowledge document')}.md"
+
+    def knowledge_document(self, doc_id: str) -> dict[str, Any]:
+        path = self.knowledge_path(doc_id)
+        if not path.exists():
+            die(f"knowledge document does not exist: {doc_id}")
+        return self.describe_knowledge_document(path)
+
+    def describe_knowledge_document(self, path: Path) -> dict[str, Any]:
+        text = read_text(path)
+        title = path.stem
+        for line in text.splitlines():
+            if line.startswith("# "):
+                title = line[2:].strip() or path.stem
+                break
+        return {
+            "id": path.stem,
+            "title": title,
+            "path": relpath(self.root, path),
+            "chars": len(text),
+            "entries": text.count("\n## "),
+            "updatedAt": datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"),
+        }
+
+    def list_knowledge_documents(self) -> list[dict[str, Any]]:
+        if not self.knowledge.exists():
+            return []
+        documents = []
+        for path in sorted(self.knowledge.glob("*.md")):
+            if path.name == KNOWLEDGE_INDEX_FILE:
+                continue
+            documents.append(self.describe_knowledge_document(path))
+        return documents
+
+    def unique_knowledge_id(self, title: str) -> str:
+        """Derive a free file stem from a document title.
+
+        Titles written in a script the slug cannot represent (Korean, for one)
+        collapse to an empty slug, so fall back to a generic stem and number it
+        instead of letting every such document fight over the same file. The
+        readable name lives in the document's `# ` heading either way.
+        """
+        base = slugify(title, "") or "knowledge"
+        candidate = base
+        suffix = 2
+        while (self.knowledge / f"{candidate}.md").exists():
+            candidate = f"{base}-{suffix}"
+            suffix += 1
+        return candidate
+
+    def create_knowledge_document(self, title: str, doc_id: str | None = None) -> dict[str, Any]:
+        self.require_initialized()
+        self.ensure_knowledge_index()
+        title = (title or "").strip()
+        if not title and not doc_id:
+            die("knowledge document title is required")
+        if doc_id:
+            safe_id = validate_id(doc_id, "knowledge document")
+        else:
+            # Two documents showing the same name in the picker would be
+            # indistinguishable, so reject the duplicate title outright.
+            if any(item["title"] == title for item in self.list_knowledge_documents()):
+                die(f"knowledge document already exists: {title}")
+            safe_id = self.unique_knowledge_id(title)
+        path = self.knowledge / f"{safe_id}.md"
+        if path.exists():
+            die(f"knowledge document already exists: {safe_id}")
+        write_text(
+            path,
+            f"# {title or safe_id}\n\n"
+            "Guiding knowledge for branches that switch this document on.\n",
+        )
+        return self.describe_knowledge_document(path)
+
+    def append_knowledge_entry(self, doc_id: str, entry: str) -> dict[str, Any]:
+        """Append one Knowledging entry to a knowledge document.
+
+        Append-only on purpose: revising or reorganizing what is already stored
+        is a separate, explicit editing flow.
+        """
+        self.require_initialized()
+        entry = (entry or "").strip()
+        if not entry:
+            die("knowledge entry is empty")
+        path = self.knowledge_path(doc_id)
+        if not path.exists():
+            die(f"knowledge document does not exist: {doc_id}")
+        existing = read_text(path).rstrip()
+        write_text(path, f"{existing}\n\n{entry}\n" if existing else f"{entry}\n")
+        return self.describe_knowledge_document(path)
+
+    def branch_guiding_ids(self, branch_id: str) -> list[str]:
+        paths = self.branch_paths_for_read(branch_id)
+        if not paths.meta.exists():
+            return []
+        raw = load_json(paths.meta).get("guiding")
+        if not isinstance(raw, list):
+            return []
+        known = {item["id"] for item in self.list_knowledge_documents()}
+        selected = []
+        for value in raw:
+            doc_id = str(value or "").strip()
+            # Deleted documents drop out silently instead of breaking the prompt.
+            if doc_id and doc_id in known and doc_id not in selected:
+                selected.append(doc_id)
+        return selected
+
+    def set_branch_guiding(self, branch_id: str, doc_ids: list[str]) -> list[str]:
+        self.require_initialized()
+        paths = self.branch_paths(branch_id)
+        if not paths.root.exists():
+            die(f"branch does not exist: {branch_id}")
+        known = {item["id"] for item in self.list_knowledge_documents()}
+        selected: list[str] = []
+        for value in doc_ids or []:
+            doc_id = str(value or "").strip()
+            if not doc_id or doc_id in selected:
+                continue
+            if doc_id not in known:
+                die(f"knowledge document does not exist: {doc_id}")
+            selected.append(doc_id)
+        meta = load_json(paths.meta)
+        if selected:
+            meta["guiding"] = selected
+        else:
+            meta.pop("guiding", None)
+        meta["updatedAt"] = utc_now()
+        dump_json(paths.meta, meta)
+        return selected
 
     def import_starting_workspace_if_present(self) -> Path | None:
         workspace = self.find_starting_workspace()
@@ -5607,7 +5825,7 @@ def call_codex_history_compaction(
                 timeout=timeout_seconds,
             )
         except subprocess.TimeoutExpired as exc:
-            raise ChatTimeoutError(f"Codex history compaction timed out after {timeout_seconds} seconds") from exc
+            raise codex_timeout_error("Codex history compaction", timeout_seconds) from exc
         raw = read_text(output_path).strip()
         if completed.returncode != 0 and not raw:
             detail = completed.stderr.strip() or completed.stdout.strip()
@@ -5725,6 +5943,49 @@ def project_context_sections(store: ContextStore, budget_chars: int) -> list[str
             if remaining <= 0:
                 break
     return sections
+
+
+def guiding_context_sections(store: ContextStore, branch_id: str, budget_chars: int) -> str:
+    """Render the knowledge documents this branch has switched on.
+
+    These go into the prompt verbatim rather than being offered as files the
+    agent may read, so a guiding document is guaranteed to be in effect instead
+    of depending on the model choosing to open it.
+    """
+    doc_ids = store.branch_guiding_ids(branch_id)
+    if not doc_ids or budget_chars <= 0:
+        return "(none)"
+    sections = []
+    remaining = budget_chars
+    for doc_id in doc_ids:
+        path = store.knowledge_path(doc_id)
+        text = read_text(path).strip()
+        if not text:
+            continue
+        chunk = truncate_middle(text, remaining)
+        if not chunk:
+            break
+        rel = relpath(store.root, path)
+        sections.append(f"## Guiding Document: `{rel}`\n\n{chunk}")
+        remaining -= len(chunk)
+        if remaining <= 0:
+            break
+    return "\n\n".join(sections) or "(none)"
+
+
+def guiding_prompt_parts(guiding_context: str) -> list[str]:
+    if not guiding_context or guiding_context == "(none)":
+        return []
+    return [
+        "Guiding knowledge switched on for this branch. Treat it as standing",
+        "instructions and established facts that always apply here, at the same",
+        "level as the project instructions. Follow it unless the user overrides it",
+        "in this turn, and say so explicitly when you do:",
+        "<guiding_knowledge>",
+        guiding_context,
+        "</guiding_knowledge>",
+        "",
+    ]
 
 
 def source_context_sections(store: ContextStore, branch_id: str, budget_chars: int) -> str:
@@ -5986,6 +6247,7 @@ def build_context_bundle(store: ContextStore, branch_id: str) -> dict[str, str]:
         DEFAULT_CONTEXT_BUDGET_CHARS,
     )
     project_budget = max(4000, budget // 5)
+    guiding_budget = min(DEFAULT_GUIDING_BUDGET_CHARS, max(4000, budget // 4))
     branch_budget = max(12000, budget // 4)
     source_budget = max(10000, budget // 5)
     resource_budget = max(4000, budget // 12)
@@ -5993,6 +6255,7 @@ def build_context_bundle(store: ContextStore, branch_id: str) -> dict[str, str]:
     history_budget = history_budget_from_config(codex_config, "historyBudgetCharacters")
     history_record_limit = history_record_limit_from_config(codex_config)
     project_context = "\n\n".join(project_context_sections(store, project_budget)).strip()
+    guiding_context = guiding_context_sections(store, branch_id, guiding_budget)
     branch_context = truncate_middle(store.context_excerpt(branch_id), branch_budget).strip()
     source_context = source_context_sections(store, branch_id, source_budget)
     resource_context = resource_context_sections(store, branch_id, resource_budget)
@@ -6007,6 +6270,7 @@ def build_context_bundle(store: ContextStore, branch_id: str) -> dict[str, str]:
         history_lines.insert(0, f"- [ctxgit replaced {compacted_count} older raw history records with Long-history compactions above]")
     return {
         "project": project_context or "(none)",
+        "guiding": guiding_context,
         "branch": branch_context or "(none)",
         "sources": source_context,
         "resources": resource_context,
@@ -6053,6 +6317,7 @@ def build_chat_prompt(
         context["project"],
         "</project_context>",
         "",
+        *guiding_prompt_parts(context["guiding"]),
         "Branch report:",
         "<branch_report>",
         context["branch"],
@@ -6148,6 +6413,9 @@ def build_history_chat_prompt(
     )
     history_record_limit = history_record_limit_from_config(codex_config)
     project_context = "\n\n".join(project_context_sections(store, project_budget)).strip()
+    guiding_context = guiding_context_sections(
+        store, branch_id, min(DEFAULT_GUIDING_BUDGET_CHARS, max(4000, budget // 4))
+    )
     branch_context = truncate_middle(store.context_excerpt(branch_id), branch_budget).strip()
     resource_context = resource_context_sections(store, branch_id, resource_budget)
     compaction_context = compaction_context_sections(store, branch_id, max(8000, budget // 4))
@@ -6166,7 +6434,7 @@ def build_history_chat_prompt(
         "",
         "This is an information-sharing conversation mode, not an agent-editing mode.",
         "Use only these information sources:",
-        "1. Project memory/instructions supplied below.",
+        "1. Project memory/instructions and guiding knowledge supplied below.",
         "2. Branch context and conversation history supplied below.",
         "3. Branch resources and current turn attachments supplied below.",
         "4. Live web search, only when it is useful for the user's question.",
@@ -6186,6 +6454,7 @@ def build_history_chat_prompt(
         project_context or "(none)",
         "</project_context>",
         "",
+        *guiding_prompt_parts(guiding_context),
         "Branch context:",
         "<branch_context>",
         branch_context or "(none)",
@@ -6816,7 +7085,7 @@ def run_process_with_progress(
                 if stripped:
                     try:
                         event_sink(json.loads(stripped))
-                    except (json.JSONDecodeError, Exception):  # noqa: BLE001 - never let capture break the run
+                    except Exception:  # noqa: BLE001 - never let capture break the run
                         pass
             warning_key = codex_startup_warning_key(line)
             if warning_key:
@@ -6937,11 +7206,7 @@ def call_codex_chat(
                     timeout=timeout_seconds,
                 )
         except subprocess.TimeoutExpired as exc:
-            raise ChatTimeoutError(
-                f"Codex timed out after {timeout_seconds} seconds. "
-                "For broad literature reviews, narrow the request or increase "
-                "`llm.codex.timeoutSeconds` in `.ctxgit/config.json`."
-            ) from exc
+            raise codex_timeout_error("Codex", timeout_seconds) from exc
         raw = read_text(output_path).strip()
         if completed.returncode != 0 and not raw:
             detail = completed.stderr.strip() or completed.stdout.strip()
@@ -7022,7 +7287,7 @@ def call_codex_history_chat(
                     timeout=timeout_seconds,
                 )
         except subprocess.TimeoutExpired as exc:
-            raise ChatTimeoutError(f"Codex history chat timed out after {timeout_seconds} seconds") from exc
+            raise codex_timeout_error("Codex history chat", timeout_seconds) from exc
         raw = read_text(output_path).strip()
         if completed.returncode != 0 and not raw:
             detail = completed.stderr.strip() or completed.stdout.strip()
@@ -7100,7 +7365,7 @@ def call_codex_context_chat(
                     timeout=timeout_seconds,
                 )
         except subprocess.TimeoutExpired as exc:
-            raise ChatTimeoutError(f"Codex contexts chat timed out after {timeout_seconds} seconds") from exc
+            raise codex_timeout_error("Codex contexts chat", timeout_seconds) from exc
         raw = read_text(output_path).strip()
         if completed.returncode != 0 and not raw:
             detail = completed.stderr.strip() or completed.stdout.strip()
@@ -7166,7 +7431,7 @@ def call_codex_prompt(
                     timeout=timeout_seconds,
                 )
         except subprocess.TimeoutExpired as exc:
-            raise ChatTimeoutError(f"Codex timed out after {timeout_seconds} seconds") from exc
+            raise codex_timeout_error("Codex", timeout_seconds) from exc
         raw = read_text(output_path).strip()
         if completed.returncode != 0 and not raw:
             detail = completed.stdout.strip() or completed.stderr.strip()
@@ -7944,6 +8209,131 @@ def run_history_chat_turn(
     return payload
 
 
+KNOWLEDGING_ENTRY_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["entry", "summary"],
+    "properties": {
+        "entry": {"type": "string"},
+        "summary": {"type": "string"},
+    },
+}
+
+
+def build_knowledging_prompt(
+    store: ContextStore,
+    document: dict[str, Any],
+    instruction: str,
+    source_text: str,
+    branch_id: str,
+) -> str:
+    existing = truncate_middle(read_text(store.knowledge_path(document["id"])).strip(), 20000)
+    parts = [
+        "You are the ctxgit knowledging assistant.",
+        "",
+        "The user is capturing something durable out of a conversation and into a",
+        "guiding knowledge document. That document is injected verbatim into every",
+        "future prompt for the branches that switched it on, so it must stay compact,",
+        "factual, and directly usable as standing knowledge.",
+        "",
+        "Write exactly one new Markdown section to append. Rules:",
+        "- Start with a `## ` heading that names the knowledge, not the conversation.",
+        "- Record what should hold in the future, not a summary of what was said.",
+        "- Keep it to the smallest form that is still unambiguous and actionable.",
+        "- Do not restate anything the existing document already says. If the user's",
+        "  request is already fully covered, say so in `summary` and return an entry",
+        "  that only adds what is genuinely new.",
+        "- Do not invent facts. Use only the instruction and the source message.",
+        "- Write in the language the user wrote the instruction in.",
+        "- Do not include a top-level `# ` heading; the document already has one.",
+        "",
+        f"Source branch: {branch_id}",
+        f"Target document: `{document['path']}` ({document['title']})",
+        "",
+        "Existing document content:",
+        "<document>",
+        existing or "(empty)",
+        "</document>",
+        "",
+        "Chat message the user selected as the source:",
+        "<source_message>",
+        truncate_middle(source_text.strip(), 12000) or "(none)",
+        "</source_message>",
+        "",
+        "What the user wants stored:",
+        "<instruction>",
+        instruction.strip(),
+        "</instruction>",
+        "",
+        "Return JSON only, with:",
+        "- entry: the Markdown section to append, starting with `## `.",
+        "- summary: one short line describing what was stored, in the user's language.",
+    ]
+    return "\n".join(parts)
+
+
+def run_knowledging_turn(
+    root: Path,
+    store: ContextStore,
+    branch_id: str,
+    doc_id: str,
+    instruction: str,
+    source_text: str = "",
+    provider: str | None = None,
+    progress: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    """Distill one chat message into a guiding knowledge document and append it.
+
+    This never touches branch history: knowledging is a deliberate side action,
+    not a conversation turn.
+    """
+    instruction = (instruction or "").strip()
+    if not instruction:
+        die("knowledging instruction is required")
+    document = store.knowledge_document(doc_id)
+    selected_provider = provider or str(read_llm_config(root).get("provider") or "codex")
+    emit_progress(progress, f"Distilling knowledge for {document['path']}")
+    prompt = build_knowledging_prompt(store, document, instruction, source_text, branch_id)
+    result = call_provider_prompt(
+        selected_provider,
+        root,
+        prompt,
+        writable=False,
+        cwd=store.root,
+        progress=progress,
+        output_schema=KNOWLEDGING_ENTRY_SCHEMA,
+    )
+    entry = str(result.get("entry") or "").strip()
+    if not entry:
+        raise RuntimeError("knowledging returned no entry")
+    if not entry.lstrip().startswith("#"):
+        entry = f"## {utc_now()}\n\n{entry}"
+    summary = str(result.get("summary") or "").strip() or "Stored guiding knowledge"
+    emit_progress(progress, "Appending to the knowledge document")
+    updated = store.append_knowledge_entry(document["id"], entry)
+    turn_commit = internal_git_commit_turn(
+        store,
+        kind="knowledging",
+        actor="user+agent",
+        summary=f"Knowledging: append to {updated['path']}",
+        branch_id=branch_id or None,
+        metadata={
+            "document": updated["path"],
+            "documentId": updated["id"],
+            "branch": branch_id,
+            "provider": selected_provider,
+        },
+    )
+    return {
+        "document": updated,
+        "documents": store.list_knowledge_documents(),
+        "entry": entry,
+        "summary": summary,
+        "provider": selected_provider,
+        "turnCommit": turn_commit,
+    }
+
+
 def run_context_chat_turn(
     root: Path,
     store: ContextStore,
@@ -8418,6 +8808,11 @@ def build_sequence_agent_prompt(
         str(participant.get("systemPrompt") or "(no additional role prompt)"),
         "</persistent_system_prompt>",
         "",
+        # Guiding knowledge belongs to the branch you are in, so in a room every
+        # agent shares the room's guiding documents as a common briefing.
+        *guiding_prompt_parts(
+            guiding_context_sections(store, branch_id, min(DEFAULT_GUIDING_BUDGET_CHARS, max(4000, int(total_budget * 0.15))))
+        ),
         "Your private source-branch snapshot context:",
         "<source_context>",
         truncate_middle(read_text(archive_root / "context.md"), source_context_budget),
@@ -9181,6 +9576,8 @@ def branch_payload(store: ContextStore, branch_id: str) -> dict[str, Any]:
         "resources": store.list_resources(branch_id),
         "sources": store.list_sources(branch_id),
         "compactions": compaction_items,
+        "guiding": store.branch_guiding_ids(branch_id),
+        "knowledge": store.list_knowledge_documents(),
         "archives": store.list_archives(branch_id),
         "git": {
             "historyLog": run_git(store.root, ["log", "--oneline", "--", history_path]),
@@ -10798,7 +11195,7 @@ def make_handler(
                     project = self.request_project_payload()
                 except ValueError:
                     project = project_state.payload()
-                self.send_json({"error": "project_not_initialized", "project": project}, status=int(exc.code or 409))
+                self.send_json({"error": "project_not_initialized", "project": project}, status=http_status_from_exit(exc, 409))
                 return True
             except ValueError as exc:
                 self.send_json({"error": "project_invalid", "message": str(exc)}, status=400)
@@ -10825,7 +11222,7 @@ def make_handler(
                 try:
                     self.send_json(branch_payload(store, branch_id))
                 except SystemExit as exc:
-                    self.send_json({"error": "branch_not_found"}, status=int(exc.code or 404))
+                    self.send_json(die_payload("branch_not_found", exc), status=http_status_from_exit(exc, 404))
                 return True
             if parsed.path == "/api/orchestration":
                 branch_id = str(query.get("branch", [""])[0])
@@ -10836,7 +11233,7 @@ def make_handler(
                 try:
                     path = orchestration_log_path(store, branch_id, turn_id)
                 except SystemExit as exc:
-                    self.send_json({"error": "branch_invalid"}, status=int(exc.code or 400))
+                    self.send_json(die_payload("branch_invalid", exc), status=http_status_from_exit(exc, 400))
                     return
                 if not path.exists():
                     self.send_json({"error": "orchestration_log_not_found"}, status=404)
@@ -10860,14 +11257,14 @@ def make_handler(
                 try:
                     self.send_json(store.archive_payload(branch_id, archive_id))
                 except SystemExit as exc:
-                    self.send_json({"error": "archive_not_found"}, status=int(exc.code or 404))
+                    self.send_json(die_payload("archive_not_found", exc), status=http_status_from_exit(exc, 404))
                 return True
             if parsed.path == "/api/globalized":
                 archive_id = (query.get("id") or [""])[0]
                 try:
                     self.send_json(store.globalized_payload(archive_id))
                 except SystemExit as exc:
-                    self.send_json({"error": "globalized_not_found"}, status=int(exc.code or 404))
+                    self.send_json(die_payload("globalized_not_found", exc), status=http_status_from_exit(exc, 404))
                 return True
             if parsed.path == "/api/view":
                 try:
@@ -10929,6 +11326,21 @@ def make_handler(
                     self.send_json({"error": "file_not_found", "message": "File not found."}, status=404)
                 except ValueError as exc:
                     self.send_json({"error": "file_read_failed", "message": str(exc)}, status=400)
+                return True
+            if parsed.path == "/api/knowledge":
+                branch_id = (query.get("branch") or [""])[0]
+                doc_id = (query.get("doc") or [""])[0]
+                try:
+                    payload: dict[str, Any] = {"documents": store.list_knowledge_documents()}
+                    if branch_id:
+                        payload["branch"] = branch_id
+                        payload["guiding"] = store.branch_guiding_ids(branch_id)
+                    if doc_id:
+                        payload["document"] = store.knowledge_document(doc_id)
+                        payload["text"] = read_text(store.knowledge_path(doc_id))
+                    self.send_json(payload)
+                except SystemExit as exc:
+                    self.send_json(die_payload("knowledge_read_failed", exc), status=http_status_from_exit(exc, 400))
                 return True
             if parsed.path == "/api/branch/compaction":
                 try:
@@ -11045,7 +11457,7 @@ def make_handler(
                     root = registry.resolve(project_id, active_root)
                     self.send_json(project_state.open(str(root), init=init, init_git=body.get("gitInit") is True))
                 except SystemExit as exc:
-                    self.send_json({"error": "project_not_initialized", "message": "Project is not initialized for ctxgit."}, status=int(exc.code or 409))
+                    self.send_json({"error": "project_not_initialized", "message": "Project is not initialized for ctxgit."}, status=http_status_from_exit(exc, 409))
                 except ValueError as exc:
                     self.send_json({"error": "server_project_open_failed", "message": str(exc)}, status=400)
                 return
@@ -11158,7 +11570,7 @@ def make_handler(
                 try:
                     self.send_json(project_state.open(path_value, init=False, init_git=False))
                 except SystemExit as exc:
-                    self.send_json({"error": "project_not_initialized", "message": "Project is not initialized for ctxgit.", "project": project_payload(Path(path_value).expanduser().resolve())}, status=int(exc.code or 409))
+                    self.send_json({"error": "project_not_initialized", "message": "Project is not initialized for ctxgit.", "project": project_payload(Path(path_value).expanduser().resolve())}, status=http_status_from_exit(exc, 409))
                 except ValueError as exc:
                     self.send_json({"error": "project_open_failed", "message": str(exc)}, status=400)
                 return
@@ -11219,7 +11631,7 @@ def make_handler(
                     project = self.request_project_payload()
                 except ValueError:
                     project = project_state.payload()
-                self.send_json({"error": "project_not_initialized", "project": project}, status=int(exc.code or 409))
+                self.send_json({"error": "project_not_initialized", "project": project}, status=http_status_from_exit(exc, 409))
                 return
             except ValueError as exc:
                 self.send_json({"error": "project_invalid", "message": str(exc)}, status=400)
@@ -11354,7 +11766,7 @@ def make_handler(
                 except ValueError as exc:
                     self.send_json({"error": "upload_failed", "message": str(exc)}, status=400)
                 except SystemExit as exc:
-                    self.send_json({"error": "upload_failed"}, status=int(exc.code or 400))
+                    self.send_json(die_payload("upload_failed", exc), status=http_status_from_exit(exc, 400))
                 return
             if parsed.path == "/api/branch/source/upload-finish":
                 branch_id = str(body.get("branch") or "")
@@ -11365,7 +11777,7 @@ def make_handler(
                 except ValueError as exc:
                     self.send_json({"error": "upload_finish_failed", "message": str(exc)}, status=400)
                 except SystemExit as exc:
-                    self.send_json({"error": "upload_finish_failed"}, status=int(exc.code or 400))
+                    self.send_json(die_payload("upload_finish_failed", exc), status=http_status_from_exit(exc, 400))
                 return
             if parsed.path in {"/api/merge", "/api/merge/start"}:
                 raw_branches = body.get("branches")
@@ -11429,7 +11841,7 @@ def make_handler(
                 except RuntimeError as exc:
                     self.send_json({"error": "merge_failed", "message": str(exc)}, status=500)
                 except SystemExit as exc:
-                    self.send_json({"error": "merge_failed"}, status=int(exc.code or 400))
+                    self.send_json(die_payload("merge_failed", exc), status=http_status_from_exit(exc, 400))
                 return
             if parsed.path == "/api/sequence-room/create":
                 branches = [str(item) for item in body.get("branches", []) if str(item).strip()]
@@ -11623,7 +12035,7 @@ def make_handler(
                 try:
                     directory = store.branch_paths_for_read(branch_id).root
                 except SystemExit as exc:
-                    self.send_json({"error": "branch_invalid"}, status=int(exc.code or 400))
+                    self.send_json(die_payload("branch_invalid", exc), status=http_status_from_exit(exc, 400))
                     return
                 if not directory.exists() or not directory.is_dir():
                     self.send_json(
@@ -11692,7 +12104,7 @@ def make_handler(
                     )
                     self.send_json(payload)
                 except SystemExit as exc:
-                    self.send_json({"error": "clone_failed"}, status=int(exc.code or 400))
+                    self.send_json(die_payload("clone_failed", exc), status=http_status_from_exit(exc, 400))
                 return
             if parsed.path == "/api/context-chat/branch":
                 target_id = str(body.get("target") or "")
@@ -11710,7 +12122,7 @@ def make_handler(
                     )
                     self.send_json(payload)
                 except SystemExit as exc:
-                    self.send_json({"error": "branch_create_failed"}, status=int(exc.code or 400))
+                    self.send_json(die_payload("branch_create_failed", exc), status=http_status_from_exit(exc, 400))
                 return
             if parsed.path == "/api/branch/rename":
                 branch_id = str(body.get("branch") or "")
@@ -11728,7 +12140,82 @@ def make_handler(
                     )
                     self.send_json(payload)
                 except SystemExit as exc:
-                    self.send_json({"error": "rename_failed"}, status=int(exc.code or 400))
+                    self.send_json(die_payload("rename_failed", exc), status=http_status_from_exit(exc, 400))
+                return
+            if parsed.path == "/api/branch/guiding":
+                branch_id = str(body.get("branch") or "")
+                requested = body.get("docs")
+                if not isinstance(requested, list):
+                    self.send_json({"error": "docs_required"}, status=400)
+                    return
+                try:
+                    selected = store.set_branch_guiding(branch_id, [str(item) for item in requested])
+                    internal_git_commit_turn(
+                        store,
+                        kind="branch-guiding",
+                        actor="user",
+                        summary=(
+                            f"Set guiding knowledge of {branch_id} to "
+                            f"{', '.join(selected) or '(none)'}"
+                        ),
+                        branch_id=branch_id,
+                        metadata={"branch": branch_id, "guiding": selected},
+                    )
+                    self.send_json(
+                        {
+                            "branch": branch_id,
+                            "guiding": selected,
+                            "documents": store.list_knowledge_documents(),
+                        }
+                    )
+                except SystemExit as exc:
+                    self.send_json(die_payload("guiding_failed", exc), status=http_status_from_exit(exc, 400))
+                return
+            if parsed.path == "/api/knowledge/create":
+                title = str(body.get("title") or "").strip()
+                doc_id = str(body.get("id") or "").strip() or None
+                try:
+                    document = store.create_knowledge_document(title, doc_id)
+                    internal_git_commit_turn(
+                        store,
+                        kind="knowledge-create",
+                        actor="user",
+                        summary=f"Create knowledge document {document['path']}",
+                        metadata={"document": document["path"], "documentId": document["id"]},
+                    )
+                    self.send_json(
+                        {"document": document, "documents": store.list_knowledge_documents()}
+                    )
+                except SystemExit as exc:
+                    self.send_json(die_payload("knowledge_create_failed", exc), status=http_status_from_exit(exc, 400))
+                return
+            if parsed.path == "/api/knowledge/append":
+                branch_id = str(body.get("branch") or "")
+                doc_id = str(body.get("doc") or "")
+                instruction = str(body.get("instruction") or "").strip()
+                source_text = str(body.get("source") or "")
+                provider = str(body.get("provider") or "") or None
+                if not instruction:
+                    self.send_json({"error": "instruction_required"}, status=400)
+                    return
+                try:
+                    self.send_json(
+                        run_knowledging_turn(
+                            root,
+                            store,
+                            branch_id,
+                            doc_id,
+                            instruction,
+                            source_text=source_text,
+                            provider=provider,
+                        )
+                    )
+                except SystemExit as exc:
+                    self.send_json(die_payload("knowledging_failed", exc), status=http_status_from_exit(exc, 400))
+                except Exception as exc:  # provider failures surface in the modal
+                    self.send_json(
+                        {"error": "knowledging_failed", "message": str(exc)}, status=502
+                    )
                 return
             if parsed.path == "/api/branch/folder":
                 branch_id = str(body.get("branch") or "")
@@ -11745,7 +12232,7 @@ def make_handler(
                     )
                     self.send_json({"branches": store.list_branches(), "folders": store.list_branch_folders()})
                 except SystemExit as exc:
-                    self.send_json({"error": "folder_failed"}, status=int(exc.code or 400))
+                    self.send_json(die_payload("folder_failed", exc), status=http_status_from_exit(exc, 400))
                 return
             if parsed.path == "/api/folders/create":
                 name = str(body.get("name") or "")
@@ -11753,7 +12240,7 @@ def make_handler(
                     store.create_branch_folder(name)
                     self.send_json({"branches": store.list_branches(), "folders": store.list_branch_folders()})
                 except SystemExit as exc:
-                    self.send_json({"error": "folder_create_failed"}, status=int(exc.code or 400))
+                    self.send_json(die_payload("folder_create_failed", exc), status=http_status_from_exit(exc, 400))
                 return
             if parsed.path == "/api/folders/delete":
                 name = str(body.get("name") or "")
@@ -11768,7 +12255,7 @@ def make_handler(
                     )
                     self.send_json({"branches": store.list_branches(), "folders": store.list_branch_folders()})
                 except SystemExit as exc:
-                    self.send_json({"error": "folder_delete_failed"}, status=int(exc.code or 400))
+                    self.send_json(die_payload("folder_delete_failed", exc), status=http_status_from_exit(exc, 400))
                 return
             if parsed.path == "/api/branch/remove":
                 branch_id = str(body.get("branch") or "")
@@ -11791,7 +12278,7 @@ def make_handler(
                         }
                     )
                 except SystemExit as exc:
-                    self.send_json({"error": "remove_failed"}, status=int(exc.code or 400))
+                    self.send_json(die_payload("remove_failed", exc), status=http_status_from_exit(exc, 400))
                 return
             if parsed.path == "/api/branch/archive":
                 branch_id = str(body.get("branch") or "")
@@ -11833,7 +12320,7 @@ def make_handler(
                 except ValueError as exc:
                     self.send_json({"error": "archive_failed", "message": str(exc)}, status=400)
                 except SystemExit as exc:
-                    self.send_json({"error": "archive_failed"}, status=int(exc.code or 400))
+                    self.send_json(die_payload("archive_failed", exc), status=http_status_from_exit(exc, 400))
                 return
             if parsed.path == "/api/branch/unarchive":
                 branch_id = str(body.get("branch") or "")
@@ -11861,7 +12348,7 @@ def make_handler(
                 except ValueError as exc:
                     self.send_json({"error": "unarchive_failed", "message": str(exc)}, status=400)
                 except SystemExit as exc:
-                    self.send_json({"error": "unarchive_failed"}, status=int(exc.code or 400))
+                    self.send_json(die_payload("unarchive_failed", exc), status=http_status_from_exit(exc, 400))
                 return
             if parsed.path == "/api/ingest":
                 branch_id = str(body.get("branch") or "")
@@ -11879,7 +12366,7 @@ def make_handler(
                     )
                     self.send_json(payload)
                 except SystemExit as exc:
-                    self.send_json({"error": "ingest_failed"}, status=int(exc.code or 400))
+                    self.send_json(die_payload("ingest_failed", exc), status=http_status_from_exit(exc, 400))
                 return
             if parsed.path == "/api/append":
                 branch_id = str(body.get("branch") or "")
@@ -11904,7 +12391,7 @@ def make_handler(
                     payload["turnCommit"] = turn_commit
                     self.send_json(payload)
                 except SystemExit as exc:
-                    self.send_json({"error": "append_failed"}, status=int(exc.code or 400))
+                    self.send_json(die_payload("append_failed", exc), status=http_status_from_exit(exc, 400))
                 return
             if parsed.path == "/api/branch/compaction":
                 branch_id = str(body.get("branch") or "")
@@ -11973,7 +12460,7 @@ def make_handler(
                 except ValueError as exc:
                     self.send_json({"error": "delete_failed", "message": str(exc)}, status=409)
                 except SystemExit as exc:
-                    self.send_json({"error": "delete_failed"}, status=int(exc.code or 400))
+                    self.send_json(die_payload("delete_failed", exc), status=http_status_from_exit(exc, 400))
                 return
             if parsed.path == "/api/history/revise":
                 branch_id = str(body.get("branch") or "")
@@ -12008,7 +12495,7 @@ def make_handler(
                 except ValueError as exc:
                     self.send_json({"error": "revise_failed", "message": str(exc)}, status=409)
                 except SystemExit as exc:
-                    self.send_json({"error": "revise_failed"}, status=int(exc.code or 400))
+                    self.send_json(die_payload("revise_failed", exc), status=http_status_from_exit(exc, 400))
                 return
             if parsed.path == "/api/history/cut":
                 branch_id = str(body.get("branch") or "")
@@ -12032,7 +12519,7 @@ def make_handler(
                 except ValueError as exc:
                     self.send_json({"error": "cut_failed", "message": str(exc)}, status=409)
                 except SystemExit as exc:
-                    self.send_json({"error": "cut_failed"}, status=int(exc.code or 400))
+                    self.send_json(die_payload("cut_failed", exc), status=http_status_from_exit(exc, 400))
                 return
             if parsed.path == "/api/history/fork":
                 branch_id = str(body.get("branch") or "")
@@ -12067,7 +12554,7 @@ def make_handler(
                 except ValueError as exc:
                     self.send_json({"error": "fork_failed", "message": str(exc)}, status=409)
                 except SystemExit as exc:
-                    self.send_json({"error": "fork_failed"}, status=int(exc.code or 400))
+                    self.send_json(die_payload("fork_failed", exc), status=http_status_from_exit(exc, 400))
                 return
             if parsed.path == "/api/history/fork-context":
                 branch_id = str(body.get("branch") or "")
@@ -12102,7 +12589,7 @@ def make_handler(
                 except ValueError as exc:
                     self.send_json({"error": "fork_context_failed", "message": str(exc)}, status=409)
                 except SystemExit as exc:
-                    self.send_json({"error": "fork_context_failed"}, status=int(exc.code or 400))
+                    self.send_json(die_payload("fork_context_failed", exc), status=http_status_from_exit(exc, 400))
                 except Exception as exc:
                     self.send_json({"error": "fork_context_failed", "message": str(exc)}, status=500)
                 return
@@ -12181,7 +12668,7 @@ def make_handler(
                 except (ResearchExecutionError, RuntimeError, ValueError) as exc:
                     self.send_json({"error": "research_failed", "message": str(exc)}, status=500)
                 except SystemExit as exc:
-                    self.send_json({"error": "research_failed"}, status=int(exc.code or 400))
+                    self.send_json(die_payload("research_failed", exc), status=http_status_from_exit(exc, 400))
                 except Exception as exc:
                     self.send_json({"error": "research_failed", "message": str(exc)}, status=500)
                 return
@@ -12327,7 +12814,7 @@ def make_handler(
                 try:
                     self.send_json(reset_context_chat_history(store))
                 except SystemExit as exc:
-                    self.send_json({"error": "context_chat_reset_failed"}, status=int(exc.code or 400))
+                    self.send_json(die_payload("context_chat_reset_failed", exc), status=http_status_from_exit(exc, 400))
                 except Exception as exc:
                     self.send_json({"error": "context_chat_reset_failed", "message": str(exc)}, status=500)
                 return
@@ -12357,7 +12844,7 @@ def make_handler(
                 except RuntimeError as exc:
                     self.send_json({"error": "chat_failed", "message": str(exc)}, status=500)
                 except SystemExit as exc:
-                    self.send_json({"error": "chat_failed"}, status=int(exc.code or 400))
+                    self.send_json(die_payload("chat_failed", exc), status=http_status_from_exit(exc, 400))
                 except Exception as exc:
                     self.send_json({"error": "chat_failed", "message": str(exc)}, status=500)
                 return
@@ -12389,7 +12876,7 @@ def make_handler(
                 except RuntimeError as exc:
                     self.send_json({"error": "chat_failed", "message": str(exc)}, status=500)
                 except SystemExit as exc:
-                    self.send_json({"error": "chat_failed"}, status=int(exc.code or 400))
+                    self.send_json(die_payload("chat_failed", exc), status=http_status_from_exit(exc, 400))
                 except Exception as exc:
                     self.send_json({"error": "chat_failed", "message": str(exc)}, status=500)
                 return
@@ -12407,7 +12894,7 @@ def make_handler(
                 except (RuntimeError, ValueError) as exc:
                     self.send_json({"error": "approval_failed", "message": str(exc)}, status=400)
                 except SystemExit as exc:
-                    self.send_json({"error": "approval_failed"}, status=int(exc.code or 400))
+                    self.send_json(die_payload("approval_failed", exc), status=http_status_from_exit(exc, 400))
                 except Exception as exc:
                     self.send_json({"error": "approval_failed", "message": str(exc)}, status=500)
                 return

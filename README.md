@@ -178,7 +178,32 @@ Project-level agent instructions and memory live under `contexts/`:
 - `contexts/agents/`
 
 These files are global to the opened project. They are not branch-local and are
-not copied or merged when ctxgit branches are merged. `.ctxgit/` is reserved
+not copied or merged when ctxgit branches are merged.
+
+## Guiding Knowledge
+
+Guiding knowledge is durable knowledge a branch should already have before the
+first message of a turn, without depending on the model choosing to read a file.
+
+Documents live under `contexts/knowledge/*.md` and are shared across the whole
+project. Which of them apply is decided **per branch**: the topbar `Guiding`
+button lists every knowledge document and toggles each one on or off for the
+open branch. The selection is stored as `guiding` in that branch's `branch.json`.
+
+Every document a branch has switched on is inserted verbatim into that branch's
+prompts, in the same layer as `AGENTS.md`, for chat turns, info-chat turns, and
+sequence-room agent turns. It is prompt injection, not a tool call, so a guiding
+document is guaranteed to be in effect rather than merely available to read.
+Documents removed from disk drop out of a branch's selection silently instead of
+breaking its prompts.
+
+Nothing is captured automatically. To store something, open the `...` menu on a
+chat message and choose `Knowledging`. The modal asks which document to append
+to (or creates a new one) and what should be remembered; the configured LLM then
+distills one Markdown section from that message and your instruction, and
+appends it to the document. Knowledge documents are append-only through this
+flow — editing or reorganizing what is already stored is done in the files
+themselves, and every append is recorded as a ctxgit turn commit. `.ctxgit/` is reserved
 for tool configuration and metadata; AI prompts are built from `contexts/` so
 the operational context is visible and Git-reviewable.
 

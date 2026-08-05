@@ -13,6 +13,7 @@ and `contexts/`.
 The model is:
 
 - Branches are directories under `contexts/branches/<id>/`.
+- Guiding knowledge lives in `contexts/knowledge/*.md`, switched on per branch.
 - Conversation history is append-only `history.jsonl`.
 - Compressed human-editable state lives in report-form `context.md`.
 - Research outputs become markdown reports under `research/`.
@@ -76,6 +77,18 @@ ctxgit chat AItrust "Continue this research branch."
 A chat turn may create multiple markdown artifacts in
 `contexts/branches/<branch>/artifacts/`; it is not forced to create an artifact
 on every turn.
+
+## Guiding Knowledge
+
+`contexts/knowledge/*.md` holds project-wide knowledge documents. Each branch
+chooses which of them apply through the topbar `Guiding` button, stored as
+`guiding` in `branch.json`. Selected documents are injected verbatim into that
+branch's chat, info-chat, and sequence-room prompts, so they are always in
+effect rather than being files the model may or may not open.
+
+Entries are added only on request: the `Knowledging` item in a chat message's
+`...` menu opens a modal where you say what should be remembered, and the
+configured LLM appends one distilled Markdown section to the chosen document.
 
 ## Report Shape
 

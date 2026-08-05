@@ -2961,6 +2961,164 @@ button.section-toggle[aria-expanded="false"] .section-toggle-caret {
   font-weight: 600;
 }
 
+/* Guiding knowledge + Knowledging ---------------------------------------- */
+.knowledge-dialog {
+  width: min(520px, 94vw);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 0;
+  background: var(--panel);
+  color: var(--text);
+}
+
+.knowledge-dialog::backdrop {
+  background: rgb(0 0 0 / 32%);
+}
+
+.knowledge-dialog .settings-status {
+  padding: 0 14px 12px;
+  font-size: 12px;
+}
+
+.knowledge-dialog-hint {
+  padding: 0 14px 8px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+.knowledge-dialog-list {
+  display: grid;
+  gap: 6px;
+  padding: 6px 12px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.knowledge-pick {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  text-align: left;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.knowledge-pick:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.knowledge-pick.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.knowledge-pick-toggle {
+  flex-shrink: 0;
+  min-width: 38px;
+  text-align: center;
+  padding: 2px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--line);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.knowledge-pick.active .knowledge-pick-toggle {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #fff;
+}
+
+.knowledge-pick-body {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.knowledge-pick-title {
+  font-weight: 600;
+}
+
+.knowledge-pick-meta {
+  font-size: 11px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.knowledge-source {
+  margin: 10px 14px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-soft, var(--panel));
+}
+
+.knowledge-source-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+
+.knowledge-source-text {
+  font-size: 12px;
+  line-height: 1.5;
+  max-height: 120px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+}
+
+.knowledge-form {
+  display: grid;
+  gap: 10px;
+  padding: 4px 14px 12px;
+}
+
+.knowledge-field {
+  display: grid;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.knowledge-field select,
+.knowledge-field input,
+.knowledge-field textarea {
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  font: inherit;
+  resize: vertical;
+}
+
+.knowledge-result {
+  margin: 0 14px 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
 /* Google Workspace extension panel --------------------------------------- */
 .gw-status {
   display: flex;

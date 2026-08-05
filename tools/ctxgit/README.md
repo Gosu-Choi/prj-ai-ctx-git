@@ -92,6 +92,18 @@ ctxgit research AItrust \
 Both modes write markdown notes to
 `contexts/branches/<branch>/research/`.
 
+## Guiding Knowledge
+
+Knowledge documents live under `contexts/knowledge/*.md` and are shared across
+the project. Each branch switches individual documents on from the topbar
+`Guiding` button; the selection is stored as `guiding` in that branch's
+`branch.json`. Switched-on documents are injected verbatim into that branch's
+prompts, so the agent starts every turn already knowing them.
+
+Storing knowledge is always explicit: `Knowledging` in a chat message's `...`
+menu opens a modal, and the configured LLM appends one distilled section to the
+document you pick.
+
 ## Git Snapshots
 
 ```bash

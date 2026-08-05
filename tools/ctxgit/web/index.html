@@ -233,6 +233,13 @@
               aria-pressed="false"
               title="Telegram a message for every agent reply (not just at the end)"
             >Notify each reply</button>
+            <button
+              id="guidingButton"
+              class="event-panel-toggle"
+              type="button"
+              hidden
+              title="Choose which knowledge documents this branch always starts with"
+            >Guiding</button>
             <button class="tab active" data-tab="chat" type="button">Chat</button>
             <button class="tab" data-tab="report" type="button">Report</button>
             <button class="tab" data-tab="summaries" type="button">Summaries</button>
@@ -387,6 +394,59 @@
         <input id="folderDialogNewInput" type="text" placeholder="새 폴더 이름" autocomplete="off" />
         <button type="submit">만들고 이동</button>
       </form>
+    </dialog>
+
+    <dialog id="guidingDialog" class="knowledge-dialog">
+      <div class="folder-dialog-head">
+        <strong>Guiding — 이 브랜치가 항상 읽고 시작할 지식</strong>
+        <button type="button" onclick="this.closest('dialog').close()" aria-label="Close">✕</button>
+      </div>
+      <div class="folder-dialog-target-row">브랜치: <code id="guidingDialogTarget"></code></div>
+      <div class="knowledge-dialog-hint">
+        켜 둔 문서는 이 브랜치의 모든 프롬프트에 그대로 주입됩니다. 에이전트가 읽을지 말지
+        고르는 게 아니라, 매 턴 이미 알고 시작합니다.
+      </div>
+      <div id="guidingDialogList" class="knowledge-dialog-list"></div>
+      <form id="guidingDialogNewForm" class="folder-dialog-new">
+        <input id="guidingDialogNewInput" type="text" placeholder="새 지식 문서 이름" autocomplete="off" />
+        <button type="submit">문서 만들기</button>
+      </form>
+      <div id="guidingDialogStatus" class="settings-status"></div>
+    </dialog>
+
+    <dialog id="knowledgingDialog" class="knowledge-dialog">
+      <div class="folder-dialog-head">
+        <strong>Knowledging — 이 내용을 지식으로 저장</strong>
+        <button type="button" onclick="this.closest('dialog').close()" aria-label="Close">✕</button>
+      </div>
+      <div class="knowledge-source">
+        <div class="knowledge-source-label">원본 메시지</div>
+        <div id="knowledgingSource" class="knowledge-source-text"></div>
+      </div>
+      <form id="knowledgingForm" class="knowledge-form">
+        <label class="knowledge-field">
+          <span>저장할 문서</span>
+          <select id="knowledgingDoc"></select>
+        </label>
+        <label class="knowledge-field" id="knowledgingNewField" hidden>
+          <span>새 문서 이름</span>
+          <input id="knowledgingNewInput" type="text" placeholder="예: 리서치 방법론" autocomplete="off" />
+        </label>
+        <label class="knowledge-field">
+          <span>어떻게 저장할까요?</span>
+          <textarea
+            id="knowledgingInstruction"
+            rows="4"
+            placeholder="예: 이 지표 정의를 앞으로 계속 쓰는 기준으로 기억해둬"
+          ></textarea>
+        </label>
+        <div class="dialog-actions">
+          <button type="button" onclick="this.closest('dialog').close()">취소</button>
+          <button id="knowledgingSubmit" type="submit">저장</button>
+        </div>
+      </form>
+      <div id="knowledgingStatus" class="settings-status"></div>
+      <div id="knowledgingResult" class="knowledge-result" hidden></div>
     </dialog>
 
     <dialog id="orchestrationDialog" class="orchestration-dialog">

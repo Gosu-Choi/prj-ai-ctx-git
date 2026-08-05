@@ -34,6 +34,9 @@ const state = {
   sequenceEvaluator: null,
   sequenceOrderOpen: false,
   activeSummaryPath: "",
+  knowledge: [],
+  guiding: [],
+  knowledgingSource: null,
 };
 
 const CONTEXT_CHAT_KEY = "__contexts__";
@@ -107,6 +110,23 @@ const els = {
   folderDialogList: document.querySelector("#folderDialogList"),
   folderDialogNewForm: document.querySelector("#folderDialogNewForm"),
   folderDialogNewInput: document.querySelector("#folderDialogNewInput"),
+  guidingButton: document.querySelector("#guidingButton"),
+  guidingDialog: document.querySelector("#guidingDialog"),
+  guidingDialogTarget: document.querySelector("#guidingDialogTarget"),
+  guidingDialogList: document.querySelector("#guidingDialogList"),
+  guidingDialogNewForm: document.querySelector("#guidingDialogNewForm"),
+  guidingDialogNewInput: document.querySelector("#guidingDialogNewInput"),
+  guidingDialogStatus: document.querySelector("#guidingDialogStatus"),
+  knowledgingDialog: document.querySelector("#knowledgingDialog"),
+  knowledgingSource: document.querySelector("#knowledgingSource"),
+  knowledgingForm: document.querySelector("#knowledgingForm"),
+  knowledgingDoc: document.querySelector("#knowledgingDoc"),
+  knowledgingNewField: document.querySelector("#knowledgingNewField"),
+  knowledgingNewInput: document.querySelector("#knowledgingNewInput"),
+  knowledgingInstruction: document.querySelector("#knowledgingInstruction"),
+  knowledgingSubmit: document.querySelector("#knowledgingSubmit"),
+  knowledgingStatus: document.querySelector("#knowledgingStatus"),
+  knowledgingResult: document.querySelector("#knowledgingResult"),
   branchGraphButton: document.querySelector("#branchGraphButton"),
   viewList: document.querySelector("#viewList"),
   globalizedList: document.querySelector("#globalizedList"),
@@ -1560,6 +1580,237 @@ function openFolderPicker(branch) {
   };
   dialog.showModal();
 }
+
+// --- Guiding knowledge ------------------------------------------------------
+//
+// Guiding documents are injected into every prompt for the branches that switch
+// them on, so this picker decides what the branch always starts out knowing.
+
+async function refreshKnowledge(branch) {
+  const query = branch ? `?branch=${encodeURIComponent(branch)}` : "";
+  const data = await api(`/api/knowledge${query}`);
+  state.knowledge = Array.isArray(data.documents) ? data.documents : [];
+  if (branch && Array.isArray(data.guiding)) state.guiding = data.guiding;
+  return data;
+}
+
+function renderGuidingList(branch) {
+  const selected = new Set(state.guiding || []);
+  const rows = (state.knowledge || []).map((doc) => {
+    const on = selected.has(doc.id);
+    return `
+      <button class="knowledge-pick ${on ? "active" : ""}" data-guiding-doc="${escapeHtml(doc.id)}" type="button">
+        <span class="knowledge-pick-toggle">${on ? "ON" : "OFF"}</span>
+        <span class="knowledge-pick-body">
+          <span class="knowledge-pick-title">${escapeHtml(doc.title)}</span>
+          <span class="knowledge-pick-meta">${escapeHtml(doc.path)} · ${doc.chars} chars</span>
+        </span>
+      </button>`;
+  });
+  els.guidingDialogList.innerHTML =
+    rows.join("") ||
+    '<div class="muted">지식 문서가 없습니다. 아래에서 만들거나, 메시지의 ... → Knowledging으로 첫 지식을 저장하세요.</div>';
+  els.guidingDialogList.querySelectorAll("[data-guiding-doc]").forEach((button) => {
+    button.addEventListener("click", () => toggleGuidingDoc(branch, button.dataset.guidingDoc));
+  });
+}
+
+async function toggleGuidingDoc(branch, docId) {
+  const selected = new Set(state.guiding || []);
+  if (selected.has(docId)) selected.delete(docId);
+  else selected.add(docId);
+  // Keep the document order stable so the injected prompt order is predictable.
+  const docs = (state.knowledge || []).map((doc) => doc.id).filter((id) => selected.has(id));
+  setGuidingStatus("저장 중…");
+  try {
+    const data = await api("/api/branch/guiding", {
+      method: "POST",
+      body: JSON.stringify({ branch, docs }),
+    });
+    state.guiding = Array.isArray(data.guiding) ? data.guiding : docs;
+    if (Array.isArray(data.documents)) state.knowledge = data.documents;
+    renderGuidingList(branch);
+    setGuidingButton(branch);
+    setGuidingStatus(
+      state.guiding.length ? `${state.guiding.length}개 문서를 항상 읽고 시작합니다.` : "주입 중인 지식 문서가 없습니다.",
+      "ok",
+    );
+  } catch (error) {
+    setGuidingStatus(`저장 실패: ${error.message}`, "error");
+  }
+}
+
+function setGuidingStatus(message, kind = "") {
+  if (!els.guidingDialogStatus) return;
+  els.guidingDialogStatus.textContent = message;
+  els.guidingDialogStatus.className = `settings-status ${kind}`.trim();
+}
+
+async function openGuidingDialog() {
+  const branch = els.guidingButton?.dataset.branch || "";
+  if (!branch || !els.guidingDialog) return;
+  els.guidingDialogTarget.textContent = branch;
+  els.guidingDialogNewInput.value = "";
+  setGuidingStatus("불러오는 중…");
+  els.guidingDialog.showModal();
+  try {
+    await refreshKnowledge(branch);
+    renderGuidingList(branch);
+    setGuidingStatus(
+      state.guiding.length ? `${state.guiding.length}개 문서를 항상 읽고 시작합니다.` : "주입 중인 지식 문서가 없습니다.",
+    );
+  } catch (error) {
+    setGuidingStatus(`불러오기 실패: ${error.message}`, "error");
+  }
+  els.guidingDialogNewForm.onsubmit = async (event) => {
+    event.preventDefault();
+    const title = (els.guidingDialogNewInput.value || "").trim();
+    if (!title) return;
+    setGuidingStatus("문서 생성 중…");
+    try {
+      const data = await api("/api/knowledge/create", {
+        method: "POST",
+        body: JSON.stringify({ title }),
+      });
+      state.knowledge = Array.isArray(data.documents) ? data.documents : state.knowledge;
+      els.guidingDialogNewInput.value = "";
+      renderGuidingList(branch);
+      setGuidingStatus(`${data.document?.path || title} 생성됨. ON으로 켜면 주입됩니다.`, "ok");
+    } catch (error) {
+      setGuidingStatus(`생성 실패: ${error.message}`, "error");
+    }
+  };
+}
+
+els.guidingButton?.addEventListener("click", () => {
+  openGuidingDialog();
+});
+
+// --- Knowledging ------------------------------------------------------------
+//
+// Storing knowledge is always a deliberate action: nothing is captured unless
+// the user opens this modal from a message and says what to keep.
+
+function setKnowledgingStatus(message, kind = "") {
+  if (!els.knowledgingStatus) return;
+  els.knowledgingStatus.textContent = message;
+  els.knowledgingStatus.className = `settings-status ${kind}`.trim();
+}
+
+function renderKnowledgingDocOptions() {
+  const options = (state.knowledge || []).map(
+    (doc) => `<option value="${escapeHtml(doc.id)}">${escapeHtml(doc.title)} (${escapeHtml(doc.path)})</option>`,
+  );
+  options.push('<option value="__new__">+ 새 문서 만들기</option>');
+  els.knowledgingDoc.innerHTML = options.join("");
+  // Default to the branch's first guiding document, which is the one already in
+  // effect here and therefore the likeliest target.
+  const preferred = (state.guiding || [])[0];
+  if (preferred && (state.knowledge || []).some((doc) => doc.id === preferred)) {
+    els.knowledgingDoc.value = preferred;
+  } else if (!state.knowledge?.length) {
+    els.knowledgingDoc.value = "__new__";
+  }
+  syncKnowledgingNewField();
+}
+
+function syncKnowledgingNewField() {
+  const isNew = els.knowledgingDoc.value === "__new__";
+  els.knowledgingNewField.hidden = !isNew;
+}
+
+async function openKnowledgingDialog(button) {
+  const branch = state.activeBranch;
+  if (!branch || !els.knowledgingDialog) return;
+  const index = Number.parseInt(button.dataset.knowledging || "", 10);
+  const message = (state.payload?.history || [])[index];
+  if (!message) return;
+  state.knowledgingSource = {
+    branch,
+    index,
+    role: message.role || "",
+    createdAt: message.createdAt || "",
+    text: String(message.text || ""),
+  };
+  els.knowledgingSource.textContent = `${message.role}: ${String(message.text || "").slice(0, 600)}`;
+  els.knowledgingInstruction.value = "";
+  els.knowledgingNewInput.value = "";
+  els.knowledgingResult.hidden = true;
+  els.knowledgingResult.textContent = "";
+  setKnowledgingStatus("");
+  renderKnowledgingDocOptions();
+  els.knowledgingDialog.showModal();
+  els.knowledgingInstruction.focus();
+  try {
+    await refreshKnowledge(branch);
+    const previous = els.knowledgingDoc.value;
+    renderKnowledgingDocOptions();
+    if (previous && [...els.knowledgingDoc.options].some((option) => option.value === previous)) {
+      els.knowledgingDoc.value = previous;
+      syncKnowledgingNewField();
+    }
+  } catch (error) {
+    setKnowledgingStatus(`문서 목록을 불러오지 못했습니다: ${error.message}`, "error");
+  }
+}
+
+els.knowledgingDoc?.addEventListener("change", syncKnowledgingNewField);
+
+els.knowledgingForm?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const source = state.knowledgingSource;
+  if (!source) return;
+  const instruction = (els.knowledgingInstruction.value || "").trim();
+  if (!instruction) {
+    setKnowledgingStatus("무엇을 저장할지 적어주세요.", "error");
+    return;
+  }
+  const previousLabel = els.knowledgingSubmit.textContent;
+  els.knowledgingSubmit.disabled = true;
+  els.knowledgingSubmit.textContent = "저장 중…";
+  els.knowledgingResult.hidden = true;
+  try {
+    let docId = els.knowledgingDoc.value;
+    if (docId === "__new__") {
+      const title = (els.knowledgingNewInput.value || "").trim();
+      if (!title) throw new Error("새 문서 이름을 입력하세요.");
+      setKnowledgingStatus("문서 생성 중…");
+      const created = await api("/api/knowledge/create", {
+        method: "POST",
+        body: JSON.stringify({ title }),
+      });
+      state.knowledge = Array.isArray(created.documents) ? created.documents : state.knowledge;
+      docId = created.document?.id;
+      if (!docId) throw new Error("문서를 만들지 못했습니다.");
+    }
+    setKnowledgingStatus("지식으로 정리하는 중… (모델 호출)");
+    const data = await api("/api/knowledge/append", {
+      method: "POST",
+      body: JSON.stringify({
+        branch: source.branch,
+        doc: docId,
+        instruction,
+        source: source.text,
+      }),
+    });
+    if (Array.isArray(data.documents)) state.knowledge = data.documents;
+    setKnowledgingStatus(`${data.summary || "저장했습니다."} → ${data.document?.path || ""}`, "ok");
+    els.knowledgingResult.textContent = data.entry || "";
+    els.knowledgingResult.hidden = !data.entry;
+    els.knowledgingInstruction.value = "";
+    renderKnowledgingDocOptions();
+    if (docId) {
+      els.knowledgingDoc.value = docId;
+      syncKnowledgingNewField();
+    }
+    setGuidingButton(source.branch);
+  } catch (error) {
+    setKnowledgingStatus(`저장 실패: ${error.message}`, "error");
+  } finally {
+    els.knowledgingSubmit.disabled = false;
+    els.knowledgingSubmit.textContent = previousLabel;
+  }
+});
 
 function renderBranches() {
   if (els.contextChatButton) {
@@ -3248,9 +3499,12 @@ function renderBranch(payload) {
     state.sequenceOrder = [];
     state.sequenceEvaluator = null;
   }
+  state.knowledge = Array.isArray(payload.knowledge) ? payload.knowledge : [];
+  state.guiding = Array.isArray(payload.guiding) ? payload.guiding : [];
   els.activeTitle.textContent = meta.title || meta.id;
   setBranchDirButton(meta.id);
   setBranchParentButton(meta);
+  setGuidingButton(archived ? "" : meta.id);
   els.activeMeta.textContent = archived
     ? `${meta.id} · archived branch · read only`
     : `${meta.id} · history.jsonl is Git-tracked conversation history`;
@@ -3299,6 +3553,11 @@ function renderBranch(payload) {
                             aria-label="Message options"
                           >...</button>
                           <span class="message-options-menu">
+                            <button
+                              data-knowledging="${index}"
+                              type="button"
+                              title="Store this as guiding knowledge"
+                            >Knowledging</button>
                             <button
                               data-history-fork="${index}"
                               data-history-created-at="${escapeHtml(message.createdAt || "")}"
@@ -3377,6 +3636,13 @@ function renderBranch(payload) {
       const wasOpen = menu?.classList.contains("open");
       closeMessageMenus();
       if (menu && !wasOpen) menu.classList.add("open");
+    });
+  });
+  els.messageList.querySelectorAll("[data-knowledging]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      closeMessageMenus();
+      openKnowledgingDialog(button);
     });
   });
   els.messageList.querySelectorAll("[data-history-fork]").forEach((button) => {
@@ -5326,6 +5592,20 @@ els.teamButton.addEventListener("click", async () => {
   await sendComposerMessage({ mode: "team", runningAction: "stop" });
 });
 
+function setGuidingButton(branchId) {
+  if (!els.guidingButton) return;
+  if (!branchId) {
+    els.guidingButton.hidden = true;
+    delete els.guidingButton.dataset.branch;
+    return;
+  }
+  els.guidingButton.dataset.branch = branchId;
+  els.guidingButton.hidden = false;
+  const count = (state.guiding || []).length;
+  els.guidingButton.textContent = count ? `Guiding · ${count}` : "Guiding";
+  els.guidingButton.setAttribute("aria-pressed", String(count > 0));
+}
+
 function setBranchDirButton(branchId) {
   if (!els.openBranchDirButton) return;
   // The "new branch from chat" button is contexts-chat only; renderContextChat
@@ -5337,6 +5617,8 @@ function setBranchDirButton(branchId) {
   } else {
     delete els.openBranchDirButton.dataset.branch;
     els.openBranchDirButton.hidden = true;
+    // Guiding is branch-scoped; every non-branch view routes through here.
+    setGuidingButton("");
     // No active branch: hide the parent button too (renderBranch re-shows it).
     if (els.parentBranchButton) {
       els.parentBranchButton.hidden = true;
