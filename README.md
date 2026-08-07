@@ -293,6 +293,31 @@ Codex binary bundled with the VS Code/Cursor ChatGPT extension. If your setup is
 elsewhere, set `CTXGIT_CODEX_BIN` in this repository's `.env` file to the full
 path of `codex.exe`.
 
+### MCP servers you already have
+
+ctxgit does not isolate the agent from the MCP servers configured on the
+machine, so a server you added to your own Claude Code (`~/.claude.json`) is
+usable from ctxgit chat turns with no ctxgit-side work. Each CLI reads its own
+list, so registering a server for one provider does not register it for the
+other:
+
+| Provider | Server list |
+| --- | --- |
+| `claude` | `~/.claude.json` |
+| `codex` | `~/.codex/config.toml` (`codex mcp add <name> -- <command>`) |
+
+For Codex, add `default_tools_approval_mode = "approve"` to the server's block.
+ctxgit runs Codex non-interactively (`--ask-for-approval never exec`), and
+without that setting the turn is cancelled when the agent calls the server. A
+stdio server launched through `npx` may also time out on its very first call
+while the package downloads; the next call succeeds.
+
+The exception is Google. The hosted `gmail` and `drive` servers expose write
+tools (`create_draft`, `create_file`, label changes) that duplicate ctxgit's
+Google extension, so ctxgit denies those two servers by name
+(`SUPERSEDED_HOST_MCP_SERVERS`). Google stays reachable through the extension's
+read-only `mcp__google__*` tools. No other inherited server is affected.
+
 ```bash
 codex login status
 codex login --device-auth

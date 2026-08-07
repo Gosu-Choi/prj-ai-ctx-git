@@ -615,6 +615,18 @@ def active_extension_mcp_config() -> dict[str, Any]:
     return {ext.ID: extension_mcp_server_spec(ext) for ext in active_extensions()}
 
 
+# MCP servers from the host's own Claude Code config that ctxgit replaces with a
+# narrower extension of its own. ctxgit does not pass --strict-mcp-config, so
+# everything in `~/.claude.json` stays reachable; that is how a user-configured
+# server like chrome-devtools works here without any ctxgit support. Google is
+# the exception: the hosted `gmail`/`drive` servers offer write tools
+# (create_draft, create_file, label changes) that duplicate ctxgit's Google
+# extension and would silently undo the read-only guarantee it exists to provide.
+# Denying them by server name leaves ctxgit's read-only `mcp__google__*` as the
+# only Google surface, without touching any other inherited server.
+SUPERSEDED_HOST_MCP_SERVERS = ("mcp__gmail", "mcp__drive")
+
+
 def apply_codex_extension_mcps(cmd: list[str], root: Path) -> None:
     """Register every active extension's stdio MCP server on a Codex command.
 
@@ -7554,6 +7566,11 @@ def claude_disallowed_tools(*, writable: bool, web_search: bool, subagents: bool
     session, so it can't coexist with remote MCP extensions (Gmail/Drive). We
     achieve the same read-only / no-web / no-subagent restriction with
     `--disallowedTools`, which leaves MCP tools untouched.
+
+    That openness is deliberate — it is what lets a server the user configured in
+    their own Claude Code (`~/.claude.json`), such as chrome-devtools, work here
+    too — but it also lets SUPERSEDED_HOST_MCP_SERVERS through, so those are
+    denied by name here.
     """
     disallowed: list[str] = []
     if not writable:
@@ -7562,6 +7579,7 @@ def claude_disallowed_tools(*, writable: bool, web_search: bool, subagents: bool
         disallowed.extend(["WebSearch", "WebFetch"])
     if not subagents:
         disallowed.append("Task")
+    disallowed.extend(SUPERSEDED_HOST_MCP_SERVERS)
     return ",".join(disallowed)
 
 

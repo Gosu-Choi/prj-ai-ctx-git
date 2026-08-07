@@ -204,6 +204,36 @@ class ClaudeCommandTest(unittest.TestCase):
                 ctxgit.subprocess.run = original
 
 
+class SupersededHostMcpTest(unittest.TestCase):
+    def test_hosted_google_servers_are_denied_on_every_claude_path(self) -> None:
+        # ctxgit deliberately omits --strict-mcp-config so a server the user
+        # configured in their own Claude Code (chrome-devtools) works here too.
+        # The hosted gmail/drive servers ride in through that same door carrying
+        # write tools, which would undo the read-only Google extension, so they
+        # must be denied whether or not the turn is writable.
+        for writable in (False, True):
+            for web_search in (False, True):
+                denied = ctxgit.claude_disallowed_tools(
+                    writable=writable, web_search=web_search
+                ).split(",")
+                self.assertIn("mcp__gmail", denied)
+                self.assertIn("mcp__drive", denied)
+                # Denying by server name must not catch any other inherited
+                # server, and must never touch ctxgit's own Google extension.
+                self.assertFalse([d for d in denied if d.startswith("mcp__chrome")])
+                self.assertFalse([d for d in denied if d.startswith("mcp__google")])
+
+    def test_ctxgit_google_extension_exposes_only_read_tools(self) -> None:
+        google = [n for n in ctxgit.active_extension_mcp_tool_names()
+                  if n.startswith("mcp__google__")]
+        if not google:
+            self.skipTest("google extension not configured on this machine")
+        # e.g. mcp__google__gmail_search, mcp__google__drive_read_file — a write
+        # verb (create/copy/label/send) must never appear.
+        for name in google:
+            self.assertRegex(name, r"_(search|get|list|read)(_|$)")
+
+
 class ClaudeStreamParsingTest(unittest.TestCase):
     """stream-json is JSONL; the final `result` event carries the payload."""
 
