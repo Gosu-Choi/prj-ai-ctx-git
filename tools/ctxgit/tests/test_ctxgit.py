@@ -1699,6 +1699,49 @@ class CtxgitTest(unittest.TestCase):
             self.assertEqual(meta["forkedAtCreatedAt"], second["createdAt"])
             self.assertEqual(list(store.iter_history("forked"))[0]["createdAt"], first["createdAt"])
 
+    def test_fork_starts_in_the_same_folder_as_its_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.init()
+            store.create_branch("source", title="Source")
+            for i in range(3):
+                store.append_history("source", "user", f"m{i}")
+                # Turn commits make the fork restore from an internal-git snapshot,
+                # which is the path where the folder used to be lost.
+                ctxgit.internal_git_commit_turn(
+                    store, kind="chat", actor="user", summary=f"turn {i}", branch_id="source",
+                )
+            # Folder assigned *after* those snapshots: the restored branch.json
+            # predates it, so the fork must read the source's current metadata.
+            store.set_branch_folder("source", "Sales")
+
+            store.fork_branch_at_history("source", "forked", 1)
+            store.fork_context_at_history("source", "forked_ctx", 1)
+            store.clone_branch("source", "cloned")
+
+            for branch in ("forked", "forked_ctx", "cloned"):
+                meta = ctxgit.load_json(root / "contexts" / "branches" / branch / "branch.json")
+                self.assertEqual(meta.get("folder"), "Sales", branch)
+            forked_meta = ctxgit.load_json(root / "contexts" / "branches" / "forked" / "branch.json")
+            self.assertEqual(forked_meta.get("forkedSnapshot"), "internal-git")
+
+    def test_fork_of_an_ungrouped_branch_stays_ungrouped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.init()
+            store.create_branch("loose", title="Loose")
+            store.append_history("loose", "user", "hello")
+            ctxgit.internal_git_commit_turn(
+                store, kind="chat", actor="user", summary="turn", branch_id="loose",
+            )
+
+            store.fork_branch_at_history("loose", "loose_fork", 0)
+
+            meta = ctxgit.load_json(root / "contexts" / "branches" / "loose_fork" / "branch.json")
+            self.assertNotIn("folder", meta)
+
     def test_fork_branch_restores_all_branch_files_from_turn_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

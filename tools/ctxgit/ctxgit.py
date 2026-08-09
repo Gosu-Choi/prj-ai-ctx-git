@@ -2462,6 +2462,16 @@ class ContextStore:
         meta = load_json(target_paths.meta)
         source_title = str(meta.get("title") or source_id)
         self.reset_copied_branch_lineage(meta)
+        # A fork starts beside the branch it came from. Take the folder from the
+        # source's *current* metadata, not from the copied tree: restoring an old
+        # internal-git snapshot brings back the branch.json of that moment, which
+        # predates any folder assigned since and would drop the fork out of the
+        # sidebar group its parent lives in.
+        source_folder = str(load_json(source_paths.meta).get("folder") or "").strip()
+        if source_folder:
+            meta["folder"] = source_folder
+        else:
+            meta.pop("folder", None)
         meta["id"] = validate_id(target_id, "branch")
         meta["title"] = title or f"{source_title} fork"
         meta["forkedFrom"] = validate_id(source_id, "branch")
