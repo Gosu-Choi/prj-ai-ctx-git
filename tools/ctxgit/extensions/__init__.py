@@ -15,13 +15,16 @@ import json
 import sys
 from typing import Any
 
-from . import google, instagram
+from . import adit, google, instagram
 
-# Ordered registry of available extensions (module objects). Every extension is
-# a stdio MCP server ctxgit spawns; each keeps its own secrets in its own .env.
+# Ordered registry of available extensions (module objects). Most extensions are
+# a stdio MCP server ctxgit hosts itself; each keeps its own secrets in its own
+# .env. An extension may instead declare `mcp_servers()` to hand the agent
+# external MCP servers it does not implement (see `adit`).
 _REGISTRY: dict[str, Any] = {
     instagram.ID: instagram,
     google.ID: google,
+    adit.ID: adit,
 }
 
 
@@ -44,8 +47,29 @@ def metadata(ext: Any) -> dict[str, Any]:
 
 
 def mcp_tool_names(ext: Any) -> tuple[str, ...]:
-    """Fully-qualified tool names for an extension (used in Claude allowlists)."""
-    return tuple(f"mcp__{ext.ID}__{tool['name']}" for tool in ext.MCP_TOOLS)
+    """Fully-qualified tool names for an extension (used in Claude allowlists).
+
+    Empty for an extension that only forwards external servers: their tool names
+    live in those servers, not here. That costs nothing, because ctxgit gates
+    Claude with a denylist rather than an allowlist.
+    """
+    return tuple(f"mcp__{ext.ID}__{tool['name']}" for tool in getattr(ext, "MCP_TOOLS", ()))
+
+
+def mcp_servers(ext: Any) -> dict[str, dict[str, Any]]:
+    """MCP servers an extension contributes, keyed by the name the agent sees.
+
+    Returns an empty mapping for a ctxgit-hosted extension; ctxgit supplies the
+    `ctxgit mcp-extension <id>` spec for those itself.
+    """
+    provider = getattr(ext, "mcp_servers", None)
+    if not callable(provider):
+        return {}
+    try:
+        servers = provider()
+    except Exception:  # noqa: BLE001 - a broken add-on must not break a chat turn
+        return {}
+    return servers if isinstance(servers, dict) else {}
 
 
 def run_mcp_server(ext: Any) -> int:

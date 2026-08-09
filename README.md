@@ -318,6 +318,33 @@ Google extension, so ctxgit denies those two servers by name
 (`SUPERSEDED_HOST_MCP_SERVERS`). Google stays reachable through the extension's
 read-only `mcp__google__*` tools. No other inherited server is affected.
 
+### Forwarding MCP servers ctxgit does not implement
+
+An extension normally *is* one stdio MCP server ctxgit hosts (`MCP_TOOLS` +
+`ctxgit mcp-extension <id>`). An extension may instead declare `mcp_servers()`
+and forward servers that already exist elsewhere, contributing several under
+their own names while staying a single entry in the Extensions sidebar. The
+`adit` extension ("Adit MCP") does this for the in-house Adit MCP servers, and
+both providers get them from the same declaration.
+
+Its server list lives in `extensions/adit/servers.json`, so wiring up a newly
+built MCP is a data change:
+
+```json
+{ "id": "adit-lens", "command": "node", "args": ["mcp/server.mjs"],
+  "cwd": "adit-lens", "env": { "TOKEN": "${ADIT_LENS_TOKEN}" },
+  "requires": ["ADIT_LENS_TOKEN"] }
+```
+
+- `${VAR}` resolves from the extension's own `.env` first, then the environment.
+- A server whose `requires` are unmet, or whose checkout is missing, is skipped
+  with a reason (`ctxgit provider status`) instead of being offered broken — a
+  half-configured setup still hands over the servers that do work.
+- Forwarded servers are always spawned through `ctxgit mcp-server <ext> <id>`,
+  never directly. Provider wiring puts specs on argv (Codex `-c`, Claude
+  `--mcp-config`) and argv is readable by any process on the machine, so the
+  launcher resolves cwd and secrets inside the child process instead.
+
 ```bash
 codex login status
 codex login --device-auth

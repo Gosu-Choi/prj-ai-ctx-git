@@ -204,6 +204,51 @@ class ClaudeCommandTest(unittest.TestCase):
                 ctxgit.subprocess.run = original
 
 
+class ExternalExtensionMcpTest(unittest.TestCase):
+    """An extension may forward MCP servers it does not implement (e.g. `adit`)."""
+
+    def test_external_servers_are_launched_through_ctxgit_not_directly(self) -> None:
+        # Provider wiring puts these specs on argv, and argv is world-readable via
+        # `ps`. Secrets must therefore reach the server through the launcher's
+        # environment, never through the command line.
+        servers = ctxgit.active_extension_mcp_servers()
+        adit = ctxgit.extensions.get_extension("adit")
+        declared = ctxgit.extensions.mcp_servers(adit)
+        if not declared:
+            self.skipTest("no Adit MCP server configured on this machine")
+        for name in declared:
+            self.assertIn(name, servers)
+            spec = servers[name]
+            self.assertEqual(spec["command"], sys.executable)
+            self.assertIn("mcp-server", spec["args"])
+            self.assertNotIn("env", spec)
+            self.assertNotIn("cwd", spec)
+
+    def test_no_secret_reaches_the_command_line_on_either_provider(self) -> None:
+        declared = ctxgit.extensions.mcp_servers(ctxgit.extensions.get_extension("adit"))
+        secrets = [
+            str(v) for spec in declared.values()
+            for k, v in (spec.get("env") or {}).items()
+            if "SECRET" in k.upper() or "TOKEN" in k.upper()
+        ]
+        if not secrets:
+            self.skipTest("no Adit MCP secret configured on this machine")
+        codex_cmd: list[str] = []
+        ctxgit.apply_codex_extension_mcps(codex_cmd, Path("."))
+        surface = json.dumps(ctxgit.active_extension_mcp_config()) + " ".join(codex_cmd)
+        for secret in secrets:
+            self.assertNotIn(secret, surface)
+
+    def test_unconfigured_server_is_skipped_not_offered_broken(self) -> None:
+        adit = ctxgit.extensions.get_extension("adit")
+        ready = set(ctxgit.extensions.mcp_servers(adit))
+        for row in adit.server_status():
+            # Every declared server is either offered, or withheld with a reason.
+            self.assertEqual(row["ready"], row["id"] in ready)
+            if not row["ready"]:
+                self.assertTrue(row["reason"])
+
+
 class SupersededHostMcpTest(unittest.TestCase):
     def test_hosted_google_servers_are_denied_on_every_claude_path(self) -> None:
         # ctxgit deliberately omits --strict-mcp-config so a server the user

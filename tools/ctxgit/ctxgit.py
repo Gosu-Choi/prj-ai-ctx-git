@@ -610,9 +610,80 @@ def active_extension_mcp_tool_names() -> list[str]:
     return names
 
 
+def extension_mcp_launch_spec(ext: Any, server_id: str) -> dict[str, Any]:
+    """How the agent spawns one of an extension's *external* MCP servers.
+
+    Always routed through `ctxgit mcp-server`, never spawned directly, so the
+    server's cwd and environment stay off the command line. Provider wiring puts
+    this spec on argv (Codex `-c`, Claude `--mcp-config`), and argv is readable
+    by any process on the machine — an inlined token would leak to `ps`.
+    """
+    return {
+        "command": sys.executable,
+        "args": [str(Path(__file__).resolve()), "mcp-server", ext.ID, server_id],
+    }
+
+
+def active_extension_mcp_servers() -> dict[str, dict[str, Any]]:
+    """Every MCP server the active extensions contribute, keyed by server name.
+
+    An extension is normally one ctxgit-hosted server named after the extension.
+    An extension that declares `mcp_servers()` instead forwards external servers
+    it does not implement, and may contribute several under their own names — so
+    a bundle like `adit` shows up as one Extensions entry but several servers.
+    """
+    servers: dict[str, dict[str, Any]] = {}
+    for ext in active_extensions():
+        declared = extensions.mcp_servers(ext)
+        if declared:
+            for name in declared:
+                servers[str(name)] = extension_mcp_launch_spec(ext, str(name))
+        else:
+            servers[ext.ID] = extension_mcp_server_spec(ext)
+    return servers
+
+
+def run_extension_mcp_server(ext_id: str, server_id: str) -> int:
+    """Exec an extension-declared external MCP server, stdio passed straight through.
+
+    Resolves the spec (and its secrets) here, inside the child process, so they
+    reach the server through its environment instead of anyone's argv.
+    """
+    ext = extensions.get_extension(ext_id)
+    if ext is None:
+        die(f"unknown extension: {ext_id}")
+    spec = extensions.mcp_servers(ext).get(server_id)
+    if not spec:
+        available = ", ".join(extensions.mcp_servers(ext)) or "(none ready)"
+        die(f"unknown or unconfigured MCP server {server_id!r} for {ext_id}; ready: {available}")
+    command = str(spec.get("command") or "")
+    args = [str(a) for a in (spec.get("args") or [])]
+    cwd = str(spec.get("cwd") or "") or None
+    env = {**os.environ, **{str(k): str(v) for k, v in (spec.get("env") or {}).items()}}
+    if cwd:
+        try:
+            os.chdir(cwd)
+        except OSError as exc:
+            die(f"cannot enter {cwd} for {ext_id}/{server_id}: {exc}")
+    try:
+        os.execvpe(command, [command, *args], env)
+    except OSError as exc:
+        die(f"cannot start {ext_id}/{server_id} ({command}): {exc}")
+    return 0  # unreachable: execvpe replaces this process
+
+
 def active_extension_mcp_config() -> dict[str, Any]:
     """`mcpServers` config for every active extension (for Claude --mcp-config)."""
-    return {ext.ID: extension_mcp_server_spec(ext) for ext in active_extensions()}
+    config: dict[str, Any] = {}
+    for name, spec in active_extension_mcp_servers().items():
+        entry: dict[str, Any] = {"command": spec["command"], "args": list(spec.get("args") or [])}
+        # Only forward the optional keys when set: Claude rejects a null cwd.
+        if spec.get("cwd"):
+            entry["cwd"] = spec["cwd"]
+        if spec.get("env"):
+            entry["env"] = dict(spec["env"])
+        config[name] = entry
+    return config
 
 
 # MCP servers from the host's own Claude Code config that ctxgit replaces with a
@@ -636,11 +707,14 @@ def apply_codex_extension_mcps(cmd: list[str], root: Path) -> None:
     default_tools_approval_mode="approve" auto-approves the server's tool calls
     so the non-interactive `exec` run does not cancel them.
     """
-    for ext in active_extensions():
-        spec = extension_mcp_server_spec(ext)
-        cmd.extend(["-c", f"mcp_servers.{ext.ID}.command=" + json.dumps(spec["command"])])
-        cmd.extend(["-c", f"mcp_servers.{ext.ID}.args=" + json.dumps(spec["args"])])
-        cmd.extend(["-c", f'mcp_servers.{ext.ID}.default_tools_approval_mode="approve"'])
+    for name, spec in active_extension_mcp_servers().items():
+        cmd.extend(["-c", f"mcp_servers.{name}.command=" + json.dumps(spec["command"])])
+        cmd.extend(["-c", f"mcp_servers.{name}.args=" + json.dumps(list(spec.get("args") or []))])
+        if spec.get("cwd"):
+            cmd.extend(["-c", f"mcp_servers.{name}.cwd=" + json.dumps(spec["cwd"])])
+        for key, value in (spec.get("env") or {}).items():
+            cmd.extend(["-c", f"mcp_servers.{name}.env.{key}=" + json.dumps(str(value))])
+        cmd.extend(["-c", f'mcp_servers.{name}.default_tools_approval_mode="approve"'])
 
 
 def run_google_auth() -> int:
@@ -13315,6 +13389,13 @@ def build_parser() -> argparse.ArgumentParser:
     mcp_ext = sub.add_parser("mcp-extension", help="Run an extension's MCP server over stdio (used by chat agents)")
     mcp_ext.add_argument("extension", help="Extension id (e.g. instagram, google)")
 
+    mcp_srv = sub.add_parser(
+        "mcp-server",
+        help="Exec an extension-declared external MCP server over stdio (used by chat agents)",
+    )
+    mcp_srv.add_argument("extension", help="Extension id (e.g. adit)")
+    mcp_srv.add_argument("server", help="Server id declared by that extension (e.g. adit-analytics)")
+
     sub.add_parser("google-auth", help="One-time OAuth to grant ctxgit read-only Gmail + Drive access")
 
     worker = sub.add_parser("worker", help="Run a local Codex worker for a ctxgit server")
@@ -13353,6 +13434,9 @@ def main(argv: list[str] | None = None) -> int:
         if ext is None:
             die(f"unknown extension: {args.extension}")
         return extensions.run_mcp_server(ext)
+
+    if args.command == "mcp-server":
+        return run_extension_mcp_server(args.extension, args.server)
 
     if args.command == "google-auth":
         return run_google_auth()

@@ -1,0 +1,61 @@
+{
+  "_comment": [
+    "Adit MCP servers ctxgit hands to the chat agent (Claude and Codex alike).",
+    "Adding a server later is a data change: append an entry, nothing else.",
+    "",
+    "  id       server name the agent sees (tools arrive as mcp__<id>__*)",
+    "  command  executable; `args` are passed verbatim",
+    "  cwd      working directory; relative paths resolve against `root`",
+    "  root     optional base for cwd/args (defaults to `aditRoot` below)",
+    "  env      values may reference the host environment as ${VAR};",
+    "           an unresolved ${VAR} makes that one server inactive rather",
+    "           than breaking the others",
+    "  requires env vars that must resolve for the server to be offered",
+    "  enabled  set false to keep an entry without offering it",
+    "",
+    "Secrets belong in this directory's .env (git-ignored), not here."
+  ],
+  "aditRoot": "/Users/gosu/Developer/Adit-ctxgit-package/adit-context/contexts/Rdod-Corporation",
+  "servers": [
+    {
+      "id": "adit-console",
+      "label": "ADIT 콘솔 (광고주·파트너·캠페인·정산)",
+      "enabled": true,
+      "command": "npm",
+      "args": ["run", "--silent", "mcp"],
+      "cwd": "adit-backend",
+      "env": {
+        "MCP_ADMIN_TOKEN": "${ADIT_MCP_ADMIN_TOKEN}"
+      },
+      "requires": ["ADIT_MCP_ADMIN_TOKEN"]
+    },
+    {
+      "id": "adit-analytics",
+      "label": "Adit Analytics (방문자·세션 읽기)",
+      "enabled": true,
+      "command": "node",
+      "args": ["mcp/server.mjs"],
+      "cwd": "adit-analytics",
+      "env": {
+        "ANALYTICS_URL": "https://analytics.adit.now",
+        "CF_ACCESS_CLIENT_ID": "8f60eb2eed444dfa7192e7087bc306e4.access",
+        "CF_ACCESS_CLIENT_SECRET": "${ADIT_ANALYTICS_MCP_SECRET}"
+      },
+      "requires": ["ADIT_ANALYTICS_MCP_SECRET"]
+    },
+    {
+      "id": "adit-ablab",
+      "label": "A/B Lab (실험 스펙·구현 제출)",
+      "enabled": true,
+      "command": "node",
+      "args": ["mcp/server.mjs"],
+      "cwd": "AB-Lab",
+      "env": {
+        "ABLAB_URL": "https://ablab.adit.now",
+        "CF_ACCESS_CLIENT_ID": "a23bcee48df93afb45c6a6be41595d6a.access",
+        "CF_ACCESS_CLIENT_SECRET": "${ABLAB_MCP_SECRET}"
+      },
+      "requires": ["ABLAB_MCP_SECRET"]
+    }
+  ]
+}
