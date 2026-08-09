@@ -487,9 +487,17 @@ class CtxgitTest(unittest.TestCase):
         self.assertEqual(ctxgit.humanize_output_text("a​b﻿c"), "abc")
         self.assertEqual(ctxgit.humanize_output_text("full（x）："), "full(x):")
 
-    def test_humanize_output_text_preserves_middle_dot_and_bullets(self) -> None:
-        # These are context-dependent and intentionally left untouched.
-        self.assertEqual(ctxgit.humanize_output_text("A·B • item ▪ ▶"), "A·B • item ▪ ▶")
+    def test_humanize_output_text_turns_middle_dots_into_slashes(self) -> None:
+        # In Korean the middle dot joins peers, which a person types as a slash.
+        self.assertEqual(ctxgit.humanize_output_text("기술·운영"), "기술/운영")
+        self.assertEqual(ctxgit.humanize_output_text("패션·뷰티·푸드"), "패션/뷰티/푸드")
+        # U+2027 renders identically and shows up in model output too.
+        self.assertEqual(ctxgit.humanize_output_text("A‧B"), "A/B")
+
+    def test_humanize_output_text_preserves_bullets(self) -> None:
+        # A bullet opens a list item; swapping it for punctuation would break the
+        # markdown rather than de-AI the prose.
+        self.assertEqual(ctxgit.humanize_output_text("• item ▪ ▶"), "• item ▪ ▶")
 
     def test_auth_store_first_signup_login_and_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

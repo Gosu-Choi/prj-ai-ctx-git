@@ -477,15 +477,19 @@ def output_humanize_enabled() -> bool:
 
 
 # Unicode typography -> plain keyboard equivalents, so AI output reads as if a
-# person typed it. Ordered; longer/more-specific sources first. Deliberately
-# omits the middle dot (·) and bullets (• ▪ ◦ ▶) because their replacement is
-# context-dependent (comma / slash / "와/과" / markdown bullet) and a blanket
-# swap does more harm than good -- detect those by eye instead.
+# person typed it. Ordered; longer/more-specific sources first.
+#
+# The middle dot maps to a slash: in Korean it joins peers ("기술·운영",
+# "패션·뷰티·푸드"), which is what a person types as "기술/운영". Bullets
+# (• ▪ ◦ ▶) stay out — a bullet opens a list item, so swapping it for punctuation
+# would break the markdown rather than de-AI the prose.
 _HUMANIZE_REPLACEMENTS: tuple[tuple[str, str], ...] = (
     ("—", "---"),   # — em dash
     ("―", "---"),   # ― horizontal bar / Korean 줄표
     ("–", "--"),    # – en dash
     ("‒", "--"),    # ‒ figure dash
+    ("·", "/"),     # · middle dot (U+00B7) — 가운뎃점
+    ("‧", "/"),     # ‧ hyphenation point (U+2027) — same glyph, also emitted
     ("⇒", "=>"),    # ⇒
     ("→", "->"),    # →
     ("↔", "<->"),   # ↔
@@ -519,7 +523,7 @@ _EMOJI_RE = re.compile(
 def humanize_output_text(text: str) -> str:
     """Rewrite Unicode typography as plain keyboard characters.
 
-    Pure and deterministic. Leaves the middle dot and bullets alone (see note on
+    Pure and deterministic. Leaves bullets alone (see note on
     _HUMANIZE_REPLACEMENTS).
     """
     if not text:
