@@ -238,6 +238,35 @@ class ExtensionStalenessTest(unittest.TestCase):
                     thread.join(timeout=5)
             self.assertIn("stale", payload)
             self.assertIsInstance(payload["stale"], bool)
+            # "Changed" is only actionable next to when this process loaded, so
+            # both timestamps ship together.
+            self.assertTrue(payload["loadedAt"])
+            self.assertTrue(payload["changedAt"])
+            for ext in payload["extensions"]:
+                self.assertTrue(ext["updatedAt"], ext["id"])
+
+    def test_version_payload_reports_the_pending_edit_and_commit(self) -> None:
+        target = Path(ctxgit.extensions.__file__).resolve().parent / "adit" / "servers.json"
+        original = target.read_bytes()
+        try:
+            # No assertion on `before["stale"]`: a sibling test touches this same
+            # file, and restoring it moves the mtime, so the process may already
+            # be stale by now. What must hold is how the fields move.
+            before = ctxgit.extensions_version_payload()
+            time.sleep(0.01)
+            target.write_bytes(original + b"\n")
+            after = ctxgit.extensions_version_payload()
+            self.assertTrue(after["stale"])
+            # loadedAt pins the running version; changedAt moves with the edit.
+            self.assertEqual(after["loadedAt"], before["loadedAt"])
+            self.assertGreaterEqual(after["changedAt"], before["changedAt"])
+            self.assertGreater(after["changedAt"], after["loadedMtime"])
+            if after["commit"]:
+                # An uncommitted edit makes the commit date a misleading
+                # "last updated", so it is flagged.
+                self.assertTrue(after["commit"]["dirty"])
+        finally:
+            target.write_bytes(original)
 
 
 class ExternalExtensionMcpTest(unittest.TestCase):

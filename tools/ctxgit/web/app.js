@@ -103,6 +103,7 @@ const els = {
   extensionsBody: document.querySelector("#extensionsBody"),
   extensionList: document.querySelector("#extensionList"),
   extensionsStale: document.querySelector("#extensionsStale"),
+  extensionsVersion: document.querySelector("#extensionsVersion"),
   extensionContent: document.querySelector("#extensionContent"),
   contextChatButton: document.querySelector("#contextChatButton"),
   newFolderButton: document.querySelector("#newFolderButton"),
@@ -4672,18 +4673,61 @@ const EXTENSION_RENDERERS = {
 
 let openExtensionId = null;
 
+// "5분 전" / "2일 전" — an absolute UTC stamp is hard to judge staleness from.
+function timeAgo(iso) {
+  if (!iso) return "";
+  const then = new Date(iso).getTime();
+  if (!Number.isFinite(then)) return "";
+  const secs = Math.max(0, Math.round((Date.now() - then) / 1000));
+  if (secs < 60) return "방금";
+  const mins = Math.round(secs / 60);
+  if (mins < 60) return `${mins}분 전`;
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return `${hours}시간 전`;
+  return `${Math.round(hours / 24)}일 전`;
+}
+
+function renderExtensionsVersion(data) {
+  // Extension modules are imported once per server process, so an edit on disk
+  // does nothing until a restart. Say so rather than let it look applied, and
+  // show which edit is waiting.
+  if (els.extensionsStale) {
+    els.extensionsStale.hidden = data.stale !== true;
+    if (data.stale === true) {
+      els.extensionsStale.innerHTML =
+        `확장이 <strong>${escapeHtml(timeAgo(data.changedAt))}</strong> 수정되었습니다. ` +
+        `서버는 ${escapeHtml(timeAgo(data.loadedAt))} 로드된 버전으로 돌고 있어 재시작해야 반영됩니다.`;
+    }
+  }
+  if (!els.extensionsVersion) return;
+  const commit = data.commit || {};
+  const bits = [];
+  if (data.changedAt) bits.push(`수정 ${escapeHtml(timeAgo(data.changedAt))}`);
+  if (commit.hash) {
+    const dirty = commit.dirty ? ' <span class="ext-dirty">+ 미커밋</span>' : "";
+    bits.push(
+      `<code title="${escapeHtml(commit.subject || "")}">${escapeHtml(commit.hash)}</code>` +
+        ` ${escapeHtml(timeAgo(commit.date))}${dirty}`,
+    );
+  }
+  els.extensionsVersion.innerHTML = bits.join(" · ");
+  els.extensionsVersion.title = [
+    data.loadedAt ? `서버 로드: ${data.loadedAt}` : "",
+    data.changedAt ? `디스크 최종 수정: ${data.changedAt}` : "",
+    commit.subject ? `마지막 커밋: ${commit.subject}` : "",
+  ].filter(Boolean).join("\n");
+}
+
 async function loadExtensions() {
+  let data = {};
   try {
-    const data = await api("/api/extensions");
+    data = await api("/api/extensions");
     state.extensions = data.extensions || [];
-    // Extension modules are imported once per server process, so an edit on disk
-    // does nothing until a restart. Say so rather than let it look applied.
-    state.extensionsStale = data.stale === true;
   } catch (_error) {
     state.extensions = [];
-    state.extensionsStale = false;
+    data = {};
   }
-  if (els.extensionsStale) els.extensionsStale.hidden = !state.extensionsStale;
+  renderExtensionsVersion(data);
   renderExtensionList();
 }
 
@@ -4698,8 +4742,16 @@ function renderExtensionList() {
     button.type = "button";
     button.className = `nav-item extension-item${ext.id === openExtensionId ? " active" : ""}`;
     button.textContent = `${ext.icon} ${ext.name}`;
-    button.title = ext.description || "";
+    button.title = [ext.description || "", ext.updatedAt ? `수정: ${ext.updatedAt}` : ""]
+      .filter(Boolean)
+      .join("\n");
     button.addEventListener("click", () => openExtension(ext.id));
+    if (ext.updatedAt) {
+      const stamp = document.createElement("span");
+      stamp.className = "extension-updated";
+      stamp.textContent = timeAgo(ext.updatedAt);
+      button.appendChild(stamp);
+    }
 
     const toggle = document.createElement("input");
     toggle.type = "checkbox";

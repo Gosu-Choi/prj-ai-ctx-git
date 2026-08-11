@@ -3119,6 +3119,31 @@ button.section-toggle[aria-expanded="false"] .section-toggle-caret {
   overflow-y: auto;
 }
 
+.extensions-version {
+  padding: 0 2px 8px;
+  font-size: 10px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.extensions-version code {
+  font-size: 10px;
+  padding: 1px 3px;
+  border-radius: 3px;
+  background: var(--accent-soft);
+}
+
+.ext-dirty {
+  color: var(--warn, #b7791f);
+}
+
+.extension-updated {
+  margin-left: 6px;
+  font-size: 10px;
+  color: var(--muted);
+  font-weight: 400;
+}
+
 .extensions-stale {
   margin: 0 0 8px;
   padding: 7px 9px;

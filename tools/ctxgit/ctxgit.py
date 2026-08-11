@@ -585,8 +585,81 @@ def extension_status_payload() -> list[dict[str, Any]]:
     for ext in extensions.all_extensions():
         meta = extensions.metadata(ext)
         meta["enabled"] = extension_enabled(ext.ID)
+        meta["updatedAt"] = _mtime_iso(_extension_source_files(ext.ID))
         payload.append(meta)
     return payload
+
+
+def _extension_source_files(subdir: str = "") -> list[tuple[Path, os.stat_result]]:
+    """Files the extension registry is built from, with their stat.
+
+    `.py`/`.json` define the registry; `.env` decides whether an extension counts
+    as configured. `subdir` narrows this to one extension.
+    """
+    root = Path(extensions.__file__).resolve().parent
+    base = root / subdir if subdir else root
+    found: list[tuple[Path, os.stat_result]] = []
+    if not base.exists():
+        return found
+    for path in sorted(base.rglob("*")):
+        if "__pycache__" in path.parts or not path.is_file():
+            continue
+        if path.suffix not in {".py", ".json"} and path.name != ".env":
+            continue
+        try:
+            found.append((path.relative_to(root), path.stat()))
+        except OSError:
+            continue
+    return found
+
+
+def _mtime_iso(files: list[tuple[Path, os.stat_result]]) -> str:
+    """Newest mtime among these files, as UTC ISO-8601."""
+    if not files:
+        return ""
+    newest = max(stat.st_mtime for _, stat in files)
+    return (
+        datetime.fromtimestamp(newest, timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+_EXTENSION_GIT_CACHE: dict[str, dict[str, Any]] = {}
+
+
+def extensions_git_info() -> dict[str, Any]:
+    """Last commit touching the extensions package, plus whether it is dirty.
+
+    Best-effort: this lives in whatever repo ctxgit was checked out from, and
+    there may be none. Cached against the fingerprint so the poll does not shell
+    out to git on every request.
+    """
+    key = extensions_fingerprint()
+    cached = _EXTENSION_GIT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    root = Path(extensions.__file__).resolve().parent
+    info: dict[str, Any] = {}
+    try:
+        log = subprocess.run(
+            ["git", "-C", str(root), "log", "-1", "--format=%h%x1f%cI%x1f%s", "--", str(root)],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        if log.returncode == 0 and log.stdout.strip():
+            short, date, subject = (log.stdout.strip().split("\x1f", 2) + ["", ""])[:3]
+            info = {"hash": short, "date": date, "subject": subject}
+            status = subprocess.run(
+                ["git", "-C", str(root), "status", "--porcelain", "--", str(root)],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            # Uncommitted edits make the commit date a misleading "last updated".
+            info["dirty"] = bool(status.returncode == 0 and status.stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        info = {}
+    _EXTENSION_GIT_CACHE[key] = info
+    return info
 
 
 def extensions_fingerprint() -> str:
@@ -600,30 +673,37 @@ def extensions_fingerprint() -> str:
     Uses stat, not content: this runs on every `/api/extensions` poll, and a
     change to size or mtime is exactly the signal we need.
     """
-    root = Path(extensions.__file__).resolve().parent
-    parts: list[str] = []
-    for path in sorted(root.rglob("*")):
-        if "__pycache__" in path.parts or not path.is_file():
-            continue
-        # .py/.json define the registry; .env decides whether it is configured.
-        if path.suffix not in {".py", ".json"} and path.name != ".env":
-            continue
-        try:
-            stat = path.stat()
-        except OSError:
-            continue
-        parts.append(f"{path.relative_to(root)}:{stat.st_mtime_ns}:{stat.st_size}")
+    parts = [
+        f"{path}:{stat.st_mtime_ns}:{stat.st_size}"
+        for path, stat in _extension_source_files()
+    ]
     return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
 
 
-# Fingerprint captured when this process imported the registry. Compared against
-# the live one to tell the operator a restart is pending.
+# Captured when this process imported the registry, so the UI can contrast what
+# is running against what is on disk.
 _EXTENSIONS_FINGERPRINT_AT_START = extensions_fingerprint()
+_EXTENSIONS_LOADED_AT = utc_now()
+_EXTENSIONS_LOADED_MTIME = _mtime_iso(_extension_source_files())
 
 
 def extensions_are_stale() -> bool:
     """True when the extension files on disk no longer match what is loaded."""
     return extensions_fingerprint() != _EXTENSIONS_FINGERPRINT_AT_START
+
+
+def extensions_version_payload() -> dict[str, Any]:
+    """What is running vs what is on disk, for the Extensions section header."""
+    return {
+        "stale": extensions_are_stale(),
+        # When this process read the extensions, and how fresh they were then.
+        "loadedAt": _EXTENSIONS_LOADED_AT,
+        "loadedMtime": _EXTENSIONS_LOADED_MTIME,
+        # Newest mtime on disk right now: with stale=true, this is the edit
+        # waiting for a restart.
+        "changedAt": _mtime_iso(_extension_source_files()),
+        "commit": extensions_git_info(),
+    }
 
 
 def extension_active(ext: Any) -> bool:
@@ -11315,11 +11395,12 @@ def make_handler(
                 return True
             # Extensions are machine-level add-ons (no project context required).
             if parsed.path == "/api/extensions":
+                # Extension modules are imported once per process, so an edit on
+                # disk only takes effect after a restart. Surface that, with the
+                # timestamps needed to see *what* is waiting.
                 self.send_json({
                     "extensions": extension_status_payload(),
-                    # Extension modules are imported once per process, so an edit
-                    # on disk only takes effect after a restart. Surface that.
-                    "stale": extensions_are_stale(),
+                    **extensions_version_payload(),
                 })
                 return True
             if parsed.path == "/api/extensions/instagram/status":
