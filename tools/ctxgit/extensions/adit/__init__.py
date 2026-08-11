@@ -101,13 +101,14 @@ def server_status() -> list[dict[str, Any]]:
             name for name in (entry.get("requires") or [])
             if not _lookup(str(name))
         ]
-        cwd = _root_for(entry, config) / str(entry.get("cwd") or "")
-        exists = cwd.exists()
+        # A remote entry has a url instead of a local checkout to run.
+        url = str(entry.get("url") or "").strip()
+        cwd = "" if url else str(_root_for(entry, config) / str(entry.get("cwd") or ""))
         if not enabled:
             reason = "disabled in servers.json"
         elif missing:
             reason = f"missing env: {', '.join(missing)}"
-        elif not exists:
+        elif not url and not Path(cwd).exists():
             reason = f"path not found: {cwd}"
         else:
             reason = ""
@@ -116,7 +117,8 @@ def server_status() -> list[dict[str, Any]]:
             "label": str(entry.get("label") or server_id),
             "ready": not reason,
             "reason": reason,
-            "cwd": str(cwd),
+            "cwd": cwd,
+            "url": url,
         })
     return rows
 
@@ -134,6 +136,12 @@ def mcp_servers() -> dict[str, dict[str, Any]]:
     for entry in _entries():
         server_id = str(entry.get("id") or "").strip()
         if server_id not in ready:
+            continue
+        url = str(entry.get("url") or "").strip()
+        if url:
+            # Remote MCP: the provider CLI owns the OAuth token, so ctxgit passes
+            # the endpoint and nothing else. No credential ever reaches a spec.
+            specs[server_id] = {"url": url}
             continue
         root = _root_for(entry, config)
         env: dict[str, str] = {}

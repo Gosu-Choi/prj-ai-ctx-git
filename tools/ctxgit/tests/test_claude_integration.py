@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.request
 from pathlib import Path
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "ctxgit.py"
@@ -202,6 +203,41 @@ class ClaudeCommandTest(unittest.TestCase):
                     )
             finally:
                 ctxgit.subprocess.run = original
+
+
+class ExtensionStalenessTest(unittest.TestCase):
+    def test_fingerprint_changes_when_an_extension_file_changes(self) -> None:
+        # Python imports an extension module once per process, so an edit only
+        # lands on restart. The fingerprint is what lets the UI say so.
+        before = ctxgit.extensions_fingerprint()
+        self.assertEqual(before, ctxgit.extensions_fingerprint())  # stable
+
+        target = Path(ctxgit.extensions.__file__).resolve().parent / "adit" / "servers.json"
+        original = target.read_bytes()
+        try:
+            time.sleep(0.01)
+            target.write_bytes(original + b"\n")
+            self.assertNotEqual(before, ctxgit.extensions_fingerprint())
+        finally:
+            target.write_bytes(original)
+
+    def test_extensions_endpoint_reports_staleness(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ctxgit.ContextStore(root).init()
+            handler = ctxgit.make_handler(ctxgit.ProjectState(root), auth_required=False)
+            with ctxgit.ReusableThreadingHTTPServer(("127.0.0.1", 0), handler) as server:
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                base_url = f"http://127.0.0.1:{server.server_port}"
+                try:
+                    with urllib.request.urlopen(f"{base_url}/api/extensions", timeout=5) as response:
+                        payload = json.loads(response.read().decode("utf-8"))
+                finally:
+                    server.shutdown()
+                    thread.join(timeout=5)
+            self.assertIn("stale", payload)
+            self.assertIsInstance(payload["stale"], bool)
 
 
 class ExternalExtensionMcpTest(unittest.TestCase):

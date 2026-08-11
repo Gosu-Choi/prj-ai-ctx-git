@@ -102,6 +102,7 @@ const els = {
   extensionsToggle: document.querySelector("#extensionsToggle"),
   extensionsBody: document.querySelector("#extensionsBody"),
   extensionList: document.querySelector("#extensionList"),
+  extensionsStale: document.querySelector("#extensionsStale"),
   extensionContent: document.querySelector("#extensionContent"),
   contextChatButton: document.querySelector("#contextChatButton"),
   newFolderButton: document.querySelector("#newFolderButton"),
@@ -4675,9 +4676,14 @@ async function loadExtensions() {
   try {
     const data = await api("/api/extensions");
     state.extensions = data.extensions || [];
+    // Extension modules are imported once per server process, so an edit on disk
+    // does nothing until a restart. Say so rather than let it look applied.
+    state.extensionsStale = data.stale === true;
   } catch (_error) {
     state.extensions = [];
+    state.extensionsStale = false;
   }
+  if (els.extensionsStale) els.extensionsStale.hidden = !state.extensionsStale;
   renderExtensionList();
 }
 

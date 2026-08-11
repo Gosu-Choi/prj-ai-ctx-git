@@ -30,6 +30,22 @@
       "requires": ["ADIT_MCP_ADMIN_TOKEN"]
     },
     {
+      "id": "adit-remote",
+      "label": "ADIT 원격 MCP (api.adit.now) — OAuth",
+      "enabled": false,
+      "url": "https://api.adit.now/mcp",
+      "note": [
+        "Cognito OAuth로 보호된 원격 MCP다 (Bearer). ctxgit은 OAuth 플로우를 구현하지",
+        "않으므로 토큰은 각 CLI가 소유한다. 한 번만 아래를 실행해 로그인한 뒤",
+        "enabled를 true로 바꾼다:",
+        "  claude mcp add --transport http adit-remote https://api.adit.now/mcp",
+        "  codex  mcp add adit-remote --url https://api.adit.now/mcp",
+        "두 CLI 모두 user scope에 등록되면 ctxgit이 그대로 상속하므로, enabled를",
+        "켜지 않아도 채팅 턴에서는 이미 쓸 수 있다. 켜는 것은 Extensions 토글로",
+        "함께 끄고 켜고 싶을 때만."
+      ]
+    },
+    {
       "id": "adit-analytics",
       "label": "Adit Analytics (방문자·세션 읽기)",
       "enabled": true,

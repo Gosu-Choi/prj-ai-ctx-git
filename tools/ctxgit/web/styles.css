@@ -3119,6 +3119,17 @@ button.section-toggle[aria-expanded="false"] .section-toggle-caret {
   overflow-y: auto;
 }
 
+.extensions-stale {
+  margin: 0 0 8px;
+  padding: 7px 9px;
+  border: 1px solid var(--warn, #b7791f);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--warn, #b7791f) 12%, transparent);
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
 /* Google Workspace extension panel --------------------------------------- */
 .gw-status {
   display: flex;

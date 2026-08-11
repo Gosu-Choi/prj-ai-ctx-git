@@ -589,6 +589,43 @@ def extension_status_payload() -> list[dict[str, Any]]:
     return payload
 
 
+def extensions_fingerprint() -> str:
+    """Fingerprint of everything the extension registry is built from.
+
+    Python imports a module once per process, so editing an extension — or adding
+    one, or filling in its .env — changes nothing until the server restarts. The
+    UI compares this against the value taken at startup and says so, instead of
+    leaving the operator wondering why their edit had no effect.
+
+    Uses stat, not content: this runs on every `/api/extensions` poll, and a
+    change to size or mtime is exactly the signal we need.
+    """
+    root = Path(extensions.__file__).resolve().parent
+    parts: list[str] = []
+    for path in sorted(root.rglob("*")):
+        if "__pycache__" in path.parts or not path.is_file():
+            continue
+        # .py/.json define the registry; .env decides whether it is configured.
+        if path.suffix not in {".py", ".json"} and path.name != ".env":
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        parts.append(f"{path.relative_to(root)}:{stat.st_mtime_ns}:{stat.st_size}")
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+
+# Fingerprint captured when this process imported the registry. Compared against
+# the live one to tell the operator a restart is pending.
+_EXTENSIONS_FINGERPRINT_AT_START = extensions_fingerprint()
+
+
+def extensions_are_stale() -> bool:
+    """True when the extension files on disk no longer match what is loaded."""
+    return extensions_fingerprint() != _EXTENSIONS_FINGERPRINT_AT_START
+
+
 def extension_active(ext: Any) -> bool:
     """An extension's MCP tools are usable only when enabled AND configured."""
     return extension_enabled(ext.ID) and ext.configured()
@@ -640,8 +677,13 @@ def active_extension_mcp_servers() -> dict[str, dict[str, Any]]:
     for ext in active_extensions():
         declared = extensions.mcp_servers(ext)
         if declared:
-            for name in declared:
-                servers[str(name)] = extension_mcp_launch_spec(ext, str(name))
+            for name, spec in declared.items():
+                # A remote server is an endpoint, not a process: hand the URL
+                # straight to the provider, whose CLI owns the OAuth token.
+                if spec.get("url"):
+                    servers[str(name)] = {"url": str(spec["url"])}
+                else:
+                    servers[str(name)] = extension_mcp_launch_spec(ext, str(name))
         else:
             servers[ext.ID] = extension_mcp_server_spec(ext)
     return servers
@@ -680,6 +722,9 @@ def active_extension_mcp_config() -> dict[str, Any]:
     """`mcpServers` config for every active extension (for Claude --mcp-config)."""
     config: dict[str, Any] = {}
     for name, spec in active_extension_mcp_servers().items():
+        if spec.get("url"):
+            config[name] = {"type": "http", "url": spec["url"]}
+            continue
         entry: dict[str, Any] = {"command": spec["command"], "args": list(spec.get("args") or [])}
         # Only forward the optional keys when set: Claude rejects a null cwd.
         if spec.get("cwd"):
@@ -712,6 +757,10 @@ def apply_codex_extension_mcps(cmd: list[str], root: Path) -> None:
     so the non-interactive `exec` run does not cancel them.
     """
     for name, spec in active_extension_mcp_servers().items():
+        if spec.get("url"):
+            cmd.extend(["-c", f"mcp_servers.{name}.url=" + json.dumps(spec["url"])])
+            cmd.extend(["-c", f'mcp_servers.{name}.default_tools_approval_mode="approve"'])
+            continue
         cmd.extend(["-c", f"mcp_servers.{name}.command=" + json.dumps(spec["command"])])
         cmd.extend(["-c", f"mcp_servers.{name}.args=" + json.dumps(list(spec.get("args") or []))])
         if spec.get("cwd"):
@@ -11266,7 +11315,12 @@ def make_handler(
                 return True
             # Extensions are machine-level add-ons (no project context required).
             if parsed.path == "/api/extensions":
-                self.send_json({"extensions": extension_status_payload()})
+                self.send_json({
+                    "extensions": extension_status_payload(),
+                    # Extension modules are imported once per process, so an edit
+                    # on disk only takes effect after a restart. Surface that.
+                    "stale": extensions_are_stale(),
+                })
                 return True
             if parsed.path == "/api/extensions/instagram/status":
                 self.send_json({

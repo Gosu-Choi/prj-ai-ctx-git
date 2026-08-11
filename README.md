@@ -344,6 +344,21 @@ built MCP is a data change:
   never directly. Provider wiring puts specs on argv (Codex `-c`, Claude
   `--mcp-config`) and argv is readable by any process on the machine, so the
   launcher resolves cwd and secrets inside the child process instead.
+- An entry with `url` instead of `command` is a remote MCP. ctxgit passes only
+  the endpoint: the provider CLI owns the OAuth token, so no credential ever
+  reaches a spec. Register it once per CLI (`claude mcp add --transport http …`,
+  `codex mcp add … --url …`) and log in there.
+
+### Knowing when a restart is pending
+
+Python imports an extension module once per process, so editing an extension,
+adding one, or filling in its `.env` changes nothing until the server restarts.
+`/api/extensions` therefore returns `stale`, comparing a stat-based fingerprint
+of the extension package against the value taken at startup, and the sidebar
+says a restart is pending instead of leaving the edit looking applied.
+
+Guiding knowledge is *not* affected: `contexts/knowledge/*.md` is read fresh on
+every prompt build, so editing a knowledge document takes effect immediately.
 
 ```bash
 codex login status
