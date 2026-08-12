@@ -3217,6 +3217,19 @@ function resizeMessageInput() {
   input.style.height = `${nextHeight}px`;
 }
 
+// Which mode a running turn can be switched to, or null when switching makes no
+// sense (research/team have their own lifecycle; a sequence room is a room, not
+// a single turn).
+const MODE_SWAP = {
+  "chat": { to: "info-chat", fromLabel: "Send", toLabel: "Info chat" },
+  "info-chat": { to: "chat", fromLabel: "Info chat", toLabel: "Send" },
+};
+
+function modeSwapFor(busyMode, isSequenceRoom) {
+  if (isSequenceRoom) return null;
+  return MODE_SWAP[String(busyMode || "")] || null;
+}
+
 function updateComposerState() {
   const activeKey = activeChatKey();
   const running = activeBranchRunningJob(activeKey);
@@ -3241,11 +3254,25 @@ function updateComposerState() {
         : "Stop"
       : "Send";
   els.contextResetButton.textContent = busyMode === "context-chat" ? "Busy" : "Reset";
-  els.historyChatButton.textContent = archived
-    ? "Archived"
-    : running
-      ? "Stop"
-      : "Info chat";
+  // While a chat/info-chat turn runs, the right button switches the turn to the
+  // other mode instead of being a second Stop. Picking the wrong mode is easy,
+  // and the alternative was stopping and sending a throwaway "." to get back.
+  const swap = modeSwapFor(busyMode, isSequenceRoom);
+  if (archived) {
+    els.historyChatButton.textContent = "Archived";
+    els.historyChatButton.title = "";
+    els.historyChatButton.classList.remove("mode-swap");
+  } else if (running && swap) {
+    els.historyChatButton.innerHTML =
+      `Change<span class="mode-swap-detail">${escapeHtml(swap.fromLabel)} -> ${escapeHtml(swap.toLabel)}</span>`;
+    els.historyChatButton.title =
+      `이 턴을 멈추고 같은 메시지를 ${swap.toLabel}로 다시 보냅니다. 채팅에 남는 것은 없습니다.`;
+    els.historyChatButton.classList.add("mode-swap");
+  } else {
+    els.historyChatButton.textContent = running ? "Stop" : "Info chat";
+    els.historyChatButton.title = "";
+    els.historyChatButton.classList.remove("mode-swap");
+  }
   const claudeProvider = (state.provider?.provider || "codex") === "claude";
   const omcMode = state.provider?.orchestration === "omc";
   els.teamButton.hidden = contextMode || !omcMode;
@@ -5664,7 +5691,77 @@ els.providerSettings.addEventListener("submit", async (event) => {
   }
 });
 
+// Stop the running turn and re-run the same message in the other mode. The user
+// message is already in history (ctxgit records it before calling the model), so
+// this removes that record and resends it rather than typing anything new —
+// nothing extra ends up in the chat.
+async function switchRunningTurnMode(swap) {
+  const branch = activeChatKey();
+  const job = activeBranchRunningJob(branch);
+  if (!branch || !job) return;
+  const previousLabel = els.historyChatButton.textContent;
+  els.historyChatButton.disabled = true;
+  try {
+    await cancelTrackedJob(job);
+    // Re-read history: the pending UI record is not the stored one, and the
+    // turn may have written more before it stopped.
+    const payload = await api(
+      branch === CONTEXT_CHAT_KEY
+        ? "/api/context-chat"
+        : `/api/branch?id=${encodeURIComponent(branch)}`,
+    );
+    if (branch === CONTEXT_CHAT_KEY) renderContextChat(payload);
+    else renderBranch(payload);
+    const history = payload.history || [];
+    let index = -1;
+    for (let i = history.length - 1; i >= 0; i -= 1) {
+      if (history[i]?.role === "user") { index = i; break; }
+      // Only reuse a trailing user message; if the turn already answered,
+      // there is nothing to re-run.
+      if (history[i]?.role === "assistant") break;
+    }
+    if (index < 0) {
+      showChatError("다시 보낼 사용자 메시지를 찾지 못했습니다. 직접 다시 보내주세요.");
+      return;
+    }
+    const message = history[index];
+    const text = String(message.text || "");
+    if (!text.trim()) return;
+    if (branch !== CONTEXT_CHAT_KEY) {
+      const cleaned = await api("/api/history/delete", {
+        method: "POST",
+        body: JSON.stringify({
+          branch,
+          index,
+          createdAt: message.createdAt || "",
+          role: message.role || "",
+        }),
+      });
+      if (state.activeBranch === branch) renderBranch(cleaned);
+    }
+    els.messageInput.value = text;
+    resizeMessageInput();
+    await sendComposerMessage({ mode: swap.to, runningAction: "stop" });
+  } catch (error) {
+    showChatError(`모드 전환 실패: ${error.message}`);
+  } finally {
+    els.historyChatButton.disabled = false;
+    if (els.historyChatButton.textContent === "") els.historyChatButton.textContent = previousLabel;
+    updateComposerState();
+  }
+}
+
 els.historyChatButton.addEventListener("click", async () => {
+  const activeKey = activeChatKey();
+  const running = activeBranchRunningJob(activeKey);
+  const swap = modeSwapFor(
+    running?.mode || state.startingBranches[activeKey],
+    state.payload?.meta?.kind === "sequence-room",
+  );
+  if (running && swap) {
+    await switchRunningTurnMode(swap);
+    return;
+  }
   await sendComposerMessage({ mode: "info-chat", runningAction: "stop" });
 });
 

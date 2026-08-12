@@ -3251,3 +3251,22 @@ button.section-toggle[aria-expanded="false"] .section-toggle-caret {
   background: var(--accent-soft);
   border-color: var(--accent);
 }
+
+/* Composer: while a turn runs, the right button switches its mode --------- */
+#historyChatButton.mode-swap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  line-height: 1.15;
+  padding-top: 5px;
+  padding-bottom: 5px;
+}
+
+#historyChatButton .mode-swap-detail {
+  font-size: 9px;
+  font-weight: 400;
+  opacity: 0.8;
+  white-space: nowrap;
+}
