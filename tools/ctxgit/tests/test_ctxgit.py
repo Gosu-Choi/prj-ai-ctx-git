@@ -1699,6 +1699,70 @@ class CtxgitTest(unittest.TestCase):
             self.assertEqual(meta["forkedAtCreatedAt"], second["createdAt"])
             self.assertEqual(list(store.iter_history("forked"))[0]["createdAt"], first["createdAt"])
 
+    def test_contexts_chat_attachments_move_into_a_branch_started_from_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.init()
+            temp_dir = store.context_chat_temp_dir()
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            (temp_dir / "deck.md").write_text("deck", encoding="utf-8")
+            (temp_dir / "photo.png").write_bytes(b"\x89PNG")
+            store.append_context_history("user", "이 파일 봐줘")
+
+            self.assertEqual(
+                [f["title"] for f in store.list_context_chat_temp_files()],
+                ["deck.md", "photo.png"],
+            )
+            # The agent gets paths, so it can open them itself.
+            prompt = ctxgit.build_context_chat_prompt(store, "뭐가 들었어?")
+            self.assertIn("contexts/contexts-chat-temp/deck.md", prompt)
+
+            store.create_branch_from_context_chat("from_chat", title="From chat")
+
+            self.assertEqual(
+                [r["title"] for r in store.list_resources("from_chat")],
+                ["deck.md", "photo.png"],
+            )
+            # Moved, not copied: nothing is left for the next Reset to wipe.
+            self.assertEqual(store.list_context_chat_temp_files(), [])
+
+    def test_contexts_chat_reset_clears_attachments_with_the_conversation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.init()
+            temp_dir = store.context_chat_temp_dir()
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            (temp_dir / "scratch.txt").write_text("x", encoding="utf-8")
+            store.append_context_history("user", "hello")
+
+            messages, files = store.reset_context_history()
+
+            self.assertEqual((messages, files), (1, 1))
+            self.assertEqual(store.list_context_chat_temp_files(), [])
+            self.assertEqual(list(store.iter_context_history()), [])
+
+    def test_contexts_chat_attachment_name_clash_keeps_both(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.init()
+            store.create_branch("target", title="Target")
+            resources = root / "contexts" / "branches" / "target" / "resources"
+            resources.mkdir(parents=True, exist_ok=True)
+            (resources / "deck.md").write_text("existing", encoding="utf-8")
+            temp_dir = store.context_chat_temp_dir()
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            (temp_dir / "deck.md").write_text("incoming", encoding="utf-8")
+
+            moved = store.move_context_chat_temp_into_branch("target")
+
+            # The branch's own file must survive the handoff.
+            self.assertEqual((resources / "deck.md").read_text(encoding="utf-8"), "existing")
+            self.assertEqual(len(moved), 1)
+            self.assertTrue(moved[0].endswith("deck-2.md"))
+
     def test_fork_starts_in_the_same_folder_as_its_source(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

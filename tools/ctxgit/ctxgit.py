@@ -137,6 +137,10 @@ PROJECT_CONTEXT_FILES = (
 # on so they are injected into every prompt for that branch, the way AGENTS.md is
 # always injected. Selection is per branch (`guiding` in branch.json); the
 # documents themselves are shared across branches.
+# Scratch directory for files attached to the top-level contexts chat, which has
+# no branch (and so no resources/) of its own. Cleared by Reset; emptied into a
+# branch's resources/ when one is started from the chat.
+CONTEXT_CHAT_TEMP_DIR_NAME = "contexts-chat-temp"
 KNOWLEDGE_DIR_NAME = "knowledge"
 KNOWLEDGE_INDEX_FILE = "README.md"
 DEFAULT_GUIDING_BUDGET_CHARS = 24000
@@ -2373,8 +2377,12 @@ class ContextStore:
                 json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n" for record in records
             )
             write_text(paths.history, text)
+        # Attachments follow the conversation into the branch that continues it.
+        moved = self.move_context_chat_temp_into_branch(branch_id)
         meta = load_json(paths.meta)
         meta["createdFromContextChat"] = True
+        if moved:
+            meta["contextChatResources"] = moved
         dump_json(paths.meta, meta)
         self.write_index()
         return paths.root
@@ -3135,11 +3143,88 @@ class ContextStore:
             handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
         return record
 
-    def reset_context_history(self) -> int:
+    def reset_context_history(self) -> tuple[int, int]:
+        """Clear the contexts chat and its attachments together.
+
+        Returns (messages, files). The attachments belong to the conversation, so
+        leaving them behind after a reset would silently carry into the next one.
+        """
         self.require_initialized()
         records = list(self.iter_context_history())
         write_text(self.context_history_path(), "")
-        return len(records)
+        removed_files = self.clear_context_chat_temp()
+        return len(records), removed_files
+
+    # --- Contexts-chat attachments ------------------------------------------
+    #
+    # The contexts chat has no branch of its own, so files attached to it live in
+    # one flat scratch directory instead of a branch's resources/. It is scratch
+    # on purpose: Reset clears it along with the conversation, and starting a
+    # branch from the chat moves the files into that branch's resources/, which
+    # is where a file earns a permanent home.
+
+    def context_chat_temp_dir(self) -> Path:
+        return self.contexts / CONTEXT_CHAT_TEMP_DIR_NAME
+
+    def list_context_chat_temp_files(self) -> list[dict[str, Any]]:
+        directory = self.context_chat_temp_dir()
+        if not directory.exists():
+            return []
+        items = []
+        for path in sorted(directory.iterdir(), key=lambda item: item.name.lower()):
+            if not path.is_file() or path.name.startswith("."):
+                continue
+            stat = path.stat()
+            items.append({
+                "title": path.name,
+                "path": relpath(self.root, path),
+                "kind": path.suffix.lower().lstrip(".") or "file",
+                "status": "resource",
+                "bytes": stat.st_size,
+                "updatedAt": datetime.fromtimestamp(stat.st_mtime, timezone.utc)
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z"),
+            })
+        return items
+
+    def clear_context_chat_temp(self) -> int:
+        """Drop every attachment. Paired with Reset, which clears the chat."""
+        directory = self.context_chat_temp_dir()
+        if not directory.exists():
+            return 0
+        removed = len(self.list_context_chat_temp_files())
+        resolved = directory.resolve()
+        try:
+            resolved.relative_to(self.contexts.resolve())
+        except ValueError:
+            die(f"refusing to clear a directory outside contexts: {resolved}")
+        shutil.rmtree(resolved)
+        return removed
+
+    def move_context_chat_temp_into_branch(self, branch_id: str) -> list[str]:
+        """Hand the attachments to a new branch's resources/, emptying the scratch dir.
+
+        Moved, not copied: the files leave the contexts chat exactly as the
+        conversation does, so nothing is left behind for the next Reset to wipe.
+        """
+        files = self.list_context_chat_temp_files()
+        if not files:
+            return []
+        paths = self.branch_paths(branch_id)
+        if not paths.root.exists():
+            die(f"branch does not exist: {branch_id}")
+        resources = paths.root / "resources"
+        resources.mkdir(parents=True, exist_ok=True)
+        moved: list[str] = []
+        source_dir = self.context_chat_temp_dir()
+        for item in files:
+            source = source_dir / str(item["title"])
+            target = unique_upload_target(resources, source.name)
+            shutil.move(str(source), str(target))
+            moved.append(relpath(self.root, target))
+        self.clear_context_chat_temp()
+        return moved
 
     def add_note(self, branch_id: str, title: str, body: str, kind: str = "note") -> Path:
         paths = self.branch_paths(branch_id)
@@ -6785,6 +6870,16 @@ def contexts_branch_overview(store: ContextStore, budget_chars: int = 14000) -> 
     return truncate_middle("\n".join(rows), budget_chars) or "(none)"
 
 
+def context_chat_attachment_section(store: ContextStore) -> str:
+    """Paths of the contexts-chat attachments, for the agent to open itself."""
+    files = store.list_context_chat_temp_files()
+    if not files:
+        return "(none)"
+    return "\n".join(
+        f"- `{item['path']}` ({item['kind']}, {item['bytes']} bytes)" for item in files
+    )
+
+
 def build_context_chat_prompt(store: ContextStore, user_message: str) -> str:
     codex_config = active_llm_provider_config(store.root)
     budget = coerce_positive_int(
@@ -6831,6 +6926,12 @@ def build_context_chat_prompt(store: ContextStore, user_message: str) -> str:
         "<branch_overview>",
         branch_overview,
         "</branch_overview>",
+        "",
+        "Files attached to this contexts chat (read them when the user refers to",
+        "what they just sent; they are scratch and disappear on Reset):",
+        "<attachments>",
+        context_chat_attachment_section(store),
+        "</attachments>",
         "",
         "Top-level contexts chat history:",
         "<history>",
@@ -8615,18 +8716,25 @@ def run_context_chat_turn(
 
 
 def reset_context_chat_history(store: ContextStore) -> dict[str, Any]:
-    removed_count = store.reset_context_history()
+    removed_count, removed_files = store.reset_context_history()
     turn_id = new_turn_id()
     turn_commit = internal_git_commit_turn(
         store,
         kind="context-chat-reset",
         actor="user",
-        summary="Reset top-level contexts chat history",
+        summary=(
+            f"Reset top-level contexts chat history "
+            f"({removed_count} messages, {removed_files} attachments)"
+        ),
         turn_id=turn_id,
-        metadata={"scope": "contexts", "removedMessages": removed_count},
+        metadata={
+            "scope": "contexts",
+            "removedMessages": removed_count,
+            "removedAttachments": removed_files,
+        },
     )
     payload = context_chat_payload(store)
-    payload["reset"] = {"removedMessages": removed_count}
+    payload["reset"] = {"removedMessages": removed_count, "removedAttachments": removed_files}
     payload["turnCommit"] = turn_commit
     return payload
 
@@ -9751,6 +9859,7 @@ def context_chat_payload(store: ContextStore) -> dict[str, Any]:
         "research": [],
         "artifacts": [],
         "sources": [],
+        "resources": store.list_context_chat_temp_files(),
         "compactions": [],
         "archives": [],
         "git": {
@@ -10072,6 +10181,19 @@ def branch_compaction_payload(store: ContextStore, branch_id: str, path_value: s
     }
 
 
+def unique_upload_target(directory: Path, name: str) -> Path:
+    """A free path in `directory` for `name`, suffixing rather than overwriting."""
+    candidate = directory / name
+    if not candidate.exists():
+        return candidate
+    stem, suffix = candidate.stem, candidate.suffix
+    for index in range(2, 1000):
+        candidate = directory / f"{stem}-{index}{suffix}"
+        if not candidate.exists():
+            return candidate
+    return directory / f"{stem}-{new_history_record_id()}{suffix}"
+
+
 def safe_upload_relative_path(value: str) -> Path:
     normalized = value.replace("\\", "/").strip().lstrip("/")
     rel = Path(normalized)
@@ -10245,6 +10367,52 @@ def upload_branch_source_file_chunk(
         overwrite=overwrite,
         last_chunk=last_chunk,
     )
+
+
+def upload_context_chat_file_chunk(
+    store: ContextStore,
+    path_value: str,
+    content_base64: str,
+    offset: int,
+    total_size: int,
+    *,
+    overwrite: bool = False,
+    last_chunk: bool = False,
+) -> dict[str, Any]:
+    """Same chunked upload as branch resources, aimed at the contexts-chat scratch dir."""
+    relative_path = branch_source_upload_relative_path(path_value)
+    directory = store.context_chat_temp_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    return upload_project_file_chunk(
+        store.root,
+        relpath(store.root, directory),
+        relative_path.name,
+        content_base64,
+        offset,
+        total_size,
+        overwrite=overwrite,
+        last_chunk=last_chunk,
+    )
+
+
+def finish_context_chat_upload(store: ContextStore, uploaded_paths: list[str]) -> dict[str, Any]:
+    if not uploaded_paths:
+        raise ValueError("uploaded contexts chat files are required")
+    directory = store.context_chat_temp_dir()
+    uploaded = []
+    for path_value in uploaded_paths:
+        relative_path = branch_source_upload_relative_path(path_value)
+        path = (directory / relative_path.name).resolve(strict=False)
+        try:
+            path.relative_to(directory.resolve())
+        except ValueError as exc:
+            raise ValueError("contexts chat upload must stay inside the scratch directory") from exc
+        if not path.exists() or not path.is_file():
+            raise ValueError(f"uploaded contexts chat file is missing: {relative_path.name}")
+        uploaded.append(project_file_entry(store.root, path))
+    payload = context_chat_payload(store)
+    payload["uploadedResources"] = uploaded
+    return payload
 
 
 def finish_branch_source_upload(store: ContextStore, branch_id: str, uploaded_paths: list[str]) -> dict[str, Any]:
@@ -11976,6 +12144,41 @@ def make_handler(
                     )
                 except ValueError as exc:
                     self.send_json({"error": "upload_finish_failed", "message": str(exc)}, status=400)
+                return
+            if parsed.path == "/api/context-chat/upload-chunk":
+                path_value = str(body.get("path") or "")
+                content_base64 = str(body.get("contentBase64") or "")
+                overwrite = body.get("overwrite") is True
+                last_chunk = body.get("lastChunk") is True
+                try:
+                    offset = int(body.get("offset") or 0)
+                    total_size = int(body.get("totalSize") or 0)
+                except (TypeError, ValueError):
+                    self.send_json({"error": "invalid_chunk", "message": "offset and totalSize are required"}, status=400)
+                    return
+                try:
+                    self.send_json(
+                        upload_context_chat_file_chunk(
+                            store, path_value, content_base64, offset, total_size,
+                            overwrite=overwrite, last_chunk=last_chunk,
+                        )
+                    )
+                except FileExistsError as exc:
+                    self.send_json({"error": "file_exists", "message": f"Attachment already exists: {exc}"}, status=409)
+                except ValueError as exc:
+                    self.send_json({"error": "upload_failed", "message": str(exc)}, status=400)
+                except SystemExit as exc:
+                    self.send_json(die_payload("upload_failed", exc), status=http_status_from_exit(exc, 400))
+                return
+            if parsed.path == "/api/context-chat/upload-finish":
+                uploaded_paths = body.get("files") if isinstance(body.get("files"), list) else []
+                uploaded_paths = [str(item) for item in uploaded_paths if str(item).strip()]
+                try:
+                    self.send_json(finish_context_chat_upload(store, uploaded_paths))
+                except ValueError as exc:
+                    self.send_json({"error": "upload_finish_failed", "message": str(exc)}, status=400)
+                except SystemExit as exc:
+                    self.send_json(die_payload("upload_finish_failed", exc), status=http_status_from_exit(exc, 400))
                 return
             if parsed.path == "/api/branch/source/upload-chunk":
                 branch_id = str(body.get("branch") or "")

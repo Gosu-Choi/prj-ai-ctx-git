@@ -1192,10 +1192,20 @@ function hasDraggedFiles(event) {
   return Array.from(event.dataTransfer?.types || []).includes("Files");
 }
 
+// The contexts chat has no branch, so its attachments are keyed under
+// CONTEXT_CHAT_KEY and land in contexts/contexts-chat-temp/ instead of a
+// branch's resources/. Everything else about staging is identical.
+function activeResourceKey() {
+  if (state.activeContextChat) return CONTEXT_CHAT_KEY;
+  return state.activeBranch || "";
+}
+
 function canDropBranchResources() {
-  if (!state.activeBranch || state.activeContextChat || state.activeGlobalized) return false;
+  const key = activeResourceKey();
+  if (!key || state.activeGlobalized) return false;
+  if (key === CONTEXT_CHAT_KEY) return !activeBranchRunningJob(key) && !state.startingBranches[key];
   if (state.payload?.archived === true) return false;
-  if (activeBranchRunningJob(state.activeBranch) || state.startingBranches[state.activeBranch]) return false;
+  if (activeBranchRunningJob(key) || state.startingBranches[key]) return false;
   return true;
 }
 
@@ -1204,11 +1214,11 @@ function fileExtension(name) {
   return index >= 0 ? String(name).slice(index).toLowerCase() : "";
 }
 
-function stagedBranchResources(branch = state.activeBranch) {
+function stagedBranchResources(branch = activeResourceKey()) {
   return branch ? state.branchResourceStaged[branch] || [] : [];
 }
 
-function clearStagedBranchResources(branch = state.activeBranch) {
+function clearStagedBranchResources(branch = activeResourceKey()) {
   if (!branch) return;
   delete state.branchResourceStaged[branch];
   renderBranchResourceStage();
@@ -1228,9 +1238,10 @@ function removeStagedBranchResource(branch, index) {
 
 function renderBranchResourceStage() {
   if (!els.branchResourceStage) return;
-  const branch = state.activeBranch;
+  const branch = activeResourceKey();
   const files = stagedBranchResources(branch);
-  if (!branch || state.activeContextChat || state.activeGlobalized || state.payload?.archived === true || !files.length) {
+  const archived = branch !== CONTEXT_CHAT_KEY && state.payload?.archived === true;
+  if (!branch || state.activeGlobalized || archived || !files.length) {
     els.branchResourceStage.hidden = true;
     els.branchResourceStage.innerHTML = "";
     return;
@@ -1337,13 +1348,19 @@ function updateBranchUploadProgress(message) {
   els.progressEvents.innerHTML = `<div>${escapeHtml(message)}</div>`;
 }
 
+function chunkEndpoint(branch) {
+  return branch === CONTEXT_CHAT_KEY
+    ? "/api/context-chat/upload-chunk"
+    : "/api/branch/source/upload-chunk";
+}
+
 async function uploadBranchResourceFileInChunks(file, { branch, overwrite, index, total }) {
   const path = file.name;
   const chunkCount = Math.max(1, Math.ceil(file.size / UPLOAD_CHUNK_BYTES));
   let lastPayload = null;
   if (file.size === 0) {
     updateBranchUploadProgress(`Uploading ${index}/${total}: ${path}`);
-    lastPayload = await api("/api/branch/source/upload-chunk", {
+    lastPayload = await api(chunkEndpoint(branch), {
       method: "POST",
       body: JSON.stringify({
         branch,
@@ -1361,7 +1378,7 @@ async function uploadBranchResourceFileInChunks(file, { branch, overwrite, index
     const blob = file.slice(offset, Math.min(file.size, offset + UPLOAD_CHUNK_BYTES));
     updateBranchUploadProgress(`Uploading ${index}/${total}: ${path} (${chunkIndex}/${chunkCount}, ${formatBytes(offset)} of ${formatBytes(file.size)})`);
     const contentBase64 = await readBlobAsBase64(blob);
-    lastPayload = await api("/api/branch/source/upload-chunk", {
+    lastPayload = await api(chunkEndpoint(branch), {
       method: "POST",
       body: JSON.stringify({
         branch,
@@ -1378,10 +1395,15 @@ async function uploadBranchResourceFileInChunks(file, { branch, overwrite, index
 }
 
 async function finishBranchResourceUpload(branch, uploadedPaths, options = {}) {
-  const payload = await api("/api/branch/source/upload-finish", {
-    method: "POST",
-    body: JSON.stringify({ branch, files: uploadedPaths }),
-  });
+  const isContexts = branch === CONTEXT_CHAT_KEY;
+  const payload = await api(
+    isContexts ? "/api/context-chat/upload-finish" : "/api/branch/source/upload-finish",
+    { method: "POST", body: JSON.stringify({ branch, files: uploadedPaths }) },
+  );
+  if (isContexts) {
+    if (options.render !== false && state.activeContextChat) renderContextChat(payload);
+    return payload;
+  }
   if (options.render !== false && state.activeBranch === branch && !state.activeContextChat) {
     renderBranch(payload);
     renderGit(await api("/api/git/status"));
@@ -1392,15 +1414,15 @@ async function finishBranchResourceUpload(branch, uploadedPaths, options = {}) {
 }
 
 async function uploadBranchResourceFiles(fileList, options = {}) {
-  const branch = options.branch || state.activeBranch;
+  const branch = options.branch || activeResourceKey();
   const files = Array.from(fileList || []).filter((file) => file && file.name);
   if (!files.length) return;
+  const isContexts = branch === CONTEXT_CHAT_KEY;
   const blocked =
     !branch ||
-    branch !== state.activeBranch ||
-    state.activeContextChat ||
+    branch !== activeResourceKey() ||
     state.activeGlobalized ||
-    state.payload?.archived === true ||
+    (!isContexts && state.payload?.archived === true) ||
     Boolean(activeBranchRunningJob(branch)) ||
     Boolean(state.startingBranches[branch] && !options.allowStarting);
   if (blocked) {
@@ -5363,7 +5385,7 @@ async function sendComposerMessage({ mode, runningAction = "stop" }) {
     return;
   }
   const text = els.messageInput.value.trim();
-  const stagedFiles = isContextChat ? [] : stagedBranchResources(branch);
+  const stagedFiles = stagedBranchResources(isContextChat ? CONTEXT_CHAT_KEY : branch);
   if (!text && !stagedFiles.length) return;
   hideChatError();
   const isChat = mode === "chat";
