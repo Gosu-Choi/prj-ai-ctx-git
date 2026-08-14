@@ -1250,7 +1250,12 @@ class CtxgitTest(unittest.TestCase):
                 ctxgit.call_provider_prompt = original_call
 
             workspace = root / "contexts" / "branches" / "room" / "workspace"
-            self.assertEqual([Path(call["kwargs"]["cwd"]) for call in calls], [workspace, workspace])
+            # resolve() both sides: on macOS the temp dir is /var/... but the code
+            # hands back /private/var/..., and the paths are equal as directories.
+            self.assertEqual(
+                [Path(call["kwargs"]["cwd"]).resolve() for call in calls],
+                [workspace.resolve(), workspace.resolve()],
+            )
             self.assertTrue((workspace / "agent-1.md").exists())
             self.assertTrue((workspace / "agent-2.md").exists())
             self.assertFalse((root / "contexts" / "branches" / "writer" / "agent-1.md").exists())

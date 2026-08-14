@@ -3273,14 +3273,13 @@ function updateComposerState() {
     els.historyChatButton.title = "";
     els.historyChatButton.classList.remove("mode-swap");
   }
-  const claudeProvider = (state.provider?.provider || "codex") === "claude";
+  // The pipeline runs on either provider — each stage is one process of whichever
+  // CLI the project is set to, so it is gated on the orchestration mode alone.
   const omcMode = state.provider?.orchestration === "omc";
   els.teamButton.hidden = contextMode || !omcMode;
-  els.teamButton.disabled = disabled || Boolean(running) || !claudeProvider;
+  els.teamButton.disabled = disabled || Boolean(running);
   els.teamButton.textContent = archived ? "Archived" : running ? "Busy" : "Team";
-  els.teamButton.title = claudeProvider
-    ? "Run the deterministic team pipeline: plan → prd → exec → verify → fix"
-    : "Team pipeline requires the Claude provider";
+  els.teamButton.title = "Run the deterministic team pipeline: plan → prd → exec → verify → fix";
 }
 
 function renderActiveBranchJob() {

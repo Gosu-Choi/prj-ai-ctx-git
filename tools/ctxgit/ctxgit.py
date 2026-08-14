@@ -5927,7 +5927,7 @@ def claude_login_status(root: Path) -> dict[str, Any]:
             "loginCommand": "claude auth login", "resolvedCommand": " ".join(resolve_claude_command(root)),
             "model": str(config.get("model") or "opus"),
             "webSearch": config.get("webSearch") is not False,
-            "orchestration": orchestration_mode(root),
+            "orchestration": orchestration_mode(root, "claude"),
             "sandbox": str(config.get("sandbox") or DEFAULT_CODEX_SANDBOX),
             "timeoutSeconds": coerce_positive_int(config.get("timeoutSeconds"), 900),
             "envFiles": env_status.get("files", []),
@@ -5948,7 +5948,7 @@ def claude_login_status(root: Path) -> dict[str, Any]:
         "resolvedCommand": " ".join(resolve_claude_command(root)),
         "model": str(config.get("model") or "opus"),
         "webSearch": config.get("webSearch") is not False,
-        "orchestration": orchestration_mode(root),
+        "orchestration": orchestration_mode(root, "claude"),
         "sandbox": str(config.get("sandbox") or DEFAULT_CODEX_SANDBOX),
         "timeoutSeconds": coerce_positive_int(config.get("timeoutSeconds"), 900),
         "auth": auth,
@@ -6033,6 +6033,7 @@ def codex_login_status(root: Path) -> dict[str, Any]:
             "resolvedCommand": display_codex_command(root),
             "webSearch": codex_config.get("webSearch") is not False,
             "model": str(codex_config.get("model") or "gpt-5.6-sol"),
+            "orchestration": orchestration_mode(root, "codex"),
             "sandbox": codex_sandbox_mode(codex_config),
             "timeoutSeconds": timeout_seconds,
             "braveApiKeyConfigured": brave_configured,
@@ -6049,6 +6050,7 @@ def codex_login_status(root: Path) -> dict[str, Any]:
         "resolvedCommand": display_codex_command(root),
         "webSearch": codex_config.get("webSearch") is not False,
         "model": str(codex_config.get("model") or "gpt-5.6-sol"),
+        "orchestration": orchestration_mode(root, "codex"),
         "sandbox": codex_sandbox_mode(codex_config),
         "timeoutSeconds": coerce_positive_int(codex_config.get("timeoutSeconds"), 900),
         "braveApiKeyConfigured": brave_configured,
@@ -7865,6 +7867,18 @@ def claude_structured_output_retry_failed(stdout: str, stderr: str) -> bool:
     return False
 
 
+#: Every built-in tool ctxgit ever grants or withholds. Used to turn a role's
+#: allowlist into the equivalent denylist — `--tools` would express the same
+#: restriction in one flag, but it also drops MCP tools (see
+#: claude_disallowed_tools), so the restriction has to be stated the long way.
+CLAUDE_BUILTIN_TOOLS = [
+    "Read", "Glob", "Grep",
+    "Edit", "Write", "Bash", "NotebookEdit", "KillShell", "BashOutput",
+    "WebSearch", "WebFetch",
+    "Task",
+]
+
+
 def claude_tools(*, writable: bool, web_search: bool, subagents: bool = False) -> str:
     tools = ["Read", "Glob", "Grep"]
     if writable:
@@ -7918,7 +7932,7 @@ def call_claude_prompt(
     config = read_llm_config(root).get("claude", {})
     timeout_seconds = coerce_positive_int(config.get("timeoutSeconds"), 900)
     schema = output_schema or chat_output_schema()
-    subagents_enabled = orchestration_mode(root) == "omc"
+    subagents_enabled = orchestration_mode(root, "claude") == "omc"
     tools = claude_tools(
         writable=writable,
         web_search=config.get("webSearch") is not False,
@@ -7982,6 +7996,10 @@ def call_claude_prompt(
                     root,
                     writable=writable,
                     web_search=config.get("webSearch") is not False,
+                    # Without these the lead can reach Gmail/Drive/Adit but every
+                    # worker it delegates to cannot — and the worker reports "not
+                    # found" rather than "no tool", so the gap reads as a data gap.
+                    mcp_tools=active_extension_mcp_tool_names(),
                 ),
             ])
         model = str(config.get("model") or "opus").strip()
@@ -8048,13 +8066,19 @@ def call_claude_prompt(
 ORCHESTRATION_MODES = {"omc", "legacy"}
 
 
-def orchestration_mode(root: Path) -> str:
-    """Which orchestration a claude turn uses.
+def orchestration_mode(root: Path, provider: str | None = None) -> str:
+    """Which orchestration a turn uses, for the given provider (default: active).
 
-    `omc` gives the lead subagents plus the team pipeline; `legacy` is the plain
-    single-agent behaviour ctxgit had before any of that existed.
+    `omc` gives the team pipeline, and on Claude the lead's subagents too; `legacy`
+    is the plain single-agent behaviour ctxgit had before any of that existed.
+
+    Codex has no subagent mechanism of its own, so there `omc` means the team
+    pipeline only — the stages run as separate `codex exec` processes.
     """
-    config = read_llm_config(root).get("claude", {})
+    llm = read_llm_config(root)
+    name = provider or str(llm.get("provider") or "codex")
+    raw = llm.get(name)
+    config = raw if isinstance(raw, dict) else {}
     mode = str(config.get("orchestration") or "").strip().lower()
     if mode in ORCHESTRATION_MODES:
         return mode
@@ -8122,7 +8146,10 @@ def call_claude_agent(
     web_search = config.get("webSearch") is not False
     writable = bool(request.writable)
 
-    agent = resolve_agent(root, request.role, writable=writable, web_search=web_search)
+    mcp_tools = active_extension_mcp_tool_names()
+    agent = resolve_agent(
+        root, request.role, writable=writable, web_search=web_search, mcp_tools=mcp_tools
+    )
     if not agent:
         raise RuntimeError(f"unknown pipeline role: {request.role}")
     tools = ",".join(agent["tools"])
@@ -8134,11 +8161,21 @@ def call_claude_agent(
         "--verbose",
         "--no-session-persistence",
         "--permission-mode", "auto" if writable else "bypassPermissions",
-        "--tools", tools,
         "--allowedTools", tools,
         "--append-system-prompt",
         f"{agent['prompt']}\n\n{WORKER_RUNTIME_OVERRIDE}",
     ])
+    # The role's restriction is expressed as a denylist, not `--tools`. `--tools`
+    # is a built-in allowlist that silently drops MCP servers' tools from the
+    # session (same reason claude_disallowed_tools exists for the main path), so
+    # a worker run with it can never reach Gmail/Drive/Adit no matter what its
+    # role declares. Deny what the role does not have instead.
+    stage_disallowed = [tool for tool in CLAUDE_BUILTIN_TOOLS if tool not in agent["tools"]]
+    stage_disallowed.extend(SUPERSEDED_HOST_MCP_SERVERS)
+    command.extend(["--disallowedTools", ",".join(stage_disallowed)])
+    mcp_servers = active_extension_mcp_config()
+    if mcp_servers:
+        command.extend(["--mcp-config", json.dumps({"mcpServers": mcp_servers})])
     if request.schema:
         command.extend([
             "--json-schema",
@@ -8178,6 +8215,141 @@ def call_claude_agent(
     )
 
 
+#: Claude tier alias -> Codex tier. The agent library states a role's tier in
+#: Claude's vocabulary because that is where the roles came from; running the same
+#: role on Codex means picking the matching tier rather than dropping the intent.
+CLAUDE_TO_CODEX_TIER = {
+    "opus": "gpt-5.6-sol",
+    "sonnet": "gpt-5.6-terra",
+    "haiku": "gpt-5.6-luna",
+}
+
+
+def call_codex_agent(
+    root: Path,
+    request: AgentRequest,
+    *,
+    cwd: Path,
+    progress: ProgressCallback | None = None,
+) -> AgentReply:
+    """Run one team-pipeline stage on Codex.
+
+    Same contract as call_claude_agent so run_team_pipeline does not care which
+    provider is behind it. Three things differ because the CLI does:
+
+    * No `--append-system-prompt`. The role prompt is prepended to the task
+      instead, which is where a Codex `exec` run reads its instructions from.
+    * No per-tool allowlist. A role's tool scope is approximated with the sandbox:
+      a role that was not granted write tools runs read-only. That is coarser than
+      Claude's denylist, so it is stated here rather than hidden — a read-only role
+      cannot write, but a writable role is not held to its narrower list.
+    * Tiers are named differently, so the role's tier is mapped (see above).
+    """
+    emit_progress(progress, "Checking Codex login")
+    status = codex_login_status(root)
+    if not status["ok"]:
+        raise RuntimeError(status["message"])
+    config = read_llm_config(root).get("codex", {})
+    timeout_seconds = coerce_positive_int(config.get("timeoutSeconds"), 900)
+    web_search = config.get("webSearch") is not False
+    writable = bool(request.writable)
+
+    agent = resolve_agent(
+        root,
+        request.role,
+        writable=writable,
+        web_search=web_search,
+        mcp_tools=active_extension_mcp_tool_names(),
+    )
+    if not agent:
+        raise RuntimeError(f"unknown pipeline role: {request.role}")
+    # Bash is deliberately not in this test. A verifier keeps Bash so it can run the
+    # tests it is judging, and Codex's read-only sandbox still executes commands —
+    # it only blocks writes. Counting Bash as "writes" would hand every reviewer
+    # role a writable workspace.
+    role_can_write = any(tool in agent["tools"] for tool in ("Edit", "Write"))
+
+    workdir = cwd.resolve()
+    with tempfile.TemporaryDirectory(prefix="ctxgit-codex-agent-") as tmp:
+        tmp_path = Path(tmp)
+        schema_path = tmp_path / "agent.schema.json"
+        output_path = tmp_path / "last-message.txt"
+        write_text(
+            schema_path,
+            json.dumps(request.schema or chat_output_schema(), indent=2),
+        )
+        cmd = resolve_codex_command(root)
+        apply_codex_extension_mcps(cmd, root)
+        if web_search:
+            cmd.append("--search")
+        cmd.extend(["--ask-for-approval", "never", "exec"])
+        if progress:
+            cmd.append("--json")
+        sandbox = codex_sandbox_mode(config) if (writable and role_can_write) else "read-only"
+        cmd.extend([
+            "--cd", str(workdir),
+            "--sandbox", sandbox,
+            "--output-schema", str(schema_path),
+            "--output-last-message", str(output_path),
+        ])
+        tier = str(agent.get("model") or "").strip().lower()
+        model = CLAUDE_TO_CODEX_TIER.get(tier) or str(config.get("model") or "gpt-5.6-sol").strip()
+        if model:
+            cmd.extend(["--model", model])
+        cmd.append("-")
+
+        stdin_text = f"{agent['prompt']}\n\n{WORKER_RUNTIME_OVERRIDE}\n\n{request.prompt}"
+        try:
+            emit_progress(progress, f"Codex is working as {request.role}")
+            if progress:
+                completed = run_process_with_progress(
+                    cmd, workdir, timeout_seconds, progress, stdin_text=stdin_text
+                )
+            else:
+                completed = subprocess.run(
+                    cmd, cwd=workdir, check=False, text=True, encoding="utf-8",
+                    errors="replace", input=stdin_text, capture_output=True,
+                    timeout=timeout_seconds,
+                )
+        except subprocess.TimeoutExpired as exc:
+            raise codex_timeout_error(f"Codex agent {request.role}", timeout_seconds) from exc
+
+        raw = read_text(output_path).strip()
+        if completed.returncode != 0 and not raw:
+            detail = (completed.stderr or "").strip() or (completed.stdout or "").strip()
+            raise RuntimeError(
+                detail or f"Codex agent {request.role} failed with exit code {completed.returncode}"
+            )
+        data: dict[str, Any] | None = None
+        if raw:
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    data = parsed
+            except json.JSONDecodeError:
+                data = None
+        if request.schema and data is None:
+            raise RuntimeError(
+                f"role {request.role} returned no structured output for stage {request.label or '?'}"
+            )
+        text = raw if data is None else str(data.get("assistant") or data.get("result") or "").strip()
+        return AgentReply(text=text, data=data)
+
+
+def call_provider_agent(
+    root: Path,
+    request: AgentRequest,
+    *,
+    cwd: Path,
+    progress: ProgressCallback | None = None,
+) -> AgentReply:
+    """Run one pipeline stage on whichever provider the project is set to."""
+    provider = str(read_llm_config(root).get("provider") or "codex")
+    if provider == "codex":
+        return call_codex_agent(root, request, cwd=cwd, progress=progress)
+    return call_claude_agent(root, request, cwd=cwd, progress=progress)
+
+
 def run_team_pipeline_turn(
     root: Path,
     store: ContextStore,
@@ -8200,7 +8372,7 @@ def run_team_pipeline_turn(
     )
 
     def call_agent(request: AgentRequest) -> AgentReply:
-        return call_claude_agent(root, request, cwd=workspace, progress=progress)
+        return call_provider_agent(root, request, cwd=workspace, progress=progress)
 
     result = run_team_pipeline(
         task=user_message,

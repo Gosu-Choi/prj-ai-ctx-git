@@ -32,17 +32,29 @@ VENDORED_AGENTS_DIR = Path(__file__).resolve().parent / "agents"
 PROJECT_AGENTS_RELPATH = ("contexts", "subagents")
 
 
-def subagent_tool_pool(*, writable: bool, web_search: bool) -> list[str]:
+def subagent_tool_pool(
+    *,
+    writable: bool,
+    web_search: bool,
+    mcp_tools: Optional[list[str]] = None,
+) -> list[str]:
     """Tools a subagent may draw from.
 
     Task is deliberately excluded: per OMC's worker contract a delegated worker
     does the work directly and never spawns further subagents.
+
+    `mcp_tools` are the active extensions' fully-qualified tool names. They belong
+    in the pool because the pool is an allowlist — a worker asked to look something
+    up in Gmail or the Adit console cannot do it if the tool is not listed, and the
+    failure is silent (the role simply reports it could not find the data). The
+    caller passes them because this module must not import ctxgit.
     """
     tools = list(BASE_READ_TOOLS)
     if writable:
         tools.extend(WRITE_TOOLS)
     if web_search:
         tools.extend(WEB_TOOLS)
+    tools.extend(mcp_tools or [])
     return tools
 
 
@@ -130,8 +142,9 @@ def build_subagents(
     *,
     writable: bool,
     web_search: bool = True,
+    mcp_tools: Optional[list[str]] = None,
 ) -> dict[str, dict[str, Any]]:
-    pool = subagent_tool_pool(writable=writable, web_search=web_search)
+    pool = subagent_tool_pool(writable=writable, web_search=web_search, mcp_tools=mcp_tools)
     agents = load_vendored_agents(pool=pool)
     agents.update(load_project_agents(root, pool=pool))
     # A role with no usable tools (e.g. a writer role in a read-only session)
@@ -144,9 +157,12 @@ def build_subagents_json(
     *,
     writable: bool,
     web_search: bool = True,
+    mcp_tools: Optional[list[str]] = None,
 ) -> str:
     """Value for `claude --agents`."""
-    agents = build_subagents(root, writable=writable, web_search=web_search)
+    agents = build_subagents(
+        root, writable=writable, web_search=web_search, mcp_tools=mcp_tools
+    )
     return json.dumps(agents, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -156,6 +172,7 @@ def resolve_agent(
     *,
     writable: bool,
     web_search: bool = True,
+    mcp_tools: Optional[list[str]] = None,
 ) -> Optional[dict[str, Any]]:
     """Look up one role's prompt, tools, and model tier.
 
@@ -164,4 +181,6 @@ def resolve_agent(
     `--json-schema` — no error, just no structured output — so a stage that needs
     structured data has to inject the role's prompt instead.
     """
-    return build_subagents(root, writable=writable, web_search=web_search).get(role)
+    return build_subagents(
+        root, writable=writable, web_search=web_search, mcp_tools=mcp_tools
+    ).get(role)

@@ -151,9 +151,16 @@ class ClaudeCommandTest(unittest.TestCase):
             self.assertIn("ctxgit", system_prompt)
             # the role's tier from the agent library picks the model
             self.assertEqual(cmd[cmd.index("--model") + 1], "sonnet")
-            # verifier declares disallowedTools: Write, Edit — and no worker re-delegates
-            self.assertNotIn("Task", cmd[cmd.index("--tools") + 1])
-            self.assertNotIn("Write", cmd[cmd.index("--tools") + 1])
+            # verifier declares disallowedTools: Write, Edit — and no worker re-delegates.
+            # The restriction is stated as a denylist because `--tools` would also
+            # drop MCP tools from the stage.
+            self.assertNotIn("--tools", cmd)
+            allowed = cmd[cmd.index("--allowedTools") + 1]
+            disallowed = cmd[cmd.index("--disallowedTools") + 1]
+            self.assertNotIn("Task", allowed)
+            self.assertNotIn("Write", allowed)
+            self.assertIn("Task", disallowed.split(","))
+            self.assertIn("Write", disallowed.split(","))
             self.assertEqual(reply.data, {"verdict": "PASS"})
             self.assertEqual(reply.text, "raw text")
 
@@ -267,6 +274,149 @@ class ExtensionStalenessTest(unittest.TestCase):
                 self.assertTrue(after["commit"]["dirty"])
         finally:
             target.write_bytes(original)
+
+
+class CodexTeamPipelineTest(unittest.TestCase):
+    """The team pipeline has to run on whichever provider the project is set to.
+
+    Before this, `/api/team/start` always ran Claude agents. On a Codex project the
+    stage either failed at the login check or silently ran on the other provider —
+    the pipeline is picked in the UI, so nothing told the user which model answered.
+    """
+
+    def _project(self, tmp: str, provider: str = "codex"):
+        root = Path(tmp)
+        store = ctxgit.ContextStore(root)
+        store.init(create_initial_branch=False)
+        store.create_branch("b1")
+        ctxgit.write_provider_config(root, {"provider": provider})
+        return root, store
+
+    def _run(self, root: Path, seen: list, stdout: str, **request_kwargs):
+        original_run = ctxgit.subprocess.run
+        original_login = ctxgit.codex_login_status
+
+        def fake_run(cmd, **kwargs):
+            seen.append({"cmd": cmd, "input": kwargs.get("input", "")})
+            # Codex writes the answer to --output-last-message, not stdout.
+            out = cmd[cmd.index("--output-last-message") + 1]
+            Path(out).write_text(stdout, encoding="utf-8")
+            return FakeCompleted(stdout="")
+
+        ctxgit.subprocess.run = fake_run
+        ctxgit.codex_login_status = lambda _root: {"ok": True, "message": ""}
+        try:
+            return ctxgit.call_provider_agent(
+                root, orch.AgentRequest(**request_kwargs), cwd=root
+            )
+        finally:
+            ctxgit.subprocess.run = original_run
+            ctxgit.codex_login_status = original_login
+
+    def test_codex_project_runs_the_stage_on_codex(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = self._project(tmp)
+            seen: list[dict] = []
+            reply = self._run(
+                root,
+                seen,
+                json.dumps({"verdict": "PASS"}),
+                role="verifier",
+                prompt="check it",
+                writable=True,
+                schema={"type": "object"},
+                label="team-verify",
+            )
+            cmd = seen[0]["cmd"]
+            self.assertIn("exec", cmd)
+            self.assertIn("--output-schema", cmd)
+            # no --append-system-prompt on this CLI: the role is prepended instead
+            self.assertNotIn("--append-system-prompt", cmd)
+            self.assertIn("You are Verifier", seen[0]["input"])
+            self.assertIn("check it", seen[0]["input"])
+            self.assertEqual(reply.data, {"verdict": "PASS"})
+
+    def test_a_read_only_role_runs_read_only_even_in_a_writable_turn(self) -> None:
+        # Codex has no per-tool allowlist, so the role's scope is carried by the
+        # sandbox. A verifier must not be able to edit what it is verifying.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = self._project(tmp)
+            seen: list[dict] = []
+            self._run(
+                root, seen, json.dumps({"verdict": "PASS"}),
+                role="verifier", prompt="check", writable=True,
+                schema={"type": "object"}, label="v",
+            )
+            cmd = seen[0]["cmd"]
+            self.assertEqual(cmd[cmd.index("--sandbox") + 1], "read-only")
+
+    def test_role_tier_is_mapped_to_the_codex_tier(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = self._project(tmp)
+            seen: list[dict] = []
+            self._run(
+                root, seen, json.dumps({"verdict": "PASS"}),
+                role="verifier", prompt="check", writable=True,
+                schema={"type": "object"}, label="v",
+            )
+            cmd = seen[0]["cmd"]
+            # the verifier role declares Claude's "sonnet" tier
+            self.assertEqual(cmd[cmd.index("--model") + 1], "gpt-5.6-terra")
+
+    def test_claude_project_still_runs_the_stage_on_claude(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = self._project(tmp, provider="claude")
+            original = ctxgit.subprocess.run
+            seen: list[list[str]] = []
+
+            def fake_run(cmd, **_kwargs):
+                if "auth" in cmd and "status" in cmd:
+                    return FakeCompleted(stdout="Logged in")
+                seen.append(cmd)
+                return FakeCompleted(
+                    stdout=json.dumps(
+                        {"type": "result", "result": "ok", "structured_output": {"verdict": "PASS"}}
+                    )
+                )
+
+            ctxgit.subprocess.run = fake_run
+            try:
+                ctxgit.call_provider_agent(
+                    root,
+                    orch.AgentRequest(
+                        role="verifier", prompt="check", writable=True,
+                        schema={"type": "object"}, label="v",
+                    ),
+                    cwd=root,
+                )
+            finally:
+                ctxgit.subprocess.run = original
+            self.assertIn("--append-system-prompt", seen[0])
+
+
+class SubagentMcpReachTest(unittest.TestCase):
+    """Delegated work must reach the same integrations the lead can reach.
+
+    Regression guard: MCP was wired into the lead's own turn only. A worker then
+    ran without `--mcp-config` and with `--tools` (an allowlist that drops MCP
+    tools), so anything delegated came back as "I could not find that data" —
+    indistinguishable from the data genuinely not existing.
+    """
+
+    def test_pool_offers_mcp_tools_to_subagents(self) -> None:
+        pool = orch.subagent_tool_pool(
+            writable=False, web_search=False, mcp_tools=["mcp__adit__console_read"]
+        )
+        self.assertIn("mcp__adit__console_read", pool)
+        # the built-in restriction still holds
+        self.assertNotIn("Write", pool)
+        self.assertNotIn("Task", pool)
+
+    def test_pool_without_extensions_is_unchanged(self) -> None:
+        self.assertEqual(
+            orch.subagent_tool_pool(writable=True, web_search=True),
+            orch.subagent_tool_pool(writable=True, web_search=True, mcp_tools=[]),
+        )
 
 
 class ExternalExtensionMcpTest(unittest.TestCase):
