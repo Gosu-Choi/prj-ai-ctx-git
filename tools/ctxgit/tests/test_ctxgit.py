@@ -5428,16 +5428,6 @@ class BossChatTest(unittest.TestCase):
             self.assertEqual(ctxgit.read_boss_draft(store), {})
             self.assertEqual(ctxgit.read_boss_config(store)["branches"], ["sales"], "the selection survives")
 
-    def test_a_branch_made_here_is_badged(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root, store = self._project(tmp)
-            ctxgit.append_boss_history(store, "user", "여기서 갈라나간다")
-            store.create_branch_from_boss_chat("spun", title="Spun")
-            item = next(b for b in store.list_branches() if b["id"] == "spun")
-            self.assertTrue(item["fromBossChat"])
-            self.assertFalse(next(b for b in store.list_branches() if b["id"] == "sales")["fromBossChat"])
-            self.assertIn("여기서 갈라나간다", [r["text"] for r in store.iter_history("spun")])
-
     def test_the_payload_carries_the_board(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, store = self._project(tmp)
@@ -5445,6 +5435,8 @@ class BossChatTest(unittest.TestCase):
             store.append_history("sales", "assistant", "견적 초안 만들었습니다.")
             self._draft(root, store, [{"branch": "sales", "instruction": "견적"}])
             jobs = _BossJobs()
+            work_id = ctxgit.add_boss_inflight(store, "", "turn", branch="sales")
+            ctxgit.update_boss_inflight(store, work_id, job_id="f", kind="followup")
             jobs.running = [{"id": "f", "branch": ctxgit.boss_followup_job_key("sales")}]
             payload = ctxgit.boss_chat_payload(store, jobs)
             self.assertIn("Sales", payload["folders"])
@@ -5475,6 +5467,146 @@ class BossChatTest(unittest.TestCase):
             for thread in threads:
                 thread.join()
             self.assertEqual(len(ctxgit.boss_pending_items(store)), 8)
+
+
+class BossDeskForkTest(unittest.TestCase):
+    """"New branch from boss" makes another Boss, not a branch.
+
+    The new desk has the same board — branches, log, drafts, threads — and work that
+    was under way when it was split off keeps going on it: a draft still being
+    written, or a branch still running, reports to every desk holding its entry.
+    """
+
+    def _project(self, tmp: str):
+        root = Path(tmp)
+        store = ctxgit.ContextStore(root)
+        store.init(create_initial_branch=False)
+        store.create_branch("sales", title="Sales")
+        store.create_branch("dev", title="Dev")
+        ctxgit.write_boss_config(store, ["sales", "dev"])
+        return root, store
+
+    def test_a_fork_is_a_desk_with_the_same_board(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            with _BossModel({"assignments": [{"branch": "sales", "instruction": "견적"}], "summary": "s"}):
+                ctxgit.draft_boss_assignments(root, store, "오늘 할 일")
+            desk = ctxgit.fork_boss_desk(store, "", "견적 스프린트")
+            self.assertEqual(ctxgit.boss_desk_ids(store), ["", desk])
+            self.assertEqual(ctxgit.read_boss_config(store, desk)["branches"], ["sales", "dev"])
+            self.assertEqual(
+                [r["text"] for r in ctxgit.iter_boss_history(store, desk)],
+                [r["text"] for r in ctxgit.iter_boss_history(store)],
+            )
+            self.assertEqual([i["branch"] for i in ctxgit.boss_pending_items(store, desk)], ["sales"])
+            desks = {d["id"]: d for d in ctxgit.list_boss_desks(store)}
+            self.assertEqual(desks[desk]["title"], "견적 스프린트")
+            self.assertTrue(desks[desk]["forked"])
+            self.assertFalse(desks[""]["forked"], "only a split-off Boss carries the star")
+            # Not a branch: nothing new in the branch list.
+            self.assertEqual(sorted(b["id"] for b in store.list_branches()), ["dev", "sales"])
+
+    def test_desks_are_independent_after_the_split(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            desk = ctxgit.fork_boss_desk(store, "", "Second")
+            ctxgit.write_boss_config(store, ["dev"], desk)
+            ctxgit.append_boss_history(store, "user", "두 번째 데스크에만", desk=desk)
+            self.assertEqual(ctxgit.read_boss_config(store)["branches"], ["sales", "dev"])
+            self.assertEqual(ctxgit.iter_boss_history(store), [])
+            store.reset_boss_chat(desk)
+            self.assertEqual(ctxgit.iter_boss_history(store, desk), [])
+            self.assertEqual(ctxgit.read_boss_config(store, desk)["branches"], ["dev"])
+
+    def test_a_draft_in_progress_lands_on_the_fork_too(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            ctxgit.append_boss_history(store, "user", "오늘 할 일")
+            work_id = ctxgit.add_boss_inflight(store, "", "draft")
+            ctxgit.update_boss_inflight(store, work_id, job_id="job-1")
+            # Split off while the model is still writing.
+            desk = ctxgit.fork_boss_desk(store, "", "Mid-draft")
+            jobs = _BossJobs()
+            jobs.running = [{"id": "job-1", "branch": ctxgit.BOSS_CHAT_KEY}]
+            self.assertEqual(
+                [d["jobId"] for d in ctxgit.boss_chat_payload(store, jobs, desk)["drafting"]], ["job-1"],
+                "the new Boss shows the draft as still being written",
+            )
+            with _BossModel({"assignments": [{"branch": "sales", "instruction": "견적"}], "summary": "s"}):
+                ctxgit.draft_boss_assignments(root, store, "오늘 할 일", work_id=work_id, record_request=False)
+            for holder in ("", desk):
+                self.assertEqual([i["branch"] for i in ctxgit.boss_pending_items(store, holder)], ["sales"])
+                self.assertEqual(ctxgit.iter_boss_history(store, holder)[-1]["kind"], "draft")
+                self.assertEqual(ctxgit.read_boss_draft(store, holder).get("inflight"), [])
+
+    def test_a_running_branch_reports_its_follow_up_to_the_fork_too(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            jobs = _BossJobs()
+            original = ctxgit.run_history_chat_turn
+            ctxgit.run_history_chat_turn = lambda *a, **k: {"ok": True}
+            try:
+                ctxgit.dispatch_boss_items(root, store, jobs, [
+                    {"branch": "sales", "instruction": "견적 만들어줘", "mode": "info-chat"},
+                ])
+                desk = ctxgit.fork_boss_desk(store, "", "Mid-turn")  # the branch is still running
+                jobs.running = [{"id": "job-1", "branch": "sales"}]
+                row = next(b for b in ctxgit.boss_chat_payload(store, jobs, desk)["branches"] if b["id"] == "sales")
+                self.assertTrue(row["running"])
+                self.assertEqual(row["thread"]["lastInstruction"], "견적 만들어줘")
+                store.append_history("sales", "assistant", "초안 만들었습니다.")
+                jobs.created[0]["work"](lambda message: None)  # the turn finishes
+            finally:
+                ctxgit.run_history_chat_turn = original
+            self.assertEqual(jobs.created[1]["kind"], "boss-followup")
+            answer = {"instruction": "단가도 채워줘", "reason": "단가가 비었습니다", "done": False, "suggestedMode": "send"}
+            with _BossModel(answer):
+                jobs.created[1]["work"](lambda message: None)
+            for holder in ("", desk):
+                items = ctxgit.boss_pending_items(store, holder)
+                self.assertEqual([(i["branch"], i["origin"]) for i in items], [("sales", "followup")])
+
+    def test_a_failed_turn_clears_its_entry_everywhere(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            jobs = _BossJobs()
+            original = ctxgit.run_history_chat_turn
+
+            def boom(*a, **k):
+                raise RuntimeError("provider down")
+
+            ctxgit.run_history_chat_turn = boom
+            try:
+                ctxgit.dispatch_boss_items(root, store, jobs, [
+                    {"branch": "sales", "instruction": "질문", "mode": "info-chat"},
+                ])
+                desk = ctxgit.fork_boss_desk(store, "", "Fork")
+                with self.assertRaises(RuntimeError):
+                    jobs.created[0]["work"](lambda message: None)
+            finally:
+                ctxgit.run_history_chat_turn = original
+            for holder in ("", desk):
+                self.assertEqual(ctxgit.read_boss_draft(store, holder).get("inflight"), [])
+
+    def test_an_entry_whose_job_died_stops_showing_as_working(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            work_id = ctxgit.add_boss_inflight(store, "", "draft", startedAt="2020-01-01T00:00:00Z")
+            ctxgit.update_boss_inflight(store, work_id, job_id="gone")
+            self.assertEqual(ctxgit.boss_chat_payload(store, _BossJobs())["drafting"], [])
+            self.assertEqual(ctxgit.read_boss_draft(store).get("inflight"), [])
+
+    def test_a_desk_id_never_comes_from_input(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            for bad in ("../../etc", "nope"):
+                with self.assertRaises(ValueError):
+                    ctxgit.resolve_boss_desk(store, bad)
+            with self.assertRaises(ValueError):
+                ctxgit.delete_boss_desk(store, "")
+            desk = ctxgit.fork_boss_desk(store, "", "임시")
+            ctxgit.delete_boss_desk(store, desk)
+            self.assertEqual(ctxgit.boss_desk_ids(store), [""])
 
 
 class BossFollowUpTest(unittest.TestCase):

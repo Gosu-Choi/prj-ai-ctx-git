@@ -2593,35 +2593,12 @@ class ContextStore:
         dump_json(target_paths.meta, meta)
         self.write_index()
 
-    def create_branch_from_boss_chat(self, branch_id: str, title: str | None = None) -> Path:
-        """Start a branch from the boss chat, seeded with what was handed out.
-
-        Marked `createdFromBossChat` so the sidebar can badge it: these branches
-        are made mid-delegation and would otherwise be indistinguishable from the
-        long-running work around them.
-        """
+    def reset_boss_chat(self, desk: str = "") -> None:
+        """Clear a desk's log and any draft waiting for review. Its branches stay."""
         self.require_initialized()
-        records = iter_boss_history(self)
-        parent = "initial" if self.branch_paths("initial").root.exists() else None
-        self.create_branch_files(branch_id, title=title, parent=parent, tags=["from-boss-chat"])
-        paths = self.branch_paths(branch_id)
-        if records:
-            write_text(
-                paths.history,
-                "".join(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n" for r in records),
-            )
-        meta = load_json(paths.meta)
-        meta["createdFromBossChat"] = True
-        dump_json(paths.meta, meta)
-        self.write_index()
-        return paths.root
-
-    def reset_boss_chat(self) -> None:
-        """Clear the boss conversation and any draft waiting for review."""
-        self.require_initialized()
-        boss_dir(self).mkdir(parents=True, exist_ok=True)
-        write_text(boss_history_path(self), "")
-        clear_boss_draft(self)
+        boss_dir(self, desk).mkdir(parents=True, exist_ok=True)
+        write_text(boss_history_path(self, desk), "")
+        clear_boss_draft(self, desk)
 
     def create_branch_from_context_chat(self, branch_id: str, title: str | None = None) -> Path:
         """Create a fresh branch seeded with the top-level contexts chat.
@@ -4247,10 +4224,6 @@ class ContextStore:
             "updatedAt": meta.get("updatedAt"),
             "lastMessageAt": last_message_at,
             "lastUserMessageAt": last_user_message_at,
-            # Branches spun out of boss chat are badged in the sidebar: they are
-            # created mid-delegation and would otherwise be indistinguishable from
-            # the long-running work around them.
-            "fromBossChat": meta.get("createdFromBossChat") is True,
             "historyCount": len(history),
         }
 
@@ -11779,33 +11752,128 @@ BOSS_DIR_NAME = "boss"
 BOSS_SEND_MODES = ("info-chat", "send")
 
 
-def boss_dir(store: ContextStore) -> Path:
-    return store.contexts / BOSS_DIR_NAME
+BOSS_DESKS_DIR_NAME = "desks"
+BOSS_INFLIGHT_GRACE_SECONDS = 20
 
 
-def boss_history_path(store: ContextStore) -> Path:
-    return boss_dir(store) / "history.jsonl"
+def boss_dir(store: ContextStore, desk: str = "") -> Path:
+    """Where one desk lives. The first desk is contexts/boss itself; a desk split
+    off from another ("New branch from boss") sits beside it under desks/<id>, with
+    the same three files, so everything below works on either without caring."""
+    base = store.contexts / BOSS_DIR_NAME
+    return base / BOSS_DESKS_DIR_NAME / desk if desk else base
 
 
-def boss_config_path(store: ContextStore) -> Path:
-    return boss_dir(store) / "config.json"
+def boss_history_path(store: ContextStore, desk: str = "") -> Path:
+    return boss_dir(store, desk) / "history.jsonl"
 
 
-def boss_draft_path(store: ContextStore) -> Path:
-    return boss_dir(store) / "draft.json"
+def boss_config_path(store: ContextStore, desk: str = "") -> Path:
+    return boss_dir(store, desk) / "config.json"
 
 
-def boss_followup_job_key(branch_id: str) -> str:
+def boss_draft_path(store: ContextStore, desk: str = "") -> Path:
+    return boss_dir(store, desk) / "draft.json"
+
+
+def boss_meta_path(store: ContextStore, desk: str) -> Path:
+    return boss_dir(store, desk) / "meta.json"
+
+
+def boss_job_key(desk: str = "") -> str:
+    """The job-branch key a desk's own drafting runs under."""
+    return f"{BOSS_CHAT_KEY}@{desk}" if desk else BOSS_CHAT_KEY
+
+
+def boss_followup_job_key(branch_id: str, desk: str = "") -> str:
     """The job-branch key a follow-up draft runs under.
 
-    Not BOSS_CHAT_KEY itself: the UI tracks one job per key, and a follow-up being
+    Not the desk's own key: the UI tracks one job per key, and a follow-up being
     written in the background must not make the desk's composer look busy.
     """
-    return f"{BOSS_CHAT_KEY}:{branch_id}"
+    return f"{boss_job_key(desk)}:{branch_id}"
 
 
-def read_boss_config(store: ContextStore) -> dict[str, Any]:
-    data = load_json(boss_config_path(store)) if boss_config_path(store).exists() else {}
+def boss_desk_ids(store: ContextStore) -> list[str]:
+    """Every desk: "" for the first one, then the ones split off from it."""
+    base = store.contexts / BOSS_DIR_NAME / BOSS_DESKS_DIR_NAME
+    forks = sorted(
+        (path for path in base.iterdir() if (path / "meta.json").exists()),
+        key=lambda path: str(load_json(path / "meta.json").get("createdAt") or ""),
+    ) if base.is_dir() else []
+    return ["", *[path.name for path in forks]]
+
+
+def resolve_boss_desk(store: ContextStore, desk: Any) -> str:
+    """The desk a request named, or ValueError — never a path made from input."""
+    desk_id = str(desk or "").strip()
+    if desk_id not in boss_desk_ids(store):
+        raise ValueError(f"unknown boss desk: {desk_id}")
+    return desk_id
+
+
+def boss_desk_title(store: ContextStore, desk: str = "") -> str:
+    if not desk:
+        return "Boss"
+    return str(load_json(boss_meta_path(store, desk)).get("title") or desk)
+
+
+def list_boss_desks(store: ContextStore) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": desk,
+            "key": boss_job_key(desk),
+            "title": boss_desk_title(store, desk),
+            # Only a desk that was split off carries the star: it marks "this one
+            # came out of another Boss", which the first desk did not.
+            "forked": bool(desk),
+            "branches": read_boss_config(store, desk)["branches"],
+            "pending": len(boss_pending_items(store, desk)),
+        }
+        for desk in boss_desk_ids(store)
+    ]
+
+
+def fork_boss_desk(store: ContextStore, source: str, title: str) -> str:
+    """Split a new Boss off `source`, carrying everything it holds — including work
+    still in flight.
+
+    The new desk gets the same branches, log, drafts and threads. The `inflight`
+    entries come along too, and that is the point of copying them: a draft still
+    being written, or a branch still running, reports back to every desk holding
+    its entry, so the new Boss shows the work as in progress and receives the
+    result, rather than starting out blind to what was already under way.
+    """
+    title = str(title or "").strip()
+    if not title:
+        raise ValueError("title is required")
+    existing = set(boss_desk_ids(store))
+    base_id = slugify(title, fallback="boss")
+    desk, index = base_id, 2
+    while desk in existing:
+        desk, index = f"{base_id}-{index}", index + 1
+    target = boss_dir(store, desk)
+    with file_write_lock(boss_draft_path(store, source)):
+        target.mkdir(parents=True, exist_ok=False)
+        for name in ("config.json", "history.jsonl", "draft.json"):
+            origin = boss_dir(store, source) / name
+            if origin.exists():
+                shutil.copyfile(origin, target / name)
+        dump_json(
+            boss_meta_path(store, desk),
+            {"id": desk, "title": title, "createdAt": utc_now(), "forkedFrom": source},
+        )
+    return desk
+
+
+def delete_boss_desk(store: ContextStore, desk: str) -> None:
+    if not desk:
+        raise ValueError("The first Boss cannot be deleted; reset it instead.")
+    shutil.rmtree(boss_dir(store, resolve_boss_desk(store, desk)))
+
+
+def read_boss_config(store: ContextStore, desk: str = "") -> dict[str, Any]:
+    data = load_json(boss_config_path(store, desk)) if boss_config_path(store, desk).exists() else {}
     if not isinstance(data, dict):
         data = {}
     raw = data.get("branches")
@@ -11816,25 +11884,27 @@ def read_boss_config(store: ContextStore) -> dict[str, Any]:
     return {"branches": [b for b in dict.fromkeys(branches) if b in known]}
 
 
-def write_boss_config(store: ContextStore, branches: list[str]) -> dict[str, Any]:
+def write_boss_config(store: ContextStore, branches: list[str], desk: str = "") -> dict[str, Any]:
     known = {str(item.get("id") or "") for item in store.list_branches()}
     unknown = [b for b in branches if b not in known]
     if unknown:
         raise ValueError(f"unknown branch: {', '.join(unknown)}")
-    boss_dir(store).mkdir(parents=True, exist_ok=True)
-    dump_json(boss_config_path(store), {"branches": list(dict.fromkeys(branches))})
+    boss_dir(store, desk).mkdir(parents=True, exist_ok=True)
+    dump_json(boss_config_path(store, desk), {"branches": list(dict.fromkeys(branches))})
     # A draft addressed to a branch that just left the desk can no longer be sent.
-    drop_boss_items(store, keep=set(branches))
-    return read_boss_config(store)
+    drop_boss_items(store, keep=set(branches), desk=desk)
+    return read_boss_config(store, desk)
 
 
-def iter_boss_history(store: ContextStore) -> list[dict[str, Any]]:
-    return store.read_history_file(boss_history_path(store))
+def iter_boss_history(store: ContextStore, desk: str = "") -> list[dict[str, Any]]:
+    return store.read_history_file(boss_history_path(store, desk))
 
 
-def append_boss_history(store: ContextStore, role: str, text: str, extra: dict[str, Any] | None = None) -> dict[str, Any]:
-    boss_dir(store).mkdir(parents=True, exist_ok=True)
-    path = boss_history_path(store)
+def append_boss_history(
+    store: ContextStore, role: str, text: str, extra: dict[str, Any] | None = None, desk: str = ""
+) -> dict[str, Any]:
+    boss_dir(store, desk).mkdir(parents=True, exist_ok=True)
+    path = boss_history_path(store, desk)
     record = {
         "schemaVersion": 1,
         "id": new_history_record_id(),
@@ -11854,49 +11924,51 @@ def append_boss_history(store: ContextStore, role: str, text: str, extra: dict[s
 # --- the desk -----------------------------------------------------------------
 
 
-def read_boss_draft(store: ContextStore) -> dict[str, Any]:
-    path = boss_draft_path(store)
+def read_boss_draft(store: ContextStore, desk: str = "") -> dict[str, Any]:
+    path = boss_draft_path(store, desk)
     if not path.exists():
         return {}
     data = load_json(path)
     return data if isinstance(data, dict) else {}
 
 
-def mutate_boss_draft(store: ContextStore, change: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
+def mutate_boss_draft(
+    store: ContextStore, change: Callable[[dict[str, Any]], None], desk: str = ""
+) -> dict[str, Any]:
     """Read-modify-write the desk under one lock.
 
     Drafting, follow-ups landing from finished turns and the user's own edits all
     write here from different threads; without the lock the last writer silently
     drops what the others just put on the board.
     """
-    path = boss_draft_path(store)
+    path = boss_draft_path(store, desk)
     with file_write_lock(path):
-        desk = read_boss_draft(store)
-        change(desk)
-        boss_dir(store).mkdir(parents=True, exist_ok=True)
-        dump_json(path, desk)
-        return desk
+        data = read_boss_draft(store, desk)
+        change(data)
+        boss_dir(store, desk).mkdir(parents=True, exist_ok=True)
+        dump_json(path, data)
+        return data
 
 
-def clear_boss_draft(store: ContextStore) -> None:
-    with file_write_lock(boss_draft_path(store)):
+def clear_boss_draft(store: ContextStore, desk: str = "") -> None:
+    with file_write_lock(boss_draft_path(store, desk)):
         with contextlib.suppress(OSError):
-            boss_draft_path(store).unlink()
+            boss_draft_path(store, desk).unlink()
 
 
-def boss_pending_items(store: ContextStore) -> list[dict[str, Any]]:
+def boss_pending_items(store: ContextStore, desk: str = "") -> list[dict[str, Any]]:
     """Everything waiting for review, at most one item per branch.
 
     The first round and every follow-up land in the same list: from the desk's
     point of view there is no difference between "what should we tell sales" and
     "sales just answered — what now". Both are a sentence waiting to be approved.
     """
-    raw = read_boss_draft(store).get("items")
+    raw = read_boss_draft(store, desk).get("items")
     return [item for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
 
 
-def boss_threads(store: ContextStore) -> dict[str, dict[str, Any]]:
-    raw = read_boss_draft(store).get("threads")
+def boss_threads(store: ContextStore, desk: str = "") -> dict[str, dict[str, Any]]:
+    raw = read_boss_draft(store, desk).get("threads")
     return {str(k): v for k, v in raw.items() if isinstance(v, dict)} if isinstance(raw, dict) else {}
 
 
@@ -11905,38 +11977,38 @@ def _desk_items(desk: dict[str, Any]) -> list[dict[str, Any]]:
     return [item for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
 
 
-def upsert_boss_items(store: ContextStore, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def upsert_boss_items(store: ContextStore, items: list[dict[str, Any]], desk: str = "") -> list[dict[str, Any]]:
     """Add or replace review items, newest wording winning per branch."""
 
-    def change(desk: dict[str, Any]) -> None:
-        by_branch = {str(item.get("branch")): item for item in _desk_items(desk)}
+    def change(data: dict[str, Any]) -> None:
+        by_branch = {str(item.get("branch")): item for item in _desk_items(data)}
         for item in items:
             by_branch[str(item.get("branch"))] = item
-        desk["items"] = list(by_branch.values())
+        data["items"] = list(by_branch.values())
 
-    return _desk_items(mutate_boss_draft(store, change))
+    return _desk_items(mutate_boss_draft(store, change, desk))
 
 
 def drop_boss_items(
-    store: ContextStore, branches: set[str] | None = None, *, keep: set[str] | None = None
+    store: ContextStore, branches: set[str] | None = None, *, keep: set[str] | None = None, desk: str = ""
 ) -> None:
     """Take items off the board: the named branches, or everything not in `keep`."""
-    if not boss_draft_path(store).exists():
+    if not boss_draft_path(store, desk).exists():
         return
 
-    def change(desk: dict[str, Any]) -> None:
+    def change(data: dict[str, Any]) -> None:
         def stays(item: dict[str, Any]) -> bool:
             branch_id = str(item.get("branch"))
             if keep is not None:
                 return branch_id in keep
             return branches is not None and branch_id not in branches
 
-        desk["items"] = [item for item in _desk_items(desk) if stays(item)]
+        data["items"] = [item for item in _desk_items(data) if stays(item)]
 
-    mutate_boss_draft(store, change)
+    mutate_boss_draft(store, change, desk)
 
 
-def save_boss_edits(store: ContextStore, edits: Any) -> None:
+def save_boss_edits(store: ContextStore, edits: Any, desk: str = "") -> None:
     """Persist wording the user typed over a draft.
 
     Hand edits are kept on the item rather than only in the page, so a re-render,
@@ -11949,18 +12021,111 @@ def save_boss_edits(store: ContextStore, edits: Any) -> None:
         if isinstance(item, dict)
     }
     wanted = {branch: text for branch, text in wanted.items() if branch and text}
-    if not wanted or not boss_draft_path(store).exists():
+    if not wanted or not boss_draft_path(store, desk).exists():
         return
 
-    def change(desk: dict[str, Any]) -> None:
-        for item in _desk_items(desk):
+    def change(data: dict[str, Any]) -> None:
+        for item in _desk_items(data):
             text = wanted.get(str(item.get("branch")))
             if text and text != item.get("instruction"):
                 item["instruction"] = text
                 item["edited"] = True
                 item["editedAt"] = utc_now()
 
-    mutate_boss_draft(store, change)
+    mutate_boss_draft(store, change, desk)
+
+
+# --- work in flight ---------------------------------------------------------------
+#
+# A draft being written, a branch turn running, a follow-up being composed: each is
+# one entry in the `inflight` list of the desk that started it. Splitting a new Boss
+# off a desk copies that list, and whatever finishes is delivered to every desk
+# still holding its entry. That is how a Boss made in the middle of something keeps
+# showing it as in progress and gets the result, instead of only the desk that
+# happened to start it.
+
+
+def _desk_inflight(data: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = data.get("inflight")
+    return [entry for entry in raw if isinstance(entry, dict)] if isinstance(raw, list) else []
+
+
+def add_boss_inflight(store: ContextStore, desk: str, kind: str, **fields: Any) -> str:
+    work_id = new_turn_id()
+    entry = {"id": work_id, "kind": kind, "jobIds": [], "startedAt": utc_now(), **fields}
+    mutate_boss_draft(
+        store, lambda data: data.__setitem__("inflight", [*_desk_inflight(data), entry]), desk
+    )
+    return work_id
+
+
+def boss_inflight_desks(store: ContextStore, work_id: str) -> list[str]:
+    """Every desk still holding this piece of work — where its result belongs."""
+    if not work_id:
+        return []
+    return [
+        desk for desk in boss_desk_ids(store)
+        if any(entry.get("id") == work_id for entry in _desk_inflight(read_boss_draft(store, desk)))
+    ]
+
+
+def update_boss_inflight(store: ContextStore, work_id: str, *, job_id: str = "", kind: str = "") -> None:
+    def change(data: dict[str, Any]) -> None:
+        for entry in _desk_inflight(data):
+            if entry.get("id") != work_id:
+                continue
+            if job_id:
+                entry["jobIds"] = [*(entry.get("jobIds") or []), job_id]
+            if kind:
+                entry["kind"] = kind
+
+    for desk in boss_inflight_desks(store, work_id):
+        mutate_boss_draft(store, change, desk)
+
+
+def finish_boss_inflight(store: ContextStore, work_id: str) -> None:
+    for desk in boss_inflight_desks(store, work_id):
+        mutate_boss_draft(
+            store,
+            lambda data: data.__setitem__(
+                "inflight", [e for e in _desk_inflight(data) if e.get("id") != work_id]
+            ),
+            desk,
+        )
+
+
+def live_boss_inflight(store: ContextStore, desk: str, running_job_ids: set[str] | None) -> list[dict[str, Any]]:
+    """The desk's in-flight entries that are really still going.
+
+    An entry outlives its work when the server stops mid-job. One is believed only
+    while a job it names is running, or while it is too young to have been given a
+    job id yet; the rest are dropped here so nothing shows as working forever.
+    """
+    entries = _desk_inflight(read_boss_draft(store, desk))
+    if running_job_ids is None or not entries:
+        return entries
+    now = datetime.now(timezone.utc)
+
+    def alive(entry: dict[str, Any]) -> bool:
+        if any(str(job_id) in running_job_ids for job_id in entry.get("jobIds") or []):
+            return True
+        try:
+            started = datetime.fromisoformat(str(entry.get("startedAt") or "").replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        return (now - started).total_seconds() < BOSS_INFLIGHT_GRACE_SECONDS
+
+    live = [entry for entry in entries if alive(entry)]
+    if len(live) != len(entries):
+        keep = {entry.get("id") for entry in live}
+        mutate_boss_draft(
+            store,
+            lambda data: data.__setitem__(
+                "inflight", [e for e in _desk_inflight(data) if e.get("id") in keep]
+            ),
+            desk,
+        )
+    return live
 
 
 def new_boss_item(branch_id: str, instruction: str, **fields: Any) -> dict[str, Any]:
@@ -12133,7 +12298,7 @@ BOSS_FEEDBACK_TRAIL_ROUNDS = 5
 
 
 def boss_feedback_trail(
-    store: ContextStore, branch_id: str, *, current: str = ""
+    store: ContextStore, branch_id: str, *, current: str = "", desk: str = ""
 ) -> list[str]:
     """What the user already said about this branch's draft, oldest first.
 
@@ -12147,7 +12312,7 @@ def boss_feedback_trail(
     runs.
     """
     texts: list[str] = []
-    for record in iter_boss_history(store):
+    for record in iter_boss_history(store, desk):
         if str(record.get("kind")) != "feedback":
             continue
         branches = record.get("branches")
@@ -12162,7 +12327,7 @@ def boss_feedback_trail(
 
 
 def build_boss_revision_prompt(
-    store: ContextStore, targets: list[dict[str, Any]], feedback: str
+    store: ContextStore, targets: list[dict[str, Any]], feedback: str, desk: str = ""
 ) -> str:
     """Ask for the drafts to be rewritten against the user's comment on them."""
     drafts = []
@@ -12175,7 +12340,7 @@ def build_boss_revision_prompt(
             answer = str(last_branch_answer(store, branch_id).get("text") or "")
             if answer:
                 block += ["the branch's latest answer:", f"<answer>{truncate_middle(answer, 3000)}</answer>"]
-        trail = boss_feedback_trail(store, branch_id, current=feedback)
+        trail = boss_feedback_trail(store, branch_id, current=feedback, desk=desk)
         if trail:
             block.append("what you were already told about this draft, oldest first:")
             block += [f"<earlier_feedback>{truncate_middle(text, 1500)}</earlier_feedback>" for text in trail]
@@ -12286,6 +12451,8 @@ def draft_boss_assignments(
     store: ContextStore,
     message: str,
     *,
+    desk: str = "",
+    work_id: str = "",
     record_request: bool = True,
     progress: ProgressCallback | None = None,
 ) -> list[dict[str, Any]]:
@@ -12296,44 +12463,56 @@ def draft_boss_assignments(
     before they send it — so this produces drafts the user edits, redirects with
     feedback, or approves.
     """
-    branches = read_boss_config(store)["branches"]
+    branches = read_boss_config(store, desk)["branches"]
     if not branches:
         raise ValueError("Boss chat has no branches selected yet.")
     if record_request:
         # The HTTP path records the request itself, before the job starts, so it
         # is on screen from the first moment even if drafting then fails.
-        append_boss_history(store, "user", message)
+        append_boss_history(store, "user", message, desk=desk)
     emit_progress(progress, "Drafting what each branch should be told")
-    routing = boss_structured_reply(
-        call_provider_prompt(
-            _boss_provider(root), root, build_boss_routing_prompt(store, message, branches),
-            writable=False, cwd=root, progress=progress, output_schema=BOSS_ROUTING_SCHEMA,
-        ),
-        "assignments",
-    )
-    assignments = normalize_boss_assignments(routing.get("assignments"), branches)
-    summary = str(routing.get("summary") or "").strip()
-    items = [
-        new_boss_item(
-            item["branch"], item["instruction"],
-            suggestedMode=item.get("suggestedMode") or "info-chat",
-            origin="initial", request=message, reason="",
+    try:
+        routing = boss_structured_reply(
+            call_provider_prompt(
+                _boss_provider(root), root, build_boss_routing_prompt(store, message, branches),
+                writable=False, cwd=root, progress=progress, output_schema=BOSS_ROUTING_SCHEMA,
+            ),
+            "assignments",
         )
-        for item in assignments
-    ]
-    if items:
-        upsert_boss_items(store, items)
-    # The desk's own voice in the log: how the request was split, or that it was
-    # not. A request that produced no draft and no explanation looks like a bug.
-    lines = [summary] if summary else []
-    lines += [f"- **{item['branch']}** 초안 준비됨" for item in items]
-    if not items:
-        lines.append("_고른 브랜치 중 이 일을 맡을 곳을 찾지 못했습니다._")
-    append_boss_history(
-        store, "assistant", "\n".join(lines),
-        extra={"kind": "draft", "branches": [item["branch"] for item in items]},
-    )
-    return items
+        assignments = normalize_boss_assignments(routing.get("assignments"), branches)
+        summary = str(routing.get("summary") or "").strip()
+        delivered: list[dict[str, Any]] = []
+        # Every desk holding this work gets the result — the one that asked, and
+        # any Boss split off from it while the draft was still being written.
+        for target in boss_inflight_desks(store, work_id) if work_id else [desk]:
+            allowed = set(read_boss_config(store, target)["branches"])
+            items = [
+                new_boss_item(
+                    item["branch"], item["instruction"],
+                    suggestedMode=item.get("suggestedMode") or "info-chat",
+                    origin="initial", request=message, reason="",
+                )
+                for item in assignments if item["branch"] in allowed
+            ]
+            if items:
+                upsert_boss_items(store, items, target)
+            # The desk's own voice in the log: how the request was split, or that
+            # it was not. A request that produced no draft and no explanation
+            # looks like a bug.
+            lines = [summary] if summary else []
+            lines += [f"- **{item['branch']}** 초안 준비됨" for item in items]
+            if not items:
+                lines.append("_고른 브랜치 중 이 일을 맡을 곳을 찾지 못했습니다._")
+            append_boss_history(
+                store, "assistant", "\n".join(lines),
+                extra={"kind": "draft", "branches": [item["branch"] for item in items]},
+                desk=target,
+            )
+            if target == desk:
+                delivered = items
+        return delivered
+    finally:
+        finish_boss_inflight(store, work_id)
 
 
 def revise_boss_items(
@@ -12341,6 +12520,8 @@ def revise_boss_items(
     store: ContextStore,
     feedback: str,
     *,
+    desk: str = "",
+    work_id: str = "",
     only: list[str] | None = None,
     record_feedback: bool = True,
     progress: ProgressCallback | None = None,
@@ -12349,54 +12530,67 @@ def revise_boss_items(
     feedback = str(feedback or "").strip()
     if not feedback:
         raise ValueError("feedback is required")
-    allowed = set(read_boss_config(store)["branches"])
+    allowed = set(read_boss_config(store, desk)["branches"])
     targets = [
-        item for item in boss_pending_items(store)
+        item for item in boss_pending_items(store, desk)
         if str(item.get("branch")) in allowed and (not only or str(item.get("branch")) in only)
     ]
     if not targets:
+        finish_boss_inflight(store, work_id)
         raise ValueError("There is no draft to revise.")
     target_ids = [str(item.get("branch")) for item in targets]
     if record_feedback:
-        append_boss_history(store, "user", feedback, extra={"kind": "feedback", "branches": target_ids})
-    emit_progress(progress, "Rewriting the drafts from your feedback")
-    result = boss_structured_reply(
-        call_provider_prompt(
-            _boss_provider(root), root, build_boss_revision_prompt(store, targets, feedback),
-            writable=False, cwd=root, progress=progress, output_schema=BOSS_ROUTING_SCHEMA,
-        ),
-        "assignments",
-    )
-    rewritten = {
-        item["branch"]: item
-        for item in normalize_boss_assignments(result.get("assignments"), target_ids)
-    }
-    items = []
-    for old in targets:
-        new = rewritten.get(str(old.get("branch")))
-        if not new:
-            continue  # the model skipped it: the existing draft stays as it was
-        items.append(
-            new_boss_item(
-                new["branch"], new["instruction"],
-                suggestedMode=new.get("suggestedMode") or old.get("suggestedMode") or "info-chat",
-                origin=old.get("origin") or "initial",
-                request=old.get("request") or "",
-                reason=old.get("reason") or "",
-                done=old.get("done") is True,
-                revision=int(old.get("revision") or 0) + 1,
-                lastFeedback=feedback,
-            )
+        append_boss_history(
+            store, "user", feedback, extra={"kind": "feedback", "branches": target_ids}, desk=desk
         )
-    if items:
-        upsert_boss_items(store, items)
-    summary = str(result.get("summary") or "").strip()
-    append_boss_history(
-        store, "assistant",
-        summary or ("초안을 다시 썼습니다." if items else "_초안을 바꾸지 못했습니다._"),
-        extra={"kind": "revision", "branches": [item["branch"] for item in items]},
-    )
-    return items
+    emit_progress(progress, "Rewriting the drafts from your feedback")
+    try:
+        result = boss_structured_reply(
+            call_provider_prompt(
+                _boss_provider(root), root, build_boss_revision_prompt(store, targets, feedback, desk),
+                writable=False, cwd=root, progress=progress, output_schema=BOSS_ROUTING_SCHEMA,
+            ),
+            "assignments",
+        )
+        rewritten = {
+            item["branch"]: item
+            for item in normalize_boss_assignments(result.get("assignments"), target_ids)
+        }
+        summary = str(result.get("summary") or "").strip()
+        delivered: list[dict[str, Any]] = []
+        for holder in boss_inflight_desks(store, work_id) if work_id else [desk]:
+            # A desk only takes a rewrite of a draft it is still holding.
+            held = {str(item.get("branch")) for item in boss_pending_items(store, holder)}
+            items = []
+            for old in targets:
+                new = rewritten.get(str(old.get("branch")))
+                if not new or new["branch"] not in held:
+                    continue  # the model skipped it: the existing draft stays as it was
+                items.append(
+                    new_boss_item(
+                        new["branch"], new["instruction"],
+                        suggestedMode=new.get("suggestedMode") or old.get("suggestedMode") or "info-chat",
+                        origin=old.get("origin") or "initial",
+                        request=old.get("request") or "",
+                        reason=old.get("reason") or "",
+                        done=old.get("done") is True,
+                        revision=int(old.get("revision") or 0) + 1,
+                        lastFeedback=feedback,
+                    )
+                )
+            if items:
+                upsert_boss_items(store, items, holder)
+            append_boss_history(
+                store, "assistant",
+                summary or ("초안을 다시 썼습니다." if items else "_초안을 바꾸지 못했습니다._"),
+                extra={"kind": "revision", "branches": [item["branch"] for item in items]},
+                desk=holder,
+            )
+            if holder == desk:
+                delivered = items
+        return delivered
+    finally:
+        finish_boss_inflight(store, work_id)
 
 
 BOSS_FOLLOWUP_SCHEMA = {
@@ -12417,6 +12611,8 @@ def draft_boss_followup(
     store: ContextStore,
     branch_id: str,
     *,
+    desk: str = "",
+    work_id: str = "",
     progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     """Propose what to say to a branch next, now that it has answered.
@@ -12426,18 +12622,41 @@ def draft_boss_followup(
     Proposing it here keeps the desk one step ahead without sending anything: it
     is still a draft, reviewed like every other.
     """
-    if branch_id not in read_boss_config(store)["branches"]:
+    try:
+        return _draft_boss_followup(root, store, branch_id, desk, work_id, progress)
+    finally:
+        finish_boss_inflight(store, work_id)
+
+
+def _draft_boss_followup(
+    root: Path,
+    store: ContextStore,
+    branch_id: str,
+    desk: str,
+    work_id: str,
+    progress: ProgressCallback | None,
+) -> dict[str, Any]:
+    def wants_it(holder: str) -> bool:
+        if branch_id not in read_boss_config(store, holder)["branches"]:
+            return False
+        sent_at = str(boss_threads(store, holder).get(branch_id, {}).get("sentAt") or "")
+        # The user already queued something newer for this branch while it was
+        # working; their request outranks a follow-up nobody asked for.
+        return not any(
+            str(item.get("branch")) == branch_id and str(item.get("createdAt") or "") > sent_at
+            for item in boss_pending_items(store, holder)
+        )
+
+    # The desk that sent the turn, and any Boss split off from it while the branch
+    # was still working.
+    holders = [h for h in (boss_inflight_desks(store, work_id) if work_id else [desk]) if wants_it(h)]
+    if not holders:
         return {}
     answer = str(last_branch_answer(store, branch_id).get("text") or "")
     if not answer:
         return {}
-    thread = boss_threads(store).get(branch_id, {})
-    sent_at = str(thread.get("sentAt") or "")
-    for item in boss_pending_items(store):
-        # The user already queued something newer for this branch while it was
-        # working; their request outranks a follow-up nobody asked for.
-        if str(item.get("branch")) == branch_id and str(item.get("createdAt") or "") > sent_at:
-            return {}
+    source = desk if desk in holders else holders[0]
+    thread = boss_threads(store, source).get(branch_id, {})
     emit_progress(progress, f"Drafting the next message for {branch_id}")
     prompt = "\n".join(
         [
@@ -12499,7 +12718,8 @@ def draft_boss_followup(
         reason=str(result.get("reason") or "").strip(),
         done=result.get("done") is True,
     )
-    upsert_boss_items(store, [item])
+    for holder in holders:
+        upsert_boss_items(store, [dict(item)], holder)
     return item
 
 
@@ -12511,20 +12731,21 @@ def dispatch_boss_items(
     store: ContextStore,
     jobs: "JobStore",
     approved: Any,
+    desk: str = "",
 ) -> dict[str, Any]:
     """Send approved wording, each branch in the mode chosen for that one turn.
 
     `approved` is what the page holds at the moment of approval — the text as the
     user left it and the mode they clicked — not what is stored on the desk.
     """
-    allowed = read_boss_config(store)["branches"]
+    allowed = read_boss_config(store, desk)["branches"]
     items = normalize_boss_assignments(approved, allowed)
     missing_mode = [item["branch"] for item in items if "mode" not in item]
     if missing_mode:
         raise ValueError(f"mode is required (send or info-chat): {', '.join(missing_mode)}")
     if not items:
         raise ValueError("Nothing to send.")
-    pending = {str(item.get("branch")): item for item in boss_pending_items(store)}
+    pending = {str(item.get("branch")): item for item in boss_pending_items(store, desk)}
 
     started: list[dict[str, Any]] = []
     for item in items:
@@ -12536,13 +12757,16 @@ def dispatch_boss_items(
             jobs.interject(str(busy[0].get("id")), item["instruction"], root=root)
             started.append({**item, "delivery": "interjected", "jobId": str(busy[0].get("id") or "")})
             continue
+        work_id = add_boss_inflight(store, desk, "turn", branch=branch_id)
         job = start_branch_turn(
             root, store, jobs, branch_id, item["instruction"],
             writable=item["mode"] == "send",
             # The next instruction is written the moment the answer lands, while
             # the desk still has somewhere to go rather than an idle branch.
-            on_complete=lambda b=branch_id: start_boss_followup(root, store, jobs, b),
+            on_complete=lambda b=branch_id, w=work_id: start_boss_followup(root, store, jobs, b, desk, w),
+            on_error=lambda w=work_id: finish_boss_inflight(store, w),
         )
+        update_boss_inflight(store, work_id, job_id=str(job.get("id") or ""))
         started.append({
             **item, "delivery": "started",
             "jobId": str(job.get("id") or ""), "jobMode": str(job.get("mode") or ""),
@@ -12550,8 +12774,8 @@ def dispatch_boss_items(
 
     now = utc_now()
 
-    def change(desk: dict[str, Any]) -> None:
-        threads = desk.get("threads") if isinstance(desk.get("threads"), dict) else {}
+    def change(data: dict[str, Any]) -> None:
+        threads = data.get("threads") if isinstance(data.get("threads"), dict) else {}
         for item in started:
             previous = threads.get(item["branch"]) if isinstance(threads.get(item["branch"]), dict) else {}
             source = pending.get(item["branch"], {})
@@ -12563,12 +12787,12 @@ def dispatch_boss_items(
                 "sentAt": now,
                 "turns": int(previous.get("turns") or 0) + 1,
             }
-        desk["threads"] = threads
+        data["threads"] = threads
         # Only what was acted on leaves the board; anything untouched stays.
         sent = {item["branch"] for item in started}
-        desk["items"] = [i for i in _desk_items(desk) if str(i.get("branch")) not in sent]
+        data["items"] = [i for i in _desk_items(data) if str(i.get("branch")) not in sent]
 
-    mutate_boss_draft(store, change)
+    mutate_boss_draft(store, change, desk)
 
     lines = []
     for item in started:
@@ -12577,21 +12801,27 @@ def dispatch_boss_items(
     append_boss_history(
         store, "assistant", "\n".join(lines),
         extra={"kind": "dispatch", "assignments": started},
+        desk=desk,
     )
-    payload = boss_chat_payload(store, jobs)
+    payload = boss_chat_payload(store, jobs, desk)
     payload["started"] = started
     return payload
 
 
-def start_boss_followup(root: Path, store: ContextStore, jobs: "JobStore", branch_id: str) -> dict[str, Any]:
+def start_boss_followup(
+    root: Path, store: ContextStore, jobs: "JobStore", branch_id: str, desk: str = "", work_id: str = ""
+) -> dict[str, Any]:
     def work(progress: ProgressCallback) -> dict[str, Any]:
-        draft_boss_followup(root, store, branch_id, progress=progress)
-        return boss_chat_payload(store, jobs)
+        draft_boss_followup(root, store, branch_id, desk=desk, work_id=work_id, progress=progress)
+        return {"boss": True, "desk": desk}
 
-    return jobs.create(
+    job = jobs.create(
         "boss-followup", work, root=root,
-        branch=boss_followup_job_key(branch_id), mode="boss-followup",
+        branch=boss_followup_job_key(branch_id, desk), mode="boss-followup",
     )
+    # Same entry, next phase: the branch is done and its follow-up is being written.
+    update_boss_inflight(store, work_id, job_id=str(job.get("id") or ""), kind="followup")
+    return job
 
 
 def start_branch_turn(
@@ -12603,21 +12833,28 @@ def start_branch_turn(
     *,
     writable: bool,
     on_complete: Callable[[], Any] | None = None,
+    on_error: Callable[[], Any] | None = None,
 ) -> dict[str, Any]:
     """Start one branch's turn the same way every other entry point does."""
     provider = branch_provider_authority(root, branch_id, None)
     room = branch_is_sequence_room(store, branch_id)
 
     def work(progress: ProgressCallback) -> dict[str, Any]:
-        if room:
-            result = run_sequence_room_turn(
-                root, store, branch_id, text,
-                run_mode="send" if writable else "info-chat", progress=progress,
-            )
-        elif writable:
-            result = run_chat_turn(root, store, branch_id, text, provider=provider, progress=progress)
-        else:
-            result = run_history_chat_turn(root, store, branch_id, text, provider=provider, progress=progress)
+        try:
+            if room:
+                result = run_sequence_room_turn(
+                    root, store, branch_id, text,
+                    run_mode="send" if writable else "info-chat", progress=progress,
+                )
+            elif writable:
+                result = run_chat_turn(root, store, branch_id, text, provider=provider, progress=progress)
+            else:
+                result = run_history_chat_turn(root, store, branch_id, text, provider=provider, progress=progress)
+        except BaseException:
+            if on_error is not None:
+                with contextlib.suppress(Exception):
+                    on_error()
+            raise
         if on_complete is not None:
             # Best-effort: a failed follow-up draft must not fail the turn that
             # actually did the work.
@@ -12629,17 +12866,18 @@ def start_branch_turn(
     return jobs.create(kind, work, root=root, branch=branch_id, mode=kind)
 
 
-def boss_chat_payload(store: ContextStore, jobs: "JobStore | None" = None) -> dict[str, Any]:
+def boss_chat_payload(store: ContextStore, jobs: "JobStore | None" = None, desk: str = "") -> dict[str, Any]:
     store.require_initialized()
-    config = read_boss_config(store)
+    config = read_boss_config(store, desk)
     selected = set(config["branches"])
-    running_keys = (
-        {str(job.get("branch") or "") for job in jobs.running_jobs(root=store.root)}
-        if jobs is not None
-        else set()
+    running = jobs.running_jobs(root=store.root) if jobs is not None else []
+    running_keys = {str(job.get("branch") or "") for job in running}
+    inflight = live_boss_inflight(
+        store, desk, {str(job.get("id") or "") for job in running} if jobs is not None else None
     )
-    threads = boss_threads(store)
-    pending = [item for item in boss_pending_items(store) if str(item.get("branch")) in selected]
+    following_up = {str(e.get("branch")) for e in inflight if e.get("kind") == "followup"}
+    threads = boss_threads(store, desk)
+    pending = [item for item in boss_pending_items(store, desk) if str(item.get("branch")) in selected]
 
     def row(item: dict[str, Any]) -> dict[str, Any]:
         branch_id = str(item.get("id") or "")
@@ -12650,7 +12888,6 @@ def boss_chat_payload(store: ContextStore, jobs: "JobStore | None" = None) -> di
             "historyCount": item.get("historyCount") or 0,
             "running": branch_id in running_keys,
             "selected": branch_id in selected,
-            "fromBossChat": item.get("fromBossChat") is True,
             "lastMessageAt": item.get("lastMessageAt") or "",
         }
         if branch_id in selected:
@@ -12660,22 +12897,36 @@ def boss_chat_payload(store: ContextStore, jobs: "JobStore | None" = None) -> di
             out["lastAnswer"] = truncate_middle(str(answer.get("text") or ""), 4000)
             out["lastAnswerAt"] = str(answer.get("createdAt") or "")
             out["thread"] = threads.get(branch_id, {})
-            out["draftingFollowup"] = boss_followup_job_key(branch_id) in running_keys
+            out["draftingFollowup"] = branch_id in following_up
         return out
 
     return {
-        "meta": {"id": BOSS_CHAT_KEY, "title": "Boss", "scope": "boss"},
+        "meta": {"id": boss_job_key(desk), "title": boss_desk_title(store, desk), "scope": "boss"},
         "archived": False,
         "topLevel": True,
         "boss": True,
+        "desk": {"id": desk, "key": boss_job_key(desk), "title": boss_desk_title(store, desk), "forked": bool(desk)},
+        "desks": list_boss_desks(store),
+        # Drafting that is under way for this desk — including drafting another
+        # Boss started before this one was split off from it.
+        "drafting": [
+            {
+                "id": str(entry.get("id") or ""),
+                "kind": str(entry.get("kind") or ""),
+                "jobId": str((entry.get("jobIds") or [""])[-1]),
+                "branches": entry.get("branches") or [],
+            }
+            for entry in inflight
+            if entry.get("kind") in {"draft", "revise"}
+        ],
         "config": config,
         # The same shape the sidebar groups by, so the picker can look identical
         # instead of being a flat list nobody can find a branch in.
         "folders": store.list_branch_folders(),
         "branches": [row(item) for item in store.list_branches()],
-        "history": iter_boss_history(store),
+        "history": iter_boss_history(store, desk),
         "pending": pending,
-        "paths": {"history": relpath(store.root, boss_history_path(store))},
+        "paths": {"history": relpath(store.root, boss_history_path(store, desk))},
         "approvalStatuses": {},
         "notes": [], "research": [], "artifacts": [], "sources": [],
         "resources": [], "compactions": [], "archives": [],
@@ -14599,7 +14850,10 @@ def make_handler(
                 return True
             if parsed.path == "/api/boss":
                 try:
-                    self.send_json(boss_chat_payload(store, jobs))
+                    desk = resolve_boss_desk(store, (query.get("desk") or [""])[0])
+                    self.send_json(boss_chat_payload(store, jobs, desk))
+                except ValueError as exc:
+                    self.send_json({"error": "unknown_boss_desk", "message": str(exc)}, status=404)
                 except SystemExit as exc:
                     self.send_json(die_payload("boss_failed", exc), status=http_status_from_exit(exc, 400))
                 return True
@@ -14616,8 +14870,7 @@ def make_handler(
                         "globalized": store.list_globalized_archives(),
                         # The sidebar lists the desk's branches under the Boss chat
                         # button without having to open it first.
-                        "bossBranches": read_boss_config(store)["branches"],
-                        "bossPending": len(boss_pending_items(store)),
+                        "bossDesks": list_boss_desks(store),
                     }
                 )
                 return True
@@ -16346,12 +16599,19 @@ def make_handler(
                     status=202,
                 )
                 return
+            if parsed.path.startswith("/api/boss/"):
+                try:
+                    desk = resolve_boss_desk(store, body.get("desk"))
+                except ValueError as exc:
+                    self.send_json({"error": "unknown_boss_desk", "message": str(exc)}, status=404)
+                    return
+                desk_key = boss_job_key(desk)
             if parsed.path == "/api/boss/config":
                 raw = body.get("branches")
                 branches = [str(item) for item in raw] if isinstance(raw, list) else []
                 try:
-                    write_boss_config(store, branches)
-                    self.send_json(boss_chat_payload(store, jobs))
+                    write_boss_config(store, branches, desk)
+                    self.send_json(boss_chat_payload(store, jobs, desk))
                 except ValueError as exc:
                     self.send_json({"error": "invalid_boss_config", "message": str(exc)}, status=400)
                 except SystemExit as exc:
@@ -16362,7 +16622,7 @@ def make_handler(
                 if not text:
                     self.send_json({"error": "message_required"}, status=400)
                     return
-                if not read_boss_config(store)["branches"]:
+                if not read_boss_config(store, desk)["branches"]:
                     self.send_json(
                         {"error": "no_boss_branches", "message": "Branches 탭에서 브랜치를 먼저 고르세요."},
                         status=400,
@@ -16372,16 +16632,19 @@ def make_handler(
                 # desk from the first moment, whatever happens to the drafting.
                 # A re-run drafts again from a request that is already on the log.
                 if body.get("rerun") is not True:
-                    append_boss_history(store, "user", text)
+                    append_boss_history(store, "user", text, desk=desk)
+                work_id = add_boss_inflight(store, desk, "draft")
 
                 def draft_work(progress: ProgressCallback) -> dict[str, Any]:
-                    draft_boss_assignments(root, store, text, record_request=False, progress=progress)
-                    return boss_chat_payload(store, jobs)
+                    draft_boss_assignments(
+                        root, store, text, desk=desk, work_id=work_id,
+                        record_request=False, progress=progress,
+                    )
+                    return {"boss": True, "desk": desk}
 
-                self.send_json(
-                    jobs.create("boss-draft", draft_work, root=root, branch=BOSS_CHAT_KEY, mode="boss"),
-                    status=202,
-                )
+                job = jobs.create("boss-draft", draft_work, root=root, branch=desk_key, mode="boss")
+                update_boss_inflight(store, work_id, job_id=str(job.get("id") or ""))
+                self.send_json(job, status=202)
                 return
             if parsed.path == "/api/boss/draft/revise":
                 feedback = str(body.get("feedback") or "").strip()
@@ -16390,67 +16653,66 @@ def make_handler(
                     return
                 # Hand edits made on the page travel with the feedback, so the
                 # rewrite builds on the user's wording instead of discarding it.
-                save_boss_edits(store, body.get("items"))
+                save_boss_edits(store, body.get("items"), desk)
                 only_branch = str(body.get("branch") or "").strip()
                 only = [only_branch] if only_branch else None
-                pending = {str(item.get("branch")) for item in boss_pending_items(store)}
+                pending = {str(item.get("branch")) for item in boss_pending_items(store, desk)}
                 if not pending or (only and only_branch not in pending):
                     self.send_json({"error": "no_draft", "message": "There is no draft to revise."}, status=409)
                     return
                 append_boss_history(
                     store, "user", feedback,
-                    extra={"kind": "feedback", "branches": only or sorted(pending)},
+                    extra={"kind": "feedback", "branches": only or sorted(pending)}, desk=desk,
                 )
+                work_id = add_boss_inflight(store, desk, "revise", branches=only or sorted(pending))
 
                 def revise_work(progress: ProgressCallback) -> dict[str, Any]:
                     revise_boss_items(
-                        root, store, feedback, only=only, record_feedback=False, progress=progress
+                        root, store, feedback, desk=desk, work_id=work_id,
+                        only=only, record_feedback=False, progress=progress,
                     )
-                    return boss_chat_payload(store, jobs)
+                    return {"boss": True, "desk": desk}
 
-                self.send_json(
-                    jobs.create("boss-draft", revise_work, root=root, branch=BOSS_CHAT_KEY, mode="boss"),
-                    status=202,
-                )
+                job = jobs.create("boss-draft", revise_work, root=root, branch=desk_key, mode="boss")
+                update_boss_inflight(store, work_id, job_id=str(job.get("id") or ""))
+                self.send_json(job, status=202)
                 return
             if parsed.path == "/api/boss/draft/update":
-                save_boss_edits(store, body.get("items"))
-                self.send_json(boss_chat_payload(store, jobs))
+                save_boss_edits(store, body.get("items"), desk)
+                self.send_json(boss_chat_payload(store, jobs, desk))
                 return
             if parsed.path == "/api/boss/draft/discard":
                 only_branch = str(body.get("branch") or "").strip()
-                drop_boss_items(store, {only_branch} if only_branch else None)
-                self.send_json(boss_chat_payload(store, jobs))
+                drop_boss_items(store, {only_branch} if only_branch else None, desk=desk)
+                self.send_json(boss_chat_payload(store, jobs, desk))
                 return
             if parsed.path == "/api/boss/dispatch":
                 try:
-                    self.send_json(dispatch_boss_items(root, store, jobs, body.get("items")))
+                    self.send_json(dispatch_boss_items(root, store, jobs, body.get("items"), desk))
                 except ValueError as exc:
                     self.send_json({"error": "invalid_boss_dispatch", "message": str(exc)}, status=400)
                 except SystemExit as exc:
                     self.send_json(die_payload("boss_failed", exc), status=http_status_from_exit(exc, 400))
                 return
             if parsed.path == "/api/boss/reset":
-                store.reset_boss_chat()
-                self.send_json(boss_chat_payload(store, jobs))
+                store.reset_boss_chat(desk)
+                self.send_json(boss_chat_payload(store, jobs, desk))
                 return
-            if parsed.path == "/api/boss/branch":
-                target_id = str(body.get("target") or "")
-                title = str(body.get("title") or "") or None
+            if parsed.path == "/api/boss/fork":
+                # "New branch from boss": another Boss, not a branch — same board,
+                # same branches, and whatever is running keeps running on it.
                 try:
-                    store.create_branch_from_boss_chat(target_id, title=title)
-                    payload = branch_payload(store, target_id)
-                    payload["turnCommit"] = internal_git_commit_turn(
-                        store,
-                        kind="branch-from-boss-chat",
-                        actor="user",
-                        summary=f"Create branch {target_id} from boss chat",
-                        branch_id=target_id,
-                        metadata={"target": target_id, "title": title},
-                    )
-                    self.send_json(payload)
-                except SystemExit as exc:
-                    self.send_json(die_payload("branch_create_failed", exc), status=http_status_from_exit(exc, 400))
+                    forked = fork_boss_desk(store, desk, str(body.get("title") or ""))
+                    self.send_json(boss_chat_payload(store, jobs, forked))
+                except ValueError as exc:
+                    self.send_json({"error": "invalid_boss_fork", "message": str(exc)}, status=400)
+                return
+            if parsed.path == "/api/boss/delete":
+                try:
+                    delete_boss_desk(store, desk)
+                    self.send_json({"desks": list_boss_desks(store)})
+                except ValueError as exc:
+                    self.send_json({"error": "invalid_boss_delete", "message": str(exc)}, status=400)
                 return
             if parsed.path == "/api/context-chat/start":
                 text = str(body.get("text") or "").strip()
@@ -16888,9 +17150,17 @@ class TelegramRemote:
             return json.loads(response.read().decode("utf-8") or "{}")
 
     def _say(self, token: str, chat_id: str, text: str, reply_to: int | None = None) -> int:
-        with contextlib.suppress(Exception):
+        try:
             return send_telegram_message(token, chat_id, text[:3500], reply_to=reply_to)
-        return 0
+        except Exception as exc:  # noqa: BLE001 - a failed reply must not kill the poller
+            # Swallowing this is what made "the bot said nothing" unanswerable:
+            # the turn had started, the reply had failed, and nothing recorded it.
+            print(
+                f"telegram remote: reply failed ({type(exc).__name__}: {str(exc)[:160]})",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 0
 
     def _root_for(self, chat_id: str) -> Path:
         return self._roots.get(chat_id) or self._project_state.root()
@@ -16950,8 +17220,15 @@ class TelegramRemote:
         )
         for update in payload.get("result") or []:
             self._offset = max(self._offset, int(update.get("update_id") or 0) + 1)
-            with contextlib.suppress(Exception):
+            try:
                 self._handle(update, token)
+            except Exception as exc:  # noqa: BLE001 - one bad update must not stop the loop
+                print(
+                    f"telegram remote: update {update.get('update_id')} failed "
+                    f"({type(exc).__name__}: {str(exc)[:200]})",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
     def _handle(self, update: dict[str, Any], token: str) -> None:
         message = update.get("message") or update.get("edited_message") or {}

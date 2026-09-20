@@ -54,8 +54,11 @@ const state = {
   btwSent: {},
   activeBoss: false,
   bossPayload: null,
-  bossBranches: [],
-  bossPending: 0,
+  // Which Boss is open ("" is the first one), every Boss there is, and which of
+  // them are unfolded in the sidebar to show the branches they hold.
+  bossDesk: "",
+  bossDesks: [],
+  bossNavOpen: new Set(),
   bossNavSignature: "",
   bossLogSignature: "",
   bossOpenFolders: new Set(),
@@ -982,7 +985,7 @@ function activeChatKey() {
   // Boss chat is a conversation like the others as far as jobs, drafts and the
   // composer are concerned, so it needs a key of its own rather than falling
   // through to "no branch open".
-  if (state.activeBoss) return BOSS_CHAT_KEY;
+  if (state.activeBoss) return bossKey();
   return state.activeContextChat ? CONTEXT_CHAT_KEY : state.activeBranch || "";
 }
 
@@ -1973,7 +1976,7 @@ function renderBranches() {
     return `
       <div class="branch-row ${branch.id === state.activeBranch ? "active" : ""} ${statusClass}">
         <button class="nav-item branch-main ${branch.id === state.activeBranch ? "active" : ""}" data-branch="${escapeHtml(branch.id)}" type="button" title="${escapeHtml(`${branch.title} (${branch.id})`)}">
-          <span class="nav-title" title="${escapeHtml(branch.title)}">${branch.fromBossChat ? '<span class="boss-star" title="Boss chat에서 만든 브랜치">★</span>' : ""}${escapeHtml(branch.title)}</span>
+          <span class="nav-title" title="${escapeHtml(branch.title)}">${escapeHtml(branch.title)}</span>
           <span class="nav-meta" title="${escapeHtml(`${branch.id} · ${branch.historyCount} messages${jobLabel}`)}">${escapeHtml(branch.id)} · ${branch.historyCount} messages${escapeHtml(jobLabel)}</span>
         </button>
         ${menu ? `<button class="branch-options-button" data-branch-options="${escapeHtml(branch.id)}" type="button" aria-label="Branch options">...</button>
@@ -3583,8 +3586,7 @@ async function refreshBranchNavigation() {
   state.archived = data.archived || [];
   state.views = data.views || [];
   state.globalized = data.globalized || [];
-  state.bossBranches = data.bossBranches || [];
-  state.bossPending = data.bossPending || 0;
+  state.bossDesks = data.bossDesks || [];
   renderBranches();
 }
 
@@ -3736,9 +3738,8 @@ async function monitorTrackedJob(jobId) {
       await refreshBranchNavigation().catch(() => {});
       if (activeChatKey() === branch) {
         if (remembered.mode === "boss") {
-          // A finished boss job either produced a draft to review or dispatched
-          // one; either way its own payload is the current state.
-          renderBossChat(remembered.payload);
+          // bossJobSettled has already asked for the open desk's state. The job's
+          // own payload is no use here: the same job can belong to two desks.
         } else if (remembered.mode === "context-chat" || remembered.payload?.topLevel === true) {
           renderContextChat(remembered.payload);
         } else {
@@ -3779,7 +3780,7 @@ async function monitorTrackedJob(jobId) {
         // one-click resend/delete (the pending bubble is replaced by the real one).
         // renderBranch clears the error banner, so re-show it afterwards.
         if (remembered.mode === "boss") {
-          api("/api/boss").then(renderBossChat).catch(() => {}).finally(() => showChatError(errorText));
+          refreshBoss().finally(() => showChatError(errorText));
         }
         if (remembered.mode !== "context-chat" && remembered.mode !== "merge" && state.activeBranch === branch) {
           api(`/api/branch?id=${encodeURIComponent(branch)}`)
@@ -4281,8 +4282,7 @@ async function loadBranches() {
   state.archived = data.archived || [];
   state.views = data.views || [];
   state.globalized = data.globalized || [];
-  state.bossBranches = data.bossBranches || [];
-  state.bossPending = data.bossPending || 0;
+  state.bossDesks = data.bossDesks || [];
   if (!state.activeBoss && !state.activeContextChat && !state.activeBranch && !state.activeGlobalized && state.branches.length) {
     state.activeBranch = state.branches[0].id;
   }
@@ -5473,6 +5473,23 @@ function isBossChat() {
 
 // Boss jobs run under `__boss__` (drafting) and `__boss__:<branch>` (a follow-up
 // being written). Neither is a branch, so neither counts as unread branch work.
+// The job key of a desk: `__boss__` for the first, `__boss__@<id>` for one split off.
+function bossKey(desk = state.bossDesk) {
+  return desk ? `${BOSS_CHAT_KEY}@${desk}` : BOSS_CHAT_KEY;
+}
+
+function bossDeskInfo(desk = state.bossDesk) {
+  return (state.bossDesks || []).find((item) => item.id === desk) || null;
+}
+
+function bossPendingTotal() {
+  return (state.bossDesks || []).reduce((sum, desk) => sum + (desk.pending || 0), 0);
+}
+
+function bossPost(path, body = {}) {
+  return api(path, { method: "POST", body: JSON.stringify({ ...body, desk: state.bossDesk }) });
+}
+
 function isBossJobKey(key) {
   return String(key || "").startsWith(BOSS_CHAT_KEY);
 }
@@ -5495,8 +5512,11 @@ function leaveBossChat() {
   state.bossNavSignature = "";
 }
 
-async function openBossChat() {
+async function openBossChat(desk = "") {
   saveActiveDraft();
+  if (!state.activeBoss || desk !== state.bossDesk) resetBossDeskView();
+  state.bossDesk = desk;
+  state.bossNavOpen.add(desk);
   state.activeBoss = true;
   state.activeContextChat = false;
   state.activeBranch = null;
@@ -5504,8 +5524,15 @@ async function openBossChat() {
   selectTab("chat");
   hideChatError();
   renderBranches();
-  const payload = await api("/api/boss");
-  if (!isBossChat()) return;
+  let payload;
+  try {
+    payload = await api(`/api/boss?desk=${encodeURIComponent(desk)}`);
+  } catch (error) {
+    // The desk is gone (deleted elsewhere): fall back to the first one.
+    if (desk) return openBossChat("");
+    throw error;
+  }
+  if (!isBossChat() || state.bossDesk !== desk) return;
   // Seeded from what is saved here and after a save — never on a plain refresh,
   // which would wipe ticks made since.
   state.bossSelected = new Set(payload?.config?.branches || []);
@@ -5519,9 +5546,24 @@ async function openBossChat() {
   if (!state.bossSelected.size) selectTab("boss");
 }
 
+// Everything the board keeps between renders belongs to one desk.
+function resetBossDeskView() {
+  state.bossPayload = null;
+  state.bossEdits = {};
+  state.bossFeedback = {};
+  state.bossExpanded = new Set();
+  state.bossBusy = new Set();
+  state.bossRevising = new Set();
+  state.bossNodes = new Map();
+  state.bossLogSignature = "";
+  els.bossBar.innerHTML = "";
+  els.bossCards.innerHTML = "";
+  if (isBossChat()) replaceMessageListHtml("");
+}
+
 async function refreshBoss() {
   try {
-    const payload = await api("/api/boss");
+    const payload = await api(`/api/boss?desk=${encodeURIComponent(state.bossDesk)}`);
     renderBossChat(payload);
   } catch {
     // The next settle or tick retries.
@@ -5552,21 +5594,23 @@ function bossBranchRunning(branch) {
 
 function renderBossChat(payload) {
   if (!payload || payload.boss !== true) return;
-  state.bossPayload = payload;
-  state.bossBranches = payload.config?.branches || [];
-  state.bossPending = (payload.pending || []).length;
+  if (Array.isArray(payload.desks)) state.bossDesks = payload.desks;
+  // A late answer for a desk that is no longer the open one only updates the list.
+  const forOpenDesk = (payload.desk?.id || "") === state.bossDesk;
+  if (forOpenDesk) state.bossPayload = payload;
   // The desk refreshes on a timer; the sidebar is only rebuilt when what it shows
-  // of the desk changed, or an open branch menu would close every few seconds.
-  const navSignature = `${isBossChat()}|${state.bossBranches.join(",")}|${state.bossPending}`;
+  // of the desks changed, or an open branch menu would close every few seconds.
+  const navSignature = `${isBossChat()}|${state.bossDesk}|${JSON.stringify(state.bossDesks)}`;
   if (navSignature !== state.bossNavSignature) {
     state.bossNavSignature = navSignature;
     renderBranches();
   }
-  if (!isBossChat()) return;
+  if (!isBossChat() || !forOpenDesk) return;
   state.payload = payload;
+  adoptBossDrafting(payload);
   els.chatMain.classList.add("boss-mode");
   els.bossBoard.hidden = false;
-  els.activeTitle.textContent = "Boss";
+  els.activeTitle.textContent = `${payload.desk?.forked ? "★ " : ""}${payload.desk?.title || "Boss"}`;
   setBranchDirButton(null);
   els.chatTabButton.textContent = "Desk";
   els.bossTabButton.hidden = false;
@@ -5580,6 +5624,23 @@ function renderBossChat(payload) {
   updateComposerState();
 }
 
+// Drafting this desk is waiting on but this page never started: work that was under
+// way on another Boss when this one was split off from it, or a draft begun before
+// a reload. Tracked like any job started here, so the composer reads busy, the
+// progress shows, and the result arrives without a manual refresh.
+function adoptBossDrafting(payload) {
+  const key = bossKey();
+  for (const entry of payload.drafting || []) {
+    if (!entry.jobId || state.branchJobs[key] === entry.jobId) continue;
+    if (activeBranchRunningJob(key)) continue;
+    trackBossJob(
+      { id: entry.jobId, status: "running", createdAt: new Date().toISOString() },
+      entry.kind === "revise" ? "피드백을 반영해 초안을 다시 쓰는 중" : "브랜치별로 보낼 초안을 쓰는 중",
+    );
+    if (entry.kind === "revise") (entry.branches || []).forEach((branch) => state.bossRevising.add(branch));
+  }
+}
+
 function renderBossMeta() {
   const rows = bossSelectedRows();
   if (!rows.length) {
@@ -5587,7 +5648,8 @@ function renderBossMeta() {
     return;
   }
   const running = rows.filter(bossBranchRunning).length;
-  els.activeMeta.textContent = `${rows.length} branches · 검토 대기 ${state.bossPending} · 실행 중 ${running}`;
+  const pending = rows.filter((branch) => bossPendingMap().has(branch.id)).length;
+  els.activeMeta.textContent = `${rows.length} branches · 검토 대기 ${pending} · 실행 중 ${running}`;
 }
 
 const BOSS_LOG_LABELS = {
@@ -5719,7 +5781,7 @@ function bossCardHtml(branch, item, flags) {
   return `
     <article class="boss-card ${item ? "has-draft" : ""} ${flags.running ? "is-running" : ""}" data-boss-branch="${escapeHtml(branch.id)}">
       <header class="boss-card-head">
-        <button class="boss-card-title" data-boss-action="open" type="button" title="${escapeHtml(`${branch.title} (${branch.id}) 열기`)}">${branch.fromBossChat ? '<span class="boss-star">★</span>' : ""}${escapeHtml(branch.title)}</button>
+        <button class="boss-card-title" data-boss-action="open" type="button" title="${escapeHtml(`${branch.title} (${branch.id}) 열기`)}">${escapeHtml(branch.title)}</button>
         <span class="boss-card-meta">${escapeHtml(branch.folder ? `${branch.folder} / ${branch.id}` : branch.id)}</span>
         ${badge}
       </header>
@@ -5732,7 +5794,7 @@ function bossCardHtml(branch, item, flags) {
 
 function bossBarHtml(rows, pendingCount) {
   if (!rows.length) return "";
-  const drafting = Boolean(activeBranchRunningJob(BOSS_CHAT_KEY));
+  const drafting = Boolean(activeBranchRunningJob(bossKey()));
   if (pendingCount < 2) {
     return `<div class="boss-bar"><strong>${pendingCount ? "검토 대기 1건" : "검토할 초안이 없습니다"}</strong>
       <span class="muted">${pendingCount ? "카드에서 문장을 고치거나 피드백한 뒤, Send / Info chat 중 하나로 승인하세요." : "아래에 할 일을 적으면 브랜치별 초안이 만들어집니다."}</span></div>`;
@@ -5794,7 +5856,7 @@ function renderBossBoard() {
   }
   els.bossCards.querySelector(".boss-empty")?.remove();
   const pendingCount = rows.filter((branch) => pending.has(branch.id)).length;
-  const bossJobRunning = Boolean(activeBranchRunningJob(BOSS_CHAT_KEY));
+  const bossJobRunning = Boolean(activeBranchRunningJob(bossKey()));
   patchBossNode(
     els.bossBar, BOSS_ALL,
     JSON.stringify([rows.length, pendingCount, bossJobRunning]),
@@ -5849,8 +5911,9 @@ function updateBossCardProgress(job) {
 // Called whenever any job settles. The desk cares about three kinds: its own
 // drafting, a follow-up being written, and a turn on one of its branches.
 function bossJobSettled(job) {
-  if (job.branch === BOSS_CHAT_KEY) state.bossRevising.clear();
-  const relevant = isBossJobKey(job.branch) || (state.bossBranches || []).includes(job.branch);
+  if (job.mode === "boss") state.bossRevising.clear();
+  const relevant =
+    isBossJobKey(job.branch) || (state.bossDesks || []).some((desk) => (desk.branches || []).includes(job.branch));
   if (!relevant) return;
   if (isBossChat()) refreshBoss();
   else refreshBranchNavigation().catch(() => {});
@@ -5880,7 +5943,7 @@ async function bossSend(branchIds, mode) {
   items.forEach((item) => state.bossBusy.add(item.branch));
   renderBossBoard();
   try {
-    const payload = await api("/api/boss/dispatch", { method: "POST", body: JSON.stringify({ items }) });
+    const payload = await bossPost("/api/boss/dispatch", { items });
     ensureNotificationPermission();
     for (const started of payload.started || []) {
       delete state.bossEdits[started.branch];
@@ -5905,7 +5968,7 @@ async function bossSend(branchIds, mode) {
 }
 
 function trackBossJob(job, title) {
-  const remembered = rememberJob(job, { branch: BOSS_CHAT_KEY, mode: "boss" });
+  const remembered = rememberJob(job, { branch: bossKey(), mode: "boss" });
   if (isBossChat()) {
     showProgress(title);
     updateProgress(remembered);
@@ -5924,23 +5987,20 @@ async function bossRevise(branchId) {
     scope?.querySelector("[data-boss-feedback]")?.focus();
     return;
   }
-  if (activeBranchRunningJob(BOSS_CHAT_KEY)) {
+  if (activeBranchRunningJob(bossKey())) {
     showChatError("초안 작업이 이미 진행 중입니다. 끝난 뒤 다시 시도하세요.");
     return;
   }
   hideChatError();
   const targets = branchId ? [branchId] : [...bossPendingMap().keys()];
   try {
-    appendPendingUserMessage({ branch: BOSS_CHAT_KEY, text: feedback, mode: "boss" });
-    const job = await api("/api/boss/draft/revise", {
-      method: "POST",
-      body: JSON.stringify({
-        feedback,
-        branch: branchId || "",
-        // Hand edits travel with the feedback, so the rewrite builds on the
-        // user's wording instead of discarding it.
-        items: bossCurrentItems([...bossPendingMap().keys()]),
-      }),
+    appendPendingUserMessage({ branch: bossKey(), text: feedback, mode: "boss" });
+    const job = await bossPost("/api/boss/draft/revise", {
+      feedback,
+      branch: branchId || "",
+      // Hand edits travel with the feedback, so the rewrite builds on the
+      // user's wording instead of discarding it.
+      items: bossCurrentItems([...bossPendingMap().keys()]),
     });
     delete state.bossFeedback[key];
     // The feedback box still has the keyboard; let go of it, or the card it sits
@@ -5959,10 +6019,7 @@ async function bossRevise(branchId) {
 
 async function bossDiscard(branchId) {
   try {
-    const payload = await api("/api/boss/draft/discard", {
-      method: "POST",
-      body: JSON.stringify({ branch: branchId || "" }),
-    });
+    const payload = await bossPost("/api/boss/draft/discard", { branch: branchId || "" });
     if (branchId) delete state.bossEdits[branchId];
     else state.bossEdits = {};
     renderBossChat(payload);
@@ -5976,9 +6033,8 @@ async function bossSaveEdit(branchId) {
   const item = bossPendingMap().get(branchId);
   if (!edit || !item || edit.id !== item.id || edit.text.trim() === (item.instruction || "").trim()) return;
   try {
-    const payload = await api("/api/boss/draft/update", {
-      method: "POST",
-      body: JSON.stringify({ items: [{ branch: branchId, instruction: edit.text }] }),
+    const payload = await bossPost("/api/boss/draft/update", {
+      items: [{ branch: branchId, instruction: edit.text }],
     });
     // Quietly: the card already shows this text, and rebuilding it now could
     // land between the mousedown and mouseup of the button being clicked.
@@ -6053,7 +6109,7 @@ els.messageList.addEventListener("click", (event) => {
 
 async function sendBossRequest({ stopWhenEmpty = false, text: given = "", rerun = false } = {}) {
   const text = given || els.messageInput.value.trim();
-  const drafting = activeBranchRunningJob(BOSS_CHAT_KEY);
+  const drafting = activeBranchRunningJob(bossKey());
   if (drafting) {
     if (!text && stopWhenEmpty) await cancelTrackedJob(drafting);
     else if (text) showChatError("초안을 쓰는 중입니다. 끝난 뒤 다음 요청을 보내세요.");
@@ -6068,11 +6124,11 @@ async function sendBossRequest({ stopWhenEmpty = false, text: given = "", rerun 
   hideChatError();
   // Shown straight away; the server records it before drafting even starts, so
   // it stays on the log whatever happens to the draft.
-  if (!rerun) appendPendingUserMessage({ branch: BOSS_CHAT_KEY, text, mode: "boss" });
+  if (!rerun) appendPendingUserMessage({ branch: bossKey(), text, mode: "boss" });
   try {
-    const job = await api("/api/boss/draft", { method: "POST", body: JSON.stringify({ text, rerun }) });
+    const job = await bossPost("/api/boss/draft", { text, rerun });
     if (!rerun) {
-      clearDraft(BOSS_CHAT_KEY);
+      clearDraft(bossKey());
       els.messageInput.value = "";
       resizeMessageInput();
     }
@@ -6089,28 +6145,28 @@ els.bossResetButton.addEventListener("click", async () => {
   state.bossEdits = {};
   state.bossFeedback = {};
   state.bossLogSignature = "";
-  renderBossChat(await api("/api/boss/reset", { method: "POST", body: "{}" }));
+  renderBossChat(await bossPost("/api/boss/reset"));
 });
 
+// "New branch from boss" splits off another Boss — the same board, not a branch.
+// It carries the branches, the log, the drafts, and whatever is still running:
+// a draft being written or a branch mid-turn shows as in progress on the new one
+// and reports back to it as well.
 els.bossBranchButton.addEventListener("click", async () => {
-  const title = window.prompt("새 브랜치 제목 (이 boss chat 내용을 가지고 시작합니다)", "");
+  const title = window.prompt("새 Boss 이름 (지금 이 Boss의 브랜치·기록·초안·진행 중인 작업을 그대로 가지고 갈라집니다)", "");
   if (title === null || !title.trim()) return;
-  const target = uniqueBranchIdForTitle(title.trim());
   try {
-    await api("/api/boss/branch", {
-      method: "POST",
-      body: JSON.stringify({ target, title: title.trim() }),
-    });
-    leaveBossChat();
-    state.activeBranch = target;
-    await loadBranches();
+    // Text typed over a draft goes with it.
+    await bossPost("/api/boss/draft/update", { items: bossCurrentItems([...bossPendingMap().keys()]) });
+    const payload = await bossPost("/api/boss/fork", { title: title.trim() });
+    await openBossChat(payload.desk.id);
   } catch (error) {
-    window.alert(`브랜치 생성 실패: ${error.message}`);
+    showChatError(`Boss 분리 실패: ${error.message}`);
   }
 });
 
 els.bossChatButton.addEventListener("click", () => {
-  openBossChat().catch((error) => showChatError(`Boss chat 실패: ${error.message}`));
+  openBossChat("").catch((error) => showChatError(`Boss chat 실패: ${error.message}`));
 });
 
 // --- branch picker (the Branches tab) ----------------------------------------------
@@ -6129,7 +6185,7 @@ function renderBossPicker() {
   const row = (branch) => `
     <label class="boss-pick ${bossBranchRunning(branch) ? "running" : ""}">
       <input type="checkbox" data-boss-pick="${escapeHtml(branch.id)}" ${chosen.has(branch.id) ? "checked" : ""} />
-      <span class="boss-pick-title">${branch.fromBossChat ? '<span class="boss-star">★</span>' : ""}${escapeHtml(branch.title)}</span>
+      <span class="boss-pick-title">${escapeHtml(branch.title)}</span>
       <span class="boss-pick-meta">${escapeHtml(branch.id)} · ${branch.historyCount} messages${bossBranchRunning(branch) ? " · 실행 중" : ""}</span>
     </label>`;
   const folderOf = (branch) => (branch.folder || "").trim();
@@ -6170,7 +6226,7 @@ function scheduleBossConfigSave() {
   bossConfigSaveTimer = window.setTimeout(async () => {
     const branches = [...state.bossSelected];
     try {
-      const payload = await api("/api/boss/config", { method: "POST", body: JSON.stringify({ branches }) });
+      const payload = await bossPost("/api/boss/config", { branches });
       renderBossChat(payload);
       renderBossPickerStatus("저장됨");
     } catch (error) {
@@ -6236,47 +6292,105 @@ els.bossPickerClear.addEventListener("click", () => {
 
 // --- sidebar ---------------------------------------------------------------------
 //
-// The folder under the Boss chat button lists the desk's branches with the same
+// Under the Boss chat button: every Boss, and under each the branches it holds.
+// A Boss split off from another carries the yellow star. Branch rows are the same
 // rows the branch list uses, so clicking one opens that branch exactly as it
 // would from there, and a running turn looks the same in both places.
 function renderBossNav(buildBranchRow, branchStatusOf) {
   const button = els.bossChatButton;
-  button.classList.toggle("active", isBossChat());
-  const bossJob = branchJob(BOSS_CHAT_KEY);
-  button.classList.toggle("job-running", bossJob?.status === "running");
-  els.bossPendingBadge.hidden = !state.bossPending;
-  els.bossPendingBadge.textContent = String(state.bossPending || "");
-  els.bossPendingBadge.title = `검토 대기 중인 초안 ${state.bossPending}건`;
+  button.classList.toggle("active", isBossChat() && !state.bossDesk);
+  button.classList.toggle(
+    "job-running",
+    (state.bossDesks || []).some((desk) => branchJob(desk.key)?.status === "running"),
+  );
+  const pendingTotal = bossPendingTotal();
+  els.bossPendingBadge.hidden = !pendingTotal;
+  els.bossPendingBadge.textContent = String(pendingTotal || "");
+  els.bossPendingBadge.title = `검토 대기 중인 초안 ${pendingTotal}건`;
 
   const byId = new Map(state.branches.map((branch) => [branch.id, branch]));
-  const items = (state.bossBranches || []).map((id) => byId.get(id)).filter(Boolean);
-  els.bossFolder.hidden = items.length === 0;
-  if (!items.length) {
+  // The first Boss is only worth a row once it holds something or has company.
+  const desks = (state.bossDesks || []).filter(
+    (desk) => desk.forked || (desk.branches || []).length || state.bossDesks.length > 1,
+  );
+  els.bossFolder.hidden = desks.length === 0;
+  if (!desks.length) {
     els.bossFolder.innerHTML = "";
     return;
   }
   const collapsed = getCollapsedFolders().includes(BOSS_NAV_FOLDER_KEY);
-  const running = items.filter((branch) => branchStatusOf(branch) === "job-running");
-  const doneUnseen = items.filter((branch) => branchStatusOf(branch) === "job-done").length;
-  const dots =
-    (running.length ? `<span class="folder-dot job-running" title="실행 중 ${running.length}개">${running.length}</span>` : "") +
-    (doneUnseen ? `<span class="folder-dot job-done" title="읽지 않은 완료 ${doneUnseen}개">${doneUnseen}</span>` : "");
-  // Working branches float to the top: that is what this folder is looked at for.
-  const ordered = [...running, ...items.filter((branch) => !running.includes(branch))];
+  let runningTotal = 0;
+  const rows = desks
+    .map((desk) => {
+      const items = (desk.branches || []).map((id) => byId.get(id)).filter(Boolean);
+      const running = items.filter((branch) => branchStatusOf(branch) === "job-running");
+      runningTotal += running.length;
+      const drafting = branchJob(desk.key)?.status === "running";
+      const active = isBossChat() && state.bossDesk === desk.id;
+      const open = state.bossNavOpen.has(desk.id);
+      const meta = [
+        `${items.length} branches`,
+        running.length ? `실행 중 ${running.length}` : "",
+        drafting ? "초안 쓰는 중" : "",
+        desk.pending ? `검토 대기 ${desk.pending}` : "",
+      ].filter(Boolean).join(" · ");
+      // Working branches float to the top: that is what this list is looked at for.
+      const ordered = [...running, ...items.filter((branch) => !running.includes(branch))];
+      return `
+        <div class="boss-desk ${open ? "open" : ""}">
+          <div class="branch-row boss-desk-row ${active ? "active" : ""} ${running.length || drafting ? "job-running" : ""}">
+            <button class="nav-item branch-main ${active ? "active" : ""}" data-boss-desk="${escapeHtml(desk.id)}" type="button" title="${escapeHtml(desk.title)}">
+              <span class="nav-title"><span class="boss-desk-caret" aria-hidden="true">▸</span>${desk.forked ? '<span class="boss-star" title="다른 Boss에서 갈라져 나온 Boss">★</span>' : ""}${escapeHtml(desk.title)}${desk.pending ? `<span class="boss-pending-badge">${desk.pending}</span>` : ""}</span>
+              <span class="nav-meta">${escapeHtml(meta)}</span>
+            </button>
+            ${desk.forked ? `<button class="branch-options-button boss-desk-delete" data-boss-desk-delete="${escapeHtml(desk.id)}" type="button" title="이 Boss 삭제 (브랜치는 그대로 남습니다)" aria-label="Delete boss">✕</button>` : ""}
+          </div>
+          ${open ? `<div class="folder-body boss-desk-branches">${ordered.map((branch) => buildBranchRow(branch, { menu: false })).join("") || '<div class="folder-empty muted">고른 브랜치가 없습니다</div>'}</div>` : ""}
+        </div>`;
+    })
+    .join("");
   els.bossFolder.innerHTML = `
     <div class="branch-folder ${collapsed ? "collapsed" : ""}">
       <div class="folder-header-row">
-        <button class="folder-header" data-boss-nav-toggle type="button" title="Boss chat이 맡은 브랜치">
-          <span class="folder-caret" aria-hidden="true">▾</span><span class="folder-name"><span class="boss-star">★</span>Boss 브랜치</span><span class="folder-count">${items.length}</span>${dots}
+        <button class="folder-header" data-boss-nav-toggle type="button" title="Boss와 각 Boss가 맡은 브랜치">
+          <span class="folder-caret" aria-hidden="true">▾</span><span class="folder-name">Boss</span><span class="folder-count">${desks.length}</span>${runningTotal ? `<span class="folder-dot job-running" title="실행 중 ${runningTotal}개">${runningTotal}</span>` : ""}
         </button>
       </div>
-      <div class="folder-body">${collapsed ? "" : ordered.map((branch) => buildBranchRow(branch, { menu: false })).join("")}</div>
+      <div class="folder-body">${collapsed ? "" : rows}</div>
     </div>`;
 }
 
-els.bossFolder.addEventListener("click", (event) => {
+els.bossFolder.addEventListener("click", async (event) => {
   if (event.target.closest("[data-boss-nav-toggle]")) {
     toggleFolderCollapsed(BOSS_NAV_FOLDER_KEY);
+    return;
+  }
+  const remove = event.target.closest("[data-boss-desk-delete]");
+  if (remove) {
+    const desk = remove.dataset.bossDeskDelete;
+    const title = bossDeskInfo(desk)?.title || desk;
+    if (!window.confirm(`Boss "${title}"을(를) 삭제합니다. 기록과 초안이 지워지고, 브랜치는 그대로 남습니다.`)) return;
+    try {
+      const data = await api("/api/boss/delete", { method: "POST", body: JSON.stringify({ desk }) });
+      state.bossDesks = data.desks || [];
+      state.bossNavOpen.delete(desk);
+      if (isBossChat() && state.bossDesk === desk) await openBossChat("");
+      else renderBranches();
+    } catch (error) {
+      window.alert(`Boss 삭제 실패: ${error.message}`);
+    }
+    return;
+  }
+  const deskButton = event.target.closest("[data-boss-desk]");
+  if (deskButton) {
+    const desk = deskButton.dataset.bossDesk;
+    // Opening a Boss unfolds its branches; clicking the one already open folds them.
+    if (isBossChat() && state.bossDesk === desk && state.bossNavOpen.has(desk)) {
+      state.bossNavOpen.delete(desk);
+      renderBranches();
+    } else {
+      openBossChat(desk).catch((error) => showChatError(`Boss chat 실패: ${error.message}`));
+    }
     return;
   }
   const row = event.target.closest("[data-branch]");
