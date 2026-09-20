@@ -12249,46 +12249,173 @@ def _boss_branch_rows(store: ContextStore, branches: list[str]) -> list[str]:
     return [boss_branch_context_block(store, branch_id, budget) for branch_id in branches]
 
 
-def build_boss_routing_prompt(store: ContextStore, message: str, branches: list[str]) -> str:
-    """Ask which of these branches each piece of the request belongs to.
+#: What the splitter sees of each branch. It only decides *who does which part*, so
+#: it needs to know what each branch is, not everything the branch holds.
+BOSS_ROUTING_REPORT_CHARS = 1500
+#: Branch drafters running at once. Each is a full provider process.
+BOSS_DRAFT_WORKERS = 4
 
-    Only the chosen branches are offered — reaching one outside the selection is the
-    thing boss chat must never do. But each is offered at a branch turn's own depth
-    (`boss_branch_context_block`), because the decision is not only "who does this":
-    the instruction written here is sent verbatim as the user's message, so it has to
-    land in a conversation already underway, in the terms that conversation uses.
+BOSS_SPLIT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["assignments", "summary"],
+    "properties": {
+        "summary": {"type": "string"},
+        "assignments": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["branch", "brief"],
+                "properties": {
+                    "branch": {"type": "string"},
+                    "brief": {"type": "string"},
+                },
+            },
+        },
+    },
+}
+
+BOSS_INSTRUCTION_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["instruction", "suggestedMode"],
+    "properties": {
+        "instruction": {"type": "string"},
+        "suggestedMode": {"type": "string", "enum": list(BOSS_SEND_MODES)},
+    },
+}
+
+
+def build_boss_routing_prompt(store: ContextStore, message: str, branches: list[str]) -> str:
+    """Step one: which branch does which part. Nothing is written for a branch here.
+
+    Splitting and writing used to be one call, so every chosen branch's context had
+    to fit into a single prompt and each got a fraction of a turn's budget — the
+    wider the desk, the blinder every draft. Splitting needs little: what each
+    branch is about. The writing happens afterwards, one branch at a time, with
+    that branch's whole context (`build_boss_branch_draft_prompt`).
     """
+    rows = []
+    for branch_id in branches:
+        meta = load_json(store.branch_paths_for_read(branch_id).meta)
+        report = truncate_middle(branch_report_for_prompt(store, branch_id), BOSS_ROUTING_REPORT_CHARS)
+        rows.append(f"### {branch_id}\ntitle: {meta.get('title') or branch_id}\n{report or '(no report yet)'}")
     return "\n".join(
         [
             "You are splitting one request across a fixed set of ctxgit branches.",
             "",
             "Each branch is an ongoing piece of work with its own history and rules.",
-            "Decide which branch each part of the request belongs to, and write the",
-            "instruction that branch should receive. Write it as the user would say it",
-            "to that branch directly — it will be sent verbatim as their message, after",
-            "the user has reviewed and possibly edited it.",
+            "Decide which branch each part of the request belongs to. Do not write the",
+            "message for the branch — a separate writer, who knows that branch in full,",
+            "does that next. Give that writer a `brief`: the part of the request that",
+            "is this branch's, in the user's own words as far as possible, plus anything",
+            "in the rest of the request the writer needs in order to get it right.",
             "",
             "Rules:",
             "- Use only the branches listed below. Never invent one.",
             "- A branch that has nothing to do gets no assignment; do not pad.",
-            "- One branch may receive at most one instruction; combine if needed.",
-            "- Keep each instruction self-contained: that branch cannot see this request.",
-            "- Write in the language the request is written in.",
-            *_BOSS_MODE_GUIDE,
+            "- One branch gets at most one brief; combine its parts if needed.",
+            "- Do not drop anything the user asked for: every part goes somewhere, or",
+            "  the summary says which part had no branch to go to.",
             "",
             "Branches:",
-            *_boss_branch_rows(store, branches),
+            *rows,
             "",
             "Request:",
             "<request>",
             message,
             "</request>",
             "",
-            "Return JSON only, with `assignments` and a short `summary` of how you",
-            "split it, written in the user's language. These are drafts awaiting the",
-            "user's review — the summary must not claim anything was sent.",
+            "Return JSON only, with `assignments` (branch + brief) and a short `summary`",
+            "of how you split it, written in the user's language. These become drafts",
+            "awaiting the user's review — the summary must not claim anything was sent.",
         ]
     )
+
+
+def build_boss_branch_draft_prompt(store: ContextStore, branch_id: str, message: str, brief: str) -> str:
+    """Step two, once per branch: write what this one branch should be told.
+
+    One branch per call, so it is offered at a branch turn's own depth — the whole
+    budget, not a share of it. The instruction written here is sent verbatim as the
+    user's message, so it has to land in a conversation already underway, in the
+    terms that conversation uses.
+    """
+    return "\n".join(
+        [
+            "You are writing the message a user will send to one ctxgit branch.",
+            "",
+            "The user gave a desk a request covering several branches. The part that",
+            "belongs to this branch has been picked out for you as the brief. Write the",
+            "instruction this branch should receive, as the user would say it to the",
+            "branch directly — it is sent verbatim as their message, after the user has",
+            "reviewed and possibly edited it.",
+            "",
+            "Rules:",
+            "- Write to this branch as it is: build on what it has already done and",
+            "  decided, use the terms its conversation uses, do not re-ask what its",
+            "  history already answers.",
+            "- Keep it self-contained: the branch cannot see the desk or the request.",
+            "- Cover the brief; do not take on parts of the request that are not in it.",
+            "- If, knowing this branch, the brief turns out not to be its work at all,",
+            "  return an empty instruction.",
+            "- Write in the language the request is written in.",
+            *_BOSS_MODE_GUIDE,
+            "",
+            "Branch:",
+            boss_branch_context_block(store, branch_id, boss_branch_context_budget(store, 1)),
+            "",
+            "The whole request, for orientation only:",
+            "<request>",
+            message,
+            "</request>",
+            "",
+            "This branch's part:",
+            "<brief>",
+            brief,
+            "</brief>",
+            "",
+            "Return JSON only: `instruction` and `suggestedMode`.",
+        ]
+    )
+
+
+def _boss_branch_progress(progress: ProgressCallback | None, branch_id: str) -> ProgressCallback | None:
+    """Progress for one of several drafters running side by side, labelled so the
+    interleaved lines say which branch they are about."""
+    if progress is None:
+        return None
+
+    def labelled(message: str) -> None:
+        progress(f"[{branch_id}] {message}")
+
+    for name in ("cancelled",):
+        if hasattr(progress, name):
+            setattr(labelled, name, getattr(progress, name))
+    return labelled  # type: ignore[return-value]
+
+
+def run_boss_branch_calls(
+    branches: list[str], call: Callable[[str], dict[str, Any]]
+) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+    """Run one provider call per branch, side by side. One failing does not take the
+    others with it: what succeeded is returned, what failed is named."""
+    results: dict[str, dict[str, Any]] = {}
+    errors: dict[str, str] = {}
+    if not branches:
+        return results, errors
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(BOSS_DRAFT_WORKERS, len(branches))) as pool:
+        futures = {pool.submit(call, branch_id): branch_id for branch_id in branches}
+        for future in concurrent.futures.as_completed(futures):
+            branch_id = futures[future]
+            try:
+                results[branch_id] = future.result()
+            except (ChatTimeoutError, JobCancelledError):
+                raise
+            except Exception as exc:  # noqa: BLE001 - reported per branch
+                errors[branch_id] = str(exc)
+    return results, errors
 
 
 #: How many earlier rounds of feedback on one draft to carry. Enough to keep a
@@ -12470,17 +12597,52 @@ def draft_boss_assignments(
         # The HTTP path records the request itself, before the job starts, so it
         # is on screen from the first moment even if drafting then fails.
         append_boss_history(store, "user", message, desk=desk)
-    emit_progress(progress, "Drafting what each branch should be told")
     try:
-        routing = boss_structured_reply(
-            call_provider_prompt(
-                _boss_provider(root), root, build_boss_routing_prompt(store, message, branches),
-                writable=False, cwd=root, progress=progress, output_schema=BOSS_ROUTING_SCHEMA,
-            ),
-            "assignments",
+        provider = _boss_provider(root)
+        if len(branches) == 1:
+            # Nothing to split: the one branch's writer decides whether it is its work.
+            briefs, summary = {branches[0]: message}, ""
+        else:
+            emit_progress(progress, "Splitting the request across the branches")
+            routing = boss_structured_reply(
+                call_provider_prompt(
+                    provider, root, build_boss_routing_prompt(store, message, branches),
+                    writable=False, cwd=root, progress=progress, output_schema=BOSS_SPLIT_SCHEMA,
+                ),
+                "assignments",
+            )
+            briefs = {}
+            for entry in routing.get("assignments") if isinstance(routing.get("assignments"), list) else []:
+                branch_id = str(entry.get("branch") or "").strip() if isinstance(entry, dict) else ""
+                brief = str(entry.get("brief") or "").strip() if isinstance(entry, dict) else ""
+                if branch_id in branches and brief and branch_id not in briefs:
+                    briefs[branch_id] = brief
+            summary = str(routing.get("summary") or "").strip()
+
+        # Each branch gets its own writer, with that branch's whole context.
+        def write_for(branch_id: str) -> dict[str, Any]:
+            branch_progress = _boss_branch_progress(progress, branch_id)
+            emit_progress(branch_progress, "Writing this branch's message with its own context")
+            return boss_structured_reply(
+                call_provider_prompt(
+                    provider, root,
+                    build_boss_branch_draft_prompt(store, branch_id, message, briefs[branch_id]),
+                    writable=False, cwd=root, progress=branch_progress,
+                    output_schema=BOSS_INSTRUCTION_SCHEMA,
+                ),
+                "instruction",
+            )
+
+        written, failed = run_boss_branch_calls([b for b in branches if b in briefs], write_for)
+        if failed and not written:
+            raise RuntimeError("; ".join(f"{b}: {m}" for b, m in failed.items()))
+        assignments = normalize_boss_assignments(
+            [
+                {"branch": b, "instruction": written[b].get("instruction"), "suggestedMode": written[b].get("suggestedMode")}
+                for b in branches if b in written
+            ],
+            branches,
         )
-        assignments = normalize_boss_assignments(routing.get("assignments"), branches)
-        summary = str(routing.get("summary") or "").strip()
         delivered: list[dict[str, Any]] = []
         # Every desk holding this work gets the result — the one that asked, and
         # any Boss split off from it while the draft was still being written.
@@ -12501,7 +12663,11 @@ def draft_boss_assignments(
             # looks like a bug.
             lines = [summary] if summary else []
             lines += [f"- **{item['branch']}** 초안 준비됨" for item in items]
-            if not items:
+            lines += [
+                f"- **{branch_id}** 초안 작성 실패: {compact_progress_text(reason, 160)}"
+                for branch_id, reason in failed.items() if branch_id in allowed
+            ]
+            if not items and not failed:
                 lines.append("_고른 브랜치 중 이 일을 맡을 곳을 찾지 못했습니다._")
             append_boss_history(
                 store, "assistant", "\n".join(lines),
@@ -12545,18 +12711,39 @@ def revise_boss_items(
         )
     emit_progress(progress, "Rewriting the drafts from your feedback")
     try:
-        result = boss_structured_reply(
-            call_provider_prompt(
-                _boss_provider(root), root, build_boss_revision_prompt(store, targets, feedback, desk),
-                writable=False, cwd=root, progress=progress, output_schema=BOSS_ROUTING_SCHEMA,
-            ),
-            "assignments",
-        )
-        rewritten = {
-            item["branch"]: item
-            for item in normalize_boss_assignments(result.get("assignments"), target_ids)
-        }
-        summary = str(result.get("summary") or "").strip()
+        provider = _boss_provider(root)
+        by_branch = {str(item.get("branch")): item for item in targets}
+
+        # One rewrite per draft, side by side: each sees its branch at a turn's
+        # depth instead of sharing one prompt's budget with the others.
+        def rewrite(branch_id: str) -> dict[str, Any]:
+            return boss_structured_reply(
+                call_provider_prompt(
+                    provider, root,
+                    build_boss_revision_prompt(store, [by_branch[branch_id]], feedback, desk),
+                    writable=False, cwd=root,
+                    progress=_boss_branch_progress(progress, branch_id) if len(targets) > 1 else progress,
+                    output_schema=BOSS_ROUTING_SCHEMA,
+                ),
+                "assignments",
+            )
+
+        replies, failed = run_boss_branch_calls(target_ids, rewrite)
+        if failed and not replies:
+            raise RuntimeError("; ".join(f"{b}: {m}" for b, m in failed.items()))
+        rewritten = {}
+        notes = []
+        for branch_id in target_ids:
+            reply = replies.get(branch_id)
+            if not reply:
+                continue
+            for item in normalize_boss_assignments(reply.get("assignments"), [branch_id]):
+                rewritten[item["branch"]] = item
+            note = str(reply.get("summary") or "").strip()
+            if note:
+                notes.append(note if len(target_ids) == 1 else f"- **{branch_id}**: {note}")
+        notes += [f"- **{b}** 다시 쓰기 실패: {compact_progress_text(m, 160)}" for b, m in failed.items()]
+        summary = "\n".join(notes)
         delivered: list[dict[str, Any]] = []
         for holder in boss_inflight_desks(store, work_id) if work_id else [desk]:
             # A desk only takes a rewrite of a draft it is still holding.

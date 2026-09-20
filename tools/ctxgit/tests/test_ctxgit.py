@@ -5057,10 +5057,28 @@ class _BossModel:
             self.prompts.append(prompt)
             if self.raw:
                 return self.answer
+            answer = self.answer
+            if isinstance(answer, dict) and "assignments" in answer and "<feedback>" not in prompt:
+                rows = [a for a in answer["assignments"] if isinstance(a, dict)]
+                if "<brief>" in prompt:
+                    # Step two: the writer for one branch. Tests state what each
+                    # branch ends up being told; hand this branch its line.
+                    branch = prompt.split("Branch:\n### ", 1)[1].split("\n", 1)[0]
+                    row = next((a for a in rows if a.get("branch") == branch), {})
+                    answer = {
+                        "instruction": row.get("instruction", ""),
+                        "suggestedMode": row.get("suggestedMode", "info-chat"),
+                    }
+                else:
+                    # Step one: the split. Every named branch gets a brief.
+                    answer = {
+                        "summary": answer.get("summary", ""),
+                        "assignments": [{"branch": a.get("branch"), "brief": a.get("instruction")} for a in rows],
+                    }
             # The shape providers really return: a chat envelope, with the object
             # that was asked for as fenced text in `assistant`. A fake that handed
             # the dict straight back is how a desk that could never draft passed.
-            text = json.dumps(self.answer, ensure_ascii=False, indent=2)
+            text = json.dumps(answer, ensure_ascii=False, indent=2)
             return {"assistant": f"```json\n{text}\n```", "artifacts": [], "approvalRequests": []}
 
         ctxgit.call_provider_prompt = fake
@@ -5144,6 +5162,98 @@ class BossChatTest(unittest.TestCase):
                 ctxgit.BOSS_MIN_BRANCH_CONTEXT_CHARS,
             )
 
+    # 🚨 Splitting and writing are separate calls. One call for everything meant every
+    #    chosen branch shared a single prompt's budget — the wider the desk, the less
+    #    each draft knew about the branch it was written for.
+    def test_each_branch_gets_its_own_writer_at_full_depth(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            ctxgit.write_boss_config(store, ["sales", "dev", "untouched"])
+            store.append_history("sales", "assistant", "세일즈만 아는 이야기")
+            store.append_history("dev", "assistant", "개발만 아는 이야기")
+            seen_budgets = []
+            original = ctxgit.boss_branch_context_block
+
+            def spy(st, branch_id, budget):
+                seen_budgets.append(budget)
+                return original(st, branch_id, budget)
+
+            ctxgit.boss_branch_context_block = spy
+            try:
+                with _BossModel({"assignments": [
+                    {"branch": "sales", "instruction": "견적"},
+                    {"branch": "dev", "instruction": "빌드"},
+                ], "summary": "나눴습니다"}) as model:
+                    items = ctxgit.draft_boss_assignments(root, store, "오늘 할 일")
+            finally:
+                ctxgit.boss_branch_context_block = original
+            self.assertEqual(sorted(i["branch"] for i in items), ["dev", "sales"])
+            split = [p for p in model.prompts if "<brief>" not in p]
+            writers = [p for p in model.prompts if "<brief>" in p]
+            self.assertEqual(len(split), 1)
+            self.assertEqual(len(writers), 2, "one writer per branch that has work, none for the idle one")
+            # The split stays light: no branch history in it.
+            self.assertNotIn("세일즈만 아는 이야기", split[0])
+            # A writer sees its own branch in depth, and only its own.
+            sales = next(p for p in writers if "### sales" in p)
+            self.assertIn("세일즈만 아는 이야기", sales)
+            self.assertNotIn("개발만 아는 이야기", sales)
+            # Full budget each — not a third of it.
+            self.assertEqual(seen_budgets, [ctxgit.boss_branch_context_budget(store, 1)] * 2)
+
+    def test_one_writer_failing_does_not_lose_the_others(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            ctxgit.write_boss_config(store, ["sales", "dev"])
+            original = ctxgit.call_provider_prompt
+
+            def fake(provider, r, prompt, **k):
+                if "<brief>" not in prompt:
+                    return {"assignments": [{"branch": "sales", "brief": "견적"}, {"branch": "dev", "brief": "빌드"}], "summary": ""}
+                if "### dev" in prompt:
+                    raise RuntimeError("provider down")
+                return {"instruction": "견적 정리해줘", "suggestedMode": "send"}
+
+            ctxgit.call_provider_prompt = fake
+            try:
+                items = ctxgit.draft_boss_assignments(root, store, "오늘 할 일")
+            finally:
+                ctxgit.call_provider_prompt = original
+            self.assertEqual([i["branch"] for i in items], ["sales"])
+            self.assertIn("dev", ctxgit.iter_boss_history(store)[-1]["text"])
+            self.assertIn("실패", ctxgit.iter_boss_history(store)[-1]["text"])
+
+    def test_a_writer_can_decline_a_brief_that_is_not_its_branch_s_work(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            ctxgit.write_boss_config(store, ["sales", "dev"])
+            with _BossModel({"assignments": [
+                {"branch": "sales", "instruction": "견적"},
+                {"branch": "dev", "instruction": ""},
+            ], "summary": ""}):
+                items = ctxgit.draft_boss_assignments(root, store, "오늘 할 일")
+            self.assertEqual([i["branch"] for i in items], ["sales"])
+
+    def test_feedback_on_several_drafts_rewrites_each_on_its_own(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            ctxgit.write_boss_config(store, ["sales", "dev"])
+            self._draft(root, store, [
+                {"branch": "sales", "instruction": "세일즈 원문"},
+                {"branch": "dev", "instruction": "개발 원문"},
+            ])
+            answer = {"assignments": [
+                {"branch": "sales", "instruction": "세일즈 고침"},
+                {"branch": "dev", "instruction": "개발 고침"},
+            ], "summary": "줄였습니다"}
+            with _BossModel(answer) as model:
+                ctxgit.revise_boss_items(root, store, "전부 더 짧게")
+            self.assertEqual(len(model.prompts), 2)
+            for prompt in model.prompts:
+                self.assertEqual(("세일즈 원문" in prompt) + ("개발 원문" in prompt), 1, "one draft per rewrite")
+            items = {i["branch"]: i["instruction"] for i in ctxgit.boss_pending_items(store)}
+            self.assertEqual(items, {"sales": "세일즈 고침", "dev": "개발 고침"})
+
     def test_the_http_path_can_record_the_request_itself(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, store = self._project(tmp)
@@ -5175,7 +5285,7 @@ class BossChatTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root, store = self._project(tmp)
             ctxgit.write_boss_config(store, ["sales"])
-            reply = '나눠봤습니다.\n{"assignments": [{"branch": "sales", "instruction": "견적"}], "summary": "s"}\n이상입니다.'
+            reply = '써봤습니다.\n{"instruction": "견적", "suggestedMode": "send"}\n이상입니다.'
             with _BossModel({"assistant": reply, "artifacts": [], "approvalRequests": []}, raw=True):
                 items = ctxgit.draft_boss_assignments(root, store, "오늘 할 일")
             self.assertEqual([i["branch"] for i in items], ["sales"])
