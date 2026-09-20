@@ -5597,8 +5597,15 @@ const BOSS_LOG_LABELS = {
   dispatch: "보냄",
 };
 
+// 보냄은 이 로그에 싣지 않는다. 무엇이 언제 어떤 모드로 나갔는지는 그 브랜치 카드의
+// "마지막 지시"가 이미 말하고 있고, 여기서는 지시문 전체가 한 번 더 길게 깔려 요청과
+// 초안 사이의 흐름을 덮는다. 기록이 사라지는 것은 아니다 — 히스토리에는 그대로 남는다.
+const BOSS_LOG_HIDDEN_KINDS = new Set(["dispatch"]);
+
 function renderBossLog(payload) {
-  const history = payload.history || [];
+  const history = (payload.history || []).filter((message) => !BOSS_LOG_HIDDEN_KINDS.has(message.kind));
+  // 서명도 걸러낸 목록으로 잡는다. 보냄 하나가 추가됐다고 보이는 것이 그대로인 목록을
+  // 다시 그리면 스크롤만 바닥으로 튄다.
   const signature = `${history.length}:${history[history.length - 1]?.id || ""}`;
   if (signature === state.bossLogSignature && els.messageList.querySelector(".boss-log-entry, .boss-log-empty")) {
     return;
