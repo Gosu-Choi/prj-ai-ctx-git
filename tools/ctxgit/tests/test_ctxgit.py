@@ -5290,6 +5290,24 @@ class BossChatTest(unittest.TestCase):
             kinds = [r.get("kind") for r in ctxgit.iter_boss_history(store)]
             self.assertEqual(kinds[-2:], ["feedback", "revision"])
 
+    # 🚨 피드백은 초안 **위에서** 나온다. 다시 쓰는 쪽이 브랜치를 모르면, 사용자는
+    #    맥락을 아는 글을 보고 말했는데 고치는 쪽은 맥락 없이 고친다 — 매번 같은 자리로
+    #    되돌아오는 이유가 그것이다. 라우팅과 같은 깊이여야 한다.
+    def test_a_rewrite_sees_the_branch_as_deeply_as_the_first_draft_did(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            ctxgit.write_boss_config(store, ["sales"])
+            store.append_history("sales", "user", "단가는 월 단위로 끊어서 적어줘")
+            store.append_history("sales", "assistant", "월 단위로 고쳤습니다.")
+            self._draft(root, store, [{"branch": "sales", "instruction": "원래 문장"}])
+            answer = {"assignments": [{"branch": "sales", "instruction": "고친 문장"}], "summary": ""}
+            with _BossModel(answer) as model:
+                ctxgit.revise_boss_items(root, store, "더 짧게", only=["sales"])
+            prompt = model.prompts[0]
+            self.assertIn("recent history:", prompt)
+            self.assertIn("단가는 월 단위로 끊어서 적어줘", prompt)
+            self.assertIn("월 단위로 고쳤습니다", prompt)
+
     def test_a_rewrite_cannot_add_a_branch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, store = self._project(tmp)
