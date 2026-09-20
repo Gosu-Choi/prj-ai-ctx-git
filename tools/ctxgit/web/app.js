@@ -168,6 +168,16 @@ const els = {
   bossBranchButton: document.querySelector("#bossBranchButton"),
   bossResetButton: document.querySelector("#bossResetButton"),
   bossPickerList: document.querySelector("#bossPickerList"),
+  bossReader: document.querySelector("#bossReader"),
+  bossReaderTitle: document.querySelector("#bossReaderTitle"),
+  bossReaderMeta: document.querySelector("#bossReaderMeta"),
+  bossReaderBody: document.querySelector("#bossReaderBody"),
+  bossReaderEdit: document.querySelector("#bossReaderEdit"),
+  bossReaderStatus: document.querySelector("#bossReaderStatus"),
+  bossReaderToggle: document.querySelector("#bossReaderToggle"),
+  bossReaderCopy: document.querySelector("#bossReaderCopy"),
+  bossReaderDone: document.querySelector("#bossReaderDone"),
+  bossReaderClose: document.querySelector("#bossReaderClose"),
   bossPickerFilter: document.querySelector("#bossPickerFilter"),
   bossPickerClear: document.querySelector("#bossPickerClear"),
   bossPickerStatus: document.querySelector("#bossPickerStatus"),
@@ -5722,13 +5732,13 @@ function bossCardHtml(branch, item, flags) {
 
   const told = thread.lastInstruction
     ? `<div class="boss-card-told" title="${escapeHtml(thread.lastInstruction)}">
-         <span class="boss-card-label">마지막 지시 · ${escapeHtml(thread.delivery === "interjected" ? "끼어들기" : thread.lastMode === "send" ? "Send" : "Info chat")} · ${escapeHtml(timeAgo(thread.sentAt))}</span>
+         <span class="boss-card-label">마지막 지시 · ${escapeHtml(thread.delivery === "interjected" ? "끼어들기" : thread.lastMode === "send" ? "Send" : "Info chat")} · ${escapeHtml(timeAgo(thread.sentAt))}<button class="boss-link boss-zoom" data-boss-action="read" data-what="told" type="button" title="크게, 읽기 좋은 모양으로 봅니다">⤢ 크게 보기</button></span>
          <span class="boss-card-told-text">${escapeHtml(thread.lastInstruction)}</span>
        </div>`
     : "";
   const answer = branch.lastAnswer
     ? `<div class="boss-card-answer ${flags.expanded ? "expanded" : ""}">
-         <div class="boss-card-label">마지막 답변 · ${escapeHtml(timeAgo(branch.lastAnswerAt))}
+         <div class="boss-card-label">마지막 답변 · ${escapeHtml(timeAgo(branch.lastAnswerAt))}<button class="boss-link boss-zoom" data-boss-action="read" data-what="answer" type="button" title="크게, 읽기 좋은 모양으로 봅니다">⤢ 크게 보기</button>
            <button class="boss-link" data-boss-action="expand" type="button">${flags.expanded ? "접기" : "펼치기"}</button>
          </div>
          <div class="boss-card-answer-body message-text">${renderMessageText(branch.lastAnswer)}</div>
@@ -5764,7 +5774,7 @@ function bossCardHtml(branch, item, flags) {
           .join("");
     draft = `
       <div class="boss-card-draft">
-        <div class="boss-card-label">보낼 메시지 초안 ${origin}${revision}</div>
+        <div class="boss-card-label">보낼 메시지 초안 ${origin}${revision}<button class="boss-link boss-zoom" data-boss-action="read" data-what="draft" type="button" title="크게, 읽기 좋은 모양으로 봅니다">⤢ 크게 보기</button></div>
         ${item.reason ? `<div class="boss-card-why">${escapeHtml(item.reason)}</div>` : ""}
         <textarea data-boss-instruction rows="${rows}" ${locked ? "disabled" : ""} spellcheck="false">${escapeHtml(text)}</textarea>
         <div class="boss-card-feedback">
@@ -6051,6 +6061,7 @@ els.bossBoard.addEventListener("click", (event) => {
   const branchId = bossCardBranch(button);
   const action = button.dataset.bossAction;
   if (action === "open" && branchId) loadBranch(branchId);
+  else if (action === "read" && branchId) openBossReader(branchId, button.dataset.what);
   else if (action === "pick") selectTab("boss");
   else if (action === "expand" && branchId) {
     if (state.bossExpanded.has(branchId)) state.bossExpanded.delete(branchId);
@@ -6094,6 +6105,127 @@ els.bossBoard.addEventListener("focusout", (event) => {
   window.setTimeout(() => {
     if ([...state.bossNodes.values()].some((node) => node.dataset.stale === "1")) renderBossBoard();
   }, 300);
+});
+
+// --- reader ----------------------------------------------------------------------
+//
+// A card is a summary: the last instruction is one clipped line, the answer fades
+// out after a few, the draft sits in a small box. Anything worth judging has to be
+// readable in full, so each of the three opens here — one column, comfortable
+// measure, rendered the way the branch itself would show it. A draft can also be
+// rewritten here, with room to see the whole of it.
+const bossReader = { branch: "", what: "", text: "", original: "" };
+
+function renderBossReaderBody() {
+  els.bossReaderBody.innerHTML = bossReader.text.trim()
+    ? renderMessageText(bossReader.text)
+    : '<span class="muted">내용이 없습니다.</span>';
+}
+
+function setBossReaderEditing(editing) {
+  // Only a box that was actually on screen has anything to hand back. Reading it
+  // unconditionally let whatever the last session left in it overwrite the text
+  // being opened.
+  if (!els.bossReaderEdit.hidden && !editing) bossReader.text = els.bossReaderEdit.value;
+  els.bossReaderEdit.hidden = !editing;
+  els.bossReaderBody.hidden = editing;
+  els.bossReaderToggle.textContent = editing ? "읽는 모양으로 보기" : "여기서 고치기";
+  if (editing) {
+    els.bossReaderEdit.value = bossReader.text;
+    els.bossReaderEdit.focus();
+  } else {
+    renderBossReaderBody();
+  }
+}
+
+function openBossReader(branchId, what) {
+  const branch = (state.bossPayload?.branches || []).find((item) => item.id === branchId);
+  if (!branch) return;
+  const thread = branch.thread || {};
+  const item = bossPendingMap().get(branchId);
+  const locked = state.bossBusy.has(branchId) || state.bossRevising.has(branchId);
+  let label = "";
+  let meta = "";
+  let text = "";
+  if (what === "told") {
+    label = "마지막 지시";
+    text = thread.lastInstruction || "";
+    const mode = thread.delivery === "interjected" ? "끼어들기" : thread.lastMode === "send" ? "Send" : "Info chat";
+    meta = `${mode}(으)로 보냄 · ${timeAgo(thread.sentAt)} · 이 브랜치가 받은 문장 그대로입니다.`;
+  } else if (what === "answer") {
+    label = "마지막 답변";
+    text = branch.lastAnswer || "";
+    meta = `${timeAgo(branch.lastAnswerAt)} · 이 브랜치가 마지막으로 한 말입니다.`;
+  } else {
+    label = "보낼 메시지 초안";
+    text = bossCurrentInstruction(branchId);
+    meta = [
+      item?.origin === "followup" ? "후속 초안" : "새 요청에서 나온 초안",
+      item?.reason || "",
+      "승인하면 이 문장이 그대로 이 브랜치에 전달됩니다.",
+    ].filter(Boolean).join(" · ");
+  }
+  Object.assign(bossReader, { branch: branchId, what, text, original: text });
+  els.bossReaderTitle.textContent = `${branch.title} — ${label}`;
+  els.bossReaderMeta.textContent = meta;
+  els.bossReaderStatus.textContent = "";
+  els.bossReaderToggle.hidden = what !== "draft" || locked;
+  els.bossReaderEdit.hidden = true;
+  els.bossReaderEdit.value = "";
+  setBossReaderEditing(false);
+  if (!els.bossReader.open) els.bossReader.showModal();
+  els.bossReader.querySelector(".boss-reader-scroll").scrollTop = 0;
+  if (what === "answer") {
+    // The board's copy is trimmed in the middle; fetch the whole answer.
+    api(`/api/boss/answer?branch=${encodeURIComponent(branchId)}`)
+      .then((full) => {
+        if (!els.bossReader.open || bossReader.branch !== branchId || bossReader.what !== "answer") return;
+        if (full?.text && full.text !== bossReader.text) {
+          bossReader.text = full.text;
+          bossReader.original = full.text;
+          renderBossReaderBody();
+        }
+      })
+      .catch(() => {});
+  }
+}
+
+// Closing is also "keep what I changed": an edit made here lands in the card's own
+// box and is saved the same way typing there would be.
+function closeBossReader() {
+  if (!els.bossReaderEdit.hidden) bossReader.text = els.bossReaderEdit.value;
+  const { branch, what, text, original } = bossReader;
+  if (what === "draft" && text.trim() && text !== original) {
+    const item = bossPendingMap().get(branch);
+    if (item) {
+      state.bossEdits[branch] = { id: item.id, text };
+      const field = state.bossNodes.get(branch)?.querySelector("[data-boss-instruction]");
+      if (field) field.value = text;
+      bossSaveEdit(branch);
+    }
+  }
+  if (els.bossReader.open) els.bossReader.close();
+}
+
+els.bossReaderToggle.addEventListener("click", () => setBossReaderEditing(els.bossReaderEdit.hidden));
+els.bossReaderDone.addEventListener("click", closeBossReader);
+els.bossReaderClose.addEventListener("click", closeBossReader);
+els.bossReader.addEventListener("cancel", (event) => {
+  event.preventDefault();
+  closeBossReader();
+});
+els.bossReader.addEventListener("click", (event) => {
+  // The dialog element itself is only hit on the backdrop.
+  if (event.target === els.bossReader) closeBossReader();
+});
+els.bossReaderCopy.addEventListener("click", async () => {
+  const text = els.bossReaderEdit.hidden ? bossReader.text : els.bossReaderEdit.value;
+  try {
+    await navigator.clipboard.writeText(text);
+    els.bossReaderStatus.textContent = "복사했습니다";
+  } catch {
+    els.bossReaderStatus.textContent = "복사하지 못했습니다";
+  }
 });
 
 // --- composer --------------------------------------------------------------------

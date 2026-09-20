@@ -14857,6 +14857,18 @@ def make_handler(
                 except SystemExit as exc:
                     self.send_json(die_payload("boss_failed", exc), status=http_status_from_exit(exc, 400))
                 return True
+            if parsed.path == "/api/boss/answer":
+                # The board carries a trimmed answer so a refresh stays light; the
+                # reader asks for the whole of it when someone actually opens one.
+                branch_id = (query.get("branch") or [""])[0]
+                if branch_id not in {str(item.get("id") or "") for item in store.list_branches()}:
+                    self.send_json({"error": "branch_not_found"}, status=404)
+                    return True
+                record = last_branch_answer(store, branch_id)
+                self.send_json(
+                    {"branch": branch_id, "text": str(record.get("text") or ""), "createdAt": str(record.get("createdAt") or "")}
+                )
+                return True
             if parsed.path == "/api/context-chat":
                 self.send_json(context_chat_payload(store))
                 return True

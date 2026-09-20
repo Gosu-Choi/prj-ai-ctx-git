@@ -450,6 +450,26 @@
       </main>
     </div>
 
+    <dialog id="bossReader" class="boss-reader">
+      <header class="boss-reader-head">
+        <div class="boss-reader-titles">
+          <b id="bossReaderTitle"></b>
+          <div id="bossReaderMeta" class="boss-reader-meta"></div>
+        </div>
+        <button id="bossReaderClose" class="boss-reader-x" type="button" aria-label="닫기">✕</button>
+      </header>
+      <div class="boss-reader-scroll">
+        <article id="bossReaderBody" class="boss-reader-body message-text"></article>
+        <textarea id="bossReaderEdit" class="boss-reader-edit" spellcheck="false" hidden></textarea>
+      </div>
+      <footer class="boss-reader-foot">
+        <span id="bossReaderStatus" class="settings-status"></span>
+        <button id="bossReaderToggle" type="button" hidden>여기서 고치기</button>
+        <button id="bossReaderCopy" type="button">복사</button>
+        <button id="bossReaderDone" class="primary" type="button" autofocus>닫기</button>
+      </footer>
+    </dialog>
+
     <dialog id="folderDialog" class="folder-dialog">
       <div class="folder-dialog-head">
         <strong>폴더로 이동</strong>
