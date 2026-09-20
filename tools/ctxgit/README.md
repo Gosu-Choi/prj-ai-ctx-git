@@ -100,6 +100,12 @@ the project. Each branch switches individual documents on from the topbar
 `branch.json`. Switched-on documents are injected verbatim into that branch's
 prompts, so the agent starts every turn already knowing them.
 
+They go in three places, because one was not enough to make them stick: the
+provider's system prompt, the prompt body (ranked above the project instructions
+and above the conversation history), and a short reminder after the user message.
+History compaction gets them too — a compaction is re-injected into every later
+prompt, so one written without them contradicts them from then on.
+
 Storing knowledge is always explicit: `Knowledging` in a chat message's `...`
 menu opens a modal, and the configured LLM appends one distilled section to the
 document you pick.
@@ -145,6 +151,19 @@ without per-edit approval. Outside-workspace writes are handled as explicit
 approval requests; approving one reruns the turn with only that external
 directory added through Codex `--add-dir`. `Append only` writes a user message
 without asking the model.
+
+Web jobs use the Codex app-server protocol, so BTW messages steer the active
+Codex turn just as streamed stdin does on Claude. Direct one-shot commands keep
+`codex exec` as a fallback. App-server thread IDs are saved per branch and mode,
+so the next Codex turn resumes its native session; ctxgit's branch history also
+brings in any intervening Claude turns after a provider switch.
+
+On the Claude provider the model list is Claude Code's tier aliases — `fable`,
+`opus`, `sonnet`, `haiku`, plus the `[1m]` variants that ask for the 1M-token
+context window (those need an account entitled to it). The team pipeline reads a
+role's declared tier as relative to that choice: roles asking for the frontier
+tier run on whatever is selected, so picking Fable reaches them, while cheaper
+roles stay cheap and no role outruns a deliberately cheaper selection.
 
 ```bash
 ctxgit provider status

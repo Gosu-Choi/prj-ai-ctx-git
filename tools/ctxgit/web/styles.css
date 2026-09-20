@@ -573,6 +573,31 @@ button.section-toggle[aria-expanded="false"] .section-toggle-caret {
   box-shadow: inset 0 0 0 1px #2f8f46;
 }
 
+/* Same two states, tallied on the folder header, so collapsing a folder does not
+   hide the fact that something inside it is running or waiting to be read. */
+.folder-dot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  margin-left: 4px;
+  padding: 0 4px;
+  border-radius: 8px;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.folder-dot.job-running {
+  background: #c56a12;
+}
+
+.folder-dot.job-done {
+  background: #2f8f46;
+}
+
 #contextChatButton.job-running {
   border-color: #c56a12;
   box-shadow: inset 0 0 0 1px #c56a12;
@@ -901,7 +926,11 @@ button.section-toggle[aria-expanded="false"] .section-toggle-caret {
   padding: 18px 22px;
 }
 
-#chatTab.active.event-visible {
+/* Any sidebar panel opens the second column — the rule used to name only
+   .event-visible, so BTW and Model rendered under the chat instead of beside it. */
+#chatTab.active.event-visible,
+#chatTab.active.btw-visible,
+#chatTab.active.model-visible {
   grid-template-columns: minmax(0, 1fr) clamp(300px, 24vw, 380px);
 }
 
@@ -909,7 +938,17 @@ button.section-toggle[aria-expanded="false"] .section-toggle-caret {
 #chatTab.active.event-visible .composer,
 #chatTab.active.event-visible .progress-panel,
 #chatTab.active.event-visible .chat-error,
-#chatTab.active.event-visible .resource-stage {
+#chatTab.active.event-visible .resource-stage,
+#chatTab.active.btw-visible .message-list,
+#chatTab.active.btw-visible .composer,
+#chatTab.active.btw-visible .progress-panel,
+#chatTab.active.btw-visible .chat-error,
+#chatTab.active.btw-visible .resource-stage,
+#chatTab.active.model-visible .message-list,
+#chatTab.active.model-visible .composer,
+#chatTab.active.model-visible .progress-panel,
+#chatTab.active.model-visible .chat-error,
+#chatTab.active.model-visible .resource-stage {
   width: 100%;
   max-width: none;
 }
@@ -1519,10 +1558,16 @@ button.section-toggle[aria-expanded="false"] .section-toggle-caret {
   display: none;
 }
 
+/* One line, clipped: this is the current activity, and a long shell command must
+   not push the panel open. The agent's own lines wrap freely below it. */
 .progress-title {
   color: var(--accent);
   font-size: 12px;
   font-weight: 700;
+  line-height: 1.45;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .progress-events {
@@ -1531,6 +1576,30 @@ button.section-toggle[aria-expanded="false"] .section-toggle-caret {
   color: var(--muted);
   font-size: 12px;
 }
+
+/* What the model said reads as speech; the tool lines under it stay machinery. */
+.progress-events .progress-said {
+  color: var(--text);
+}
+
+.progress-events .progress-step {
+  color: var(--muted);
+  opacity: 0.75;
+}
+
+/* The commentary stack grows during a turn, so it scrolls rather than pushing the
+   composer off screen. */
+.progress-events {
+  max-height: 40vh;
+  overflow-y: auto;
+}
+
+.progress-events .progress-said + .progress-said {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dotted var(--line);
+}
+
 
 .event-panel {
   align-self: stretch;
@@ -1545,8 +1614,69 @@ button.section-toggle[aria-expanded="false"] .section-toggle-caret {
   overflow: hidden;
 }
 
-#chatTab.active.event-visible .event-panel {
+/* Events, BTW and Model share the one sidebar slot; never more than one is open.
+   Scoped by id rather than class because the panels share .event-panel for layout,
+   so a class rule would show all of them at once. */
+#chatTab.active.event-visible #eventPanel {
   display: grid;
+}
+
+#chatTab.active.btw-visible #btwPanel {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+}
+
+#chatTab.active.model-visible #modelPanel {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+}
+
+.model-form {
+  display: grid;
+  gap: 6px;
+  align-content: start;
+  padding: 10px 11px;
+  border-top: 1px solid var(--line);
+  overflow-y: auto;
+}
+
+.model-form select {
+  width: 100%;
+  padding: 7px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  font: inherit;
+}
+
+.model-form label {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.btw-form {
+  display: grid;
+  gap: 8px;
+  padding: 10px 11px;
+  border-top: 1px solid var(--line);
+}
+
+.btw-form textarea {
+  width: 100%;
+  resize: vertical;
+  min-height: 56px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  font: inherit;
+}
+
+.btw-form button[disabled] {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .event-panel[hidden] {
@@ -1641,6 +1771,20 @@ button.section-toggle[aria-expanded="false"] .section-toggle-caret {
   border-top: 1px solid var(--line);
   color: var(--muted);
   font-size: 12px;
+}
+
+.artifact-touched > summary {
+  cursor: pointer;
+  color: var(--muted);
+  user-select: none;
+}
+
+.artifact-touched[open] > summary {
+  margin-bottom: 5px;
+}
+
+.artifact-touched > div {
+  margin-left: 12px;
 }
 
 .approval-requests {
@@ -3269,4 +3413,553 @@ button.section-toggle[aria-expanded="false"] .section-toggle-caret {
   font-weight: 400;
   opacity: 0.8;
   white-space: nowrap;
+}
+
+
+
+/* The turn's working notes: present, but folded so the answer still leads. */
+.turn-narration {
+  margin: 0 0 8px;
+  padding: 6px 8px;
+  border-left: 2px solid var(--line);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.turn-narration > summary {
+  cursor: pointer;
+  user-select: none;
+}
+
+.turn-narration > div {
+  margin-top: 4px;
+  line-height: 1.45;
+}
+
+
+/* Boss chat ------------------------------------------------------------------
+   A desk rather than a conversation: the board of branch cards is the primary
+   surface and takes the wide column; the log of what was asked sits beside it;
+   the composer runs underneath both. */
+.chat-main.boss-mode {
+  grid-template-columns: minmax(0, 1.75fr) minmax(260px, 1fr);
+}
+
+.chat-main.boss-mode > * {
+  grid-column: 1 / -1;
+}
+
+.chat-main.boss-mode > .boss-board {
+  grid-column: 1;
+  grid-row: 1;
+}
+
+.chat-main.boss-mode > .message-list {
+  grid-column: 2;
+  grid-row: 1;
+  padding-left: 12px;
+  border-left: 1px solid var(--line);
+}
+
+@media (max-width: 1100px) {
+  .chat-main.boss-mode {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1.6fr) minmax(110px, 1fr) auto auto;
+  }
+
+  .chat-main.boss-mode > .message-list {
+    grid-column: 1;
+    grid-row: 2;
+    padding-left: 0;
+    border-left: 0;
+  }
+}
+
+.boss-board {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 10px;
+  min-width: 0;
+  min-height: 0;
+}
+
+.boss-board[hidden] {
+  display: none;
+}
+
+.boss-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  font-size: 12px;
+}
+
+.boss-bar input {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+
+.boss-bar-gap {
+  flex: 0 0 8px;
+}
+
+.boss-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));
+  gap: 10px;
+  align-content: start;
+  align-items: start;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-bottom: 18px;
+  scrollbar-gutter: stable;
+}
+
+.boss-empty {
+  display: grid;
+  gap: 8px;
+  justify-items: start;
+  padding: 18px;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.boss-card {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 11px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.boss-card.has-draft {
+  border-color: var(--accent);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.boss-card.is-running {
+  border-color: #c56a12;
+  box-shadow: inset 3px 0 0 #c56a12;
+}
+
+.boss-card-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+.boss-card-title {
+  flex-shrink: 1;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.boss-card-title:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+.boss-card-meta {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.boss-state {
+  flex-shrink: 0;
+  padding: 1px 8px;
+  border-radius: 9px;
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.boss-state.running  { background: #c56a12; color: #fff; }
+.boss-state.ready    { background: var(--accent); color: #fff; }
+.boss-state.drafting { background: var(--accent-soft); color: var(--accent); }
+.boss-state.failed   { background: #b33636; color: #fff; }
+.boss-state.idle     { background: var(--line); color: var(--muted); }
+
+.boss-card-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.boss-card-told {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.boss-card-told-text {
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.boss-card-answer {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.boss-card-answer-body {
+  max-height: 5.8em;
+  overflow: hidden;
+  font-size: 12.5px;
+  -webkit-mask-image: linear-gradient(#000 60%, transparent);
+  mask-image: linear-gradient(#000 60%, transparent);
+}
+
+.boss-card-answer.expanded .boss-card-answer-body {
+  max-height: 340px;
+  overflow-y: auto;
+  -webkit-mask-image: none;
+  mask-image: none;
+}
+
+.boss-link {
+  margin-left: auto;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.boss-card-progress {
+  overflow: hidden;
+  color: #c56a12;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The draft is the part that is meant to be read, argued with and rewritten, so
+   it is set apart from the branch's status above it. */
+.boss-card-draft {
+  display: grid;
+  gap: 6px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
+.boss-chip {
+  padding: 0 6px;
+  border-radius: 8px;
+  background: var(--line);
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.boss-chip.followup { background: var(--accent-soft); color: var(--accent); }
+.boss-chip.done     { background: #e2f3e6; color: #2f8f46; }
+
+/* Why this follow-up exists, so approving it is a judgement and not a reflex. */
+.boss-card-why {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.boss-card textarea,
+.boss-card input[type="text"],
+.boss-bar input,
+.boss-picker-head input {
+  width: 100%;
+  padding: 7px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+}
+
+.boss-card textarea {
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.boss-card-feedback {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px;
+}
+
+.boss-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.boss-card-actions-label {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.boss-card button,
+.boss-bar button,
+.boss-empty button,
+.boss-picker-head button,
+.boss-folder-all {
+  padding: 5px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.boss-card button.boss-card-title,
+.boss-card button.boss-link {
+  padding: 0;
+  border: 0;
+}
+
+.boss-card button.boss-card-title {
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.boss-card button:hover:not([disabled]),
+.boss-bar button:hover:not([disabled]) {
+  border-color: var(--accent);
+}
+
+.boss-card button[disabled],
+.boss-bar button[disabled] {
+  cursor: wait;
+  opacity: 0.55;
+}
+
+.boss-approve {
+  font-weight: 700;
+}
+
+.boss-approve.suggested {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #fff;
+}
+
+.boss-suggested {
+  margin-left: 5px;
+  padding: 0 5px;
+  border-radius: 7px;
+  background: rgb(255 255 255 / 25%);
+  font-size: 10px;
+}
+
+.boss-discard {
+  color: var(--muted);
+}
+
+/* The log beside the board: compact, it is a record rather than the main event. */
+.boss-log-entry {
+  padding: 8px 10px;
+  font-size: 12.5px;
+}
+
+.boss-log-entry.boss-log-feedback {
+  border-left: 3px solid #d9a400;
+}
+
+.boss-log-entry.message-assistant {
+  background: transparent;
+}
+
+/* Composer: one action. */
+.composer.boss-mode {
+  grid-template-columns: minmax(0, 1fr) 110px 90px;
+}
+
+/* Branch picker (Branches tab): the sidebar's folders, with checkboxes. */
+#bossTab.active {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
+  overflow: hidden;
+  padding: 18px 22px;
+}
+
+.boss-panel {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  gap: 8px;
+  max-width: 760px;
+  min-height: 0;
+}
+
+.boss-picker-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+}
+
+.boss-picker-hint {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.boss-picker-list {
+  display: grid;
+  gap: 2px;
+  align-content: start;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+/* Unlike the sidebar, a collapsed folder here hides everything inside it: the
+   count on its header already says how many are chosen. */
+.boss-pick-folder.collapsed .folder-body {
+  display: none;
+}
+
+.boss-pick-folder .folder-header-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.boss-folder-all {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  color: var(--muted);
+  font-size: 11px;
+  visibility: hidden;
+}
+
+.boss-pick-folder:hover .boss-folder-all {
+  visibility: visible;
+}
+
+.folder-count.has-picked {
+  background: var(--accent);
+  color: #fff;
+}
+
+.boss-pick {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 5px 6px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+.boss-pick:hover {
+  background: var(--accent-soft);
+}
+
+.boss-pick-title {
+  font-weight: 650;
+}
+
+.boss-pick.running .boss-pick-title {
+  color: #c56a12;
+}
+
+.boss-pick-meta {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+/* Sidebar: the desk's branches under the Boss chat button. */
+.branch-actions {
+  flex-wrap: wrap;
+}
+
+.branch-actions #bossChatButton {
+  flex: 1;
+  white-space: nowrap;
+}
+
+#bossChatButton.job-running {
+  border-color: #c56a12;
+  box-shadow: inset 0 0 0 1px #c56a12;
+}
+
+.boss-pending-badge {
+  display: inline-block;
+  min-width: 16px;
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: 8px;
+  background: #d9a400;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+}
+
+.boss-pending-badge[hidden] {
+  display: none;
+}
+
+.boss-nav-folder {
+  margin-bottom: 6px;
+}
+
+.boss-nav-folder[hidden] {
+  display: none;
+}
+
+.boss-nav-folder .branch-folder {
+  margin-top: 0;
+}
+
+.boss-nav-folder .branch-folder.collapsed .folder-body {
+  display: none;
+}
+
+.boss-nav-folder .folder-body {
+  border-left-color: #d9a400;
+}
+
+.boss-nav-folder .branch-row {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+/* Branches spun out of boss chat, so they are tellable at a glance. */
+.boss-star {
+  margin-right: 4px;
+  color: #d9a400;
 }

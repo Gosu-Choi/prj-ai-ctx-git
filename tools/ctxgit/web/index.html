@@ -98,8 +98,10 @@
           <div id="branchesBody">
             <div class="branch-actions">
               <button id="contextChatButton" class="wide-button" type="button">Contexts chat</button>
+              <button id="bossChatButton" class="wide-button" type="button" title="정해둔 브랜치들에게 일을 나눠 보내는 데스크">Boss chat<span id="bossPendingBadge" class="boss-pending-badge" hidden></span></button>
               <button id="newFolderButton" class="wide-button" type="button" title="Create an empty folder to group branches into">＋ 새 폴더</button>
             </div>
+            <div id="bossFolder" class="nav-list boss-nav-folder" hidden></div>
             <div id="branchList" class="nav-list"></div>
           </div>
         </section>
@@ -170,6 +172,7 @@
             <select id="sandboxInput">
               <option value="workspace-write">Project write</option>
               <option value="read-only">Read only</option>
+              <option value="danger-full-access">Full access (no approval gate)</option>
             </select>
             <div id="providerSettingsStatus" class="settings-status"></div>
           </form>
@@ -212,6 +215,13 @@
                 hidden
                 title="Create a new branch seeded with this contexts chat"
               >🌱 New branch from chat</button>
+              <button
+                id="bossBranchButton"
+                class="open-dir-button"
+                type="button"
+                hidden
+                title="Create a new branch seeded with this boss chat"
+              >🌱 New branch from boss</button>
             </div>
             <div id="activeMeta" class="active-meta"></div>
           </div>
@@ -243,6 +253,7 @@
               title="Choose which knowledge documents this branch always starts with"
             >Guiding</button>
             <button class="tab active" data-tab="chat" type="button">Chat</button>
+            <button class="tab" id="bossTabButton" data-tab="boss" type="button" hidden>Branches</button>
             <button class="tab" data-tab="report" type="button">Report</button>
             <button class="tab" data-tab="summaries" type="button">Summaries</button>
             <button class="tab" data-tab="files" type="button">Files</button>
@@ -250,23 +261,30 @@
             <button class="tab" data-tab="graph" type="button">Graph</button>
             <button class="tab" data-tab="version" type="button">Version</button>
             <button id="eventPanelToggle" class="event-panel-toggle" type="button" aria-pressed="false">Events</button>
+            <button id="btwPanelToggle" class="event-panel-toggle" type="button" aria-pressed="false" title="실행 중인 작업은 그대로 두고 별도의 읽기 전용 질문을 합니다.">BTW</button>
+            <button id="modelPanelToggle" class="event-panel-toggle" type="button" aria-pressed="false" title="이 브랜치만 다른 프로바이더/모델로 돌립니다.">Model</button>
           </div>
         </header>
 
         <section id="chatTab" class="tab-panel active">
           <div class="chat-main">
             <div id="branchDropOverlay" class="drop-overlay" hidden>Drop to stage branch resources</div>
+            <section id="bossBoard" class="boss-board" hidden>
+              <div id="bossBar" class="boss-bar-slot"></div>
+              <div id="bossCards" class="boss-cards"></div>
+            </section>
             <div id="messageList" class="message-list"></div>
             <div id="progressPanel" class="progress-panel" hidden>
               <div id="progressTitle" class="progress-title"></div>
               <div id="progressEvents" class="progress-events"></div>
             </div>
             <div id="chatError" class="error-banner chat-error" hidden></div>
-            <div id="branchResourceStage" class="resource-stage" hidden></div>
+              <div id="branchResourceStage" class="resource-stage" hidden></div>
             <form id="composer" class="composer">
-              <textarea id="messageInput" rows="3" placeholder="Ask the branch-aware AI"></textarea>
+              <textarea id="messageInput" rows="3" placeholder="Ask the branch-aware AI — Enter: Info chat · ⌘/Ctrl+Enter: Send · Shift+Enter: 줄바꿈"></textarea>
               <button id="sendButton" type="submit">Send</button>
               <button id="contextResetButton" class="danger-button" type="button" hidden>Reset</button>
+              <button id="bossResetButton" class="danger-button" type="button" hidden>Reset</button>
               <button id="historyChatButton" type="button">Info chat</button>
               <button id="teamButton" type="button" title="Run the deterministic team pipeline: plan → prd → exec → verify → fix">Team</button>
             </form>
@@ -287,6 +305,53 @@
               <div class="muted">아직 이벤트가 없습니다.</div>
             </div>
           </aside>
+          <aside id="btwPanel" class="event-panel btw-panel">
+            <div class="event-panel-header">
+              <span>BTW</span>
+              <span id="btwStatus" class="event-status"></span>
+            </div>
+            <div id="btwHint" class="event-meta">
+              <div>현재 작업은 그대로 두고 별도의 읽기 전용 질문을 합니다. 작업 방향을 바꾸려면 일반 입력창에서 끼어드세요.</div>
+            </div>
+            <div id="btwLog" class="event-list">
+              <div class="muted">보낸 곁말이 없습니다.</div>
+            </div>
+            <form id="btwForm" class="btw-form">
+              <textarea id="btwInput" rows="3" placeholder="작업을 멈추지 않고 별도로 질문"></textarea>
+              <button id="btwSendButton" type="submit">보내기</button>
+            </form>
+          </aside>
+          <aside id="modelPanel" class="event-panel model-panel">
+            <div class="event-panel-header">
+              <span>Model</span>
+              <span id="branchProviderStatus" class="event-status"></span>
+            </div>
+            <div id="branchProviderSummary" class="event-meta"></div>
+            <div class="model-form">
+              <label for="branchProviderInput">Provider</label>
+              <select id="branchProviderInput">
+                <option value="">Follow project</option>
+                <option value="codex">Codex</option>
+                <option value="claude">Claude Code</option>
+              </select>
+              <label for="branchModelInput">Model</label>
+              <select id="branchModelInput"></select>
+              <button id="branchProviderSave" type="button">Save for this branch</button>
+              <button id="branchProviderClear" type="button">Follow project again</button>
+            </div>
+          </aside>
+        </section>
+
+        <section id="bossTab" class="tab-panel">
+          <div class="boss-panel">
+            <div class="boss-picker-head">
+              <input id="bossPickerFilter" type="search" placeholder="브랜치 찾기" autocomplete="off" />
+              <span id="bossPickerStatus" class="settings-status"></span>
+              <button id="bossPickerClear" type="button">모두 해제</button>
+            </div>
+            <div class="boss-picker-hint">고른 브랜치에게만 일이 갑니다. 체크하면 바로 저장됩니다 · Send / Info chat은 초안을 승인할 때 건별로 정합니다.</div>
+            <div id="bossPickerList" class="boss-picker-list"></div>
+          </div>
         </section>
 
         <section id="reportTab" class="tab-panel">
@@ -480,6 +545,8 @@
         <label>Participant<select id="sequenceUpdateOrder"></select></label>
         <label>Persistent system prompt<textarea id="sequenceUpdatePrompt" rows="6"></textarea></label>
         <label>Permission<select id="sequenceUpdateAccess"><option value="send">Can send and edit project</option><option value="info-chat">Info chat only</option></select></label>
+        <label>Provider<select id="sequenceUpdateProvider"><option value="">Follow room</option><option value="codex">Codex</option><option value="claude">Claude Code</option></select></label>
+        <label>Model<select id="sequenceUpdateModel"></select></label>
         <label>Maximum agent replies<input id="sequenceUpdateMaxReplies" type="number" min="2" max="40" /></label>
         <label>Minimum evaluator rounds<input id="sequenceUpdateMinEvaluatorRounds" type="number" min="1" max="20" /></label>
         <label>Acceptance criteria (one per line)<textarea id="sequenceUpdateAcceptanceCriteria" rows="5"></textarea></label>

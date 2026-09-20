@@ -123,6 +123,51 @@ class ClaudeCommandTest(unittest.TestCase):
         finally:
             ctxgit.subprocess.run = original
 
+    def test_full_access_drops_the_auto_mode_classifier_on_writable_sessions(self) -> None:
+        """A writable session normally runs under Claude Code's auto-mode
+        classifier, which decides per command and is not deterministic — the same
+        command is allowed one day and blocked the next, with nobody present to
+        approve the prompt. `danger-full-access` is the opt-out, and it is the same
+        value Codex already takes, so one setting covers both providers."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp, sandbox="workspace-write")
+            cmd = self._capture_chat_command(root, store, "b1")
+            self.assertEqual(cmd[cmd.index("--permission-mode") + 1], "auto")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp, sandbox="danger-full-access")
+            cmd = self._capture_chat_command(root, store, "b1")
+            self.assertEqual(cmd[cmd.index("--permission-mode") + 1], "bypassPermissions")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # Read-only sessions always bypassed: the tool denylist carries the
+            # restriction, so the classifier has nothing left to decide.
+            root, store = self._project(tmp, sandbox="read-only")
+            cmd = self._capture_chat_command(root, store, "b1")
+            self.assertEqual(cmd[cmd.index("--permission-mode") + 1], "bypassPermissions")
+
+    def test_pipeline_stages_follow_the_same_permission_setting(self) -> None:
+        # A team turn that cannot merge is as stuck as a chat turn that cannot.
+        for sandbox, expected in (
+            ("workspace-write", "auto"),
+            ("danger-full-access", "bypassPermissions"),
+        ):
+            with tempfile.TemporaryDirectory() as tmp:
+                root, _ = self._project(tmp, sandbox=sandbox)
+                seen: list[list[str]] = []
+                self._run_stage_agent(
+                    root,
+                    seen,
+                    json.dumps({"type": "result", "structured_output": {"verdict": "PASS"}}),
+                    role="executor",
+                    prompt="ship it",
+                    writable=True,
+                    schema={"type": "object"},
+                    label="team-exec",
+                )
+                cmd = seen[0]
+                self.assertEqual(cmd[cmd.index("--permission-mode") + 1], expected)
+
     def test_stage_injects_the_role_prompt_instead_of_pinning_an_agent(self) -> None:
         # Regression guard: `--agent` makes Claude Code silently ignore --json-schema,
         # which left the planner returning prose and no tasks. The role has to be
@@ -163,6 +208,43 @@ class ClaudeCommandTest(unittest.TestCase):
             self.assertIn("Write", disallowed.split(","))
             self.assertEqual(reply.data, {"verdict": "PASS"})
             self.assertEqual(reply.text, "raw text")
+
+    def _stage_model(self, tmp: str, role: str, **provider) -> str:
+        root, _ = self._project(tmp, **provider)
+        seen: list[list[str]] = []
+        self._run_stage_agent(
+            root,
+            seen,
+            json.dumps({"type": "result", "structured_output": {"verdict": "PASS"}}),
+            role=role,
+            prompt="check it",
+            writable=True,
+            schema={"type": "object"},
+            label="team-verify",
+        )
+        cmd = seen[0]
+        return cmd[cmd.index("--model") + 1]
+
+    def test_selecting_fable_reaches_the_roles_that_asked_for_the_top_tier(self) -> None:
+        # A role's tier is relative: the library says "opus" for "the frontier
+        # model", so picking Fable has to reach those stages instead of leaving the
+        # whole pipeline on Opus while only the chat turn upgraded.
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(self._stage_model(tmp, "planner", model="fable"), "fable")
+        with tempfile.TemporaryDirectory() as tmp:
+            # ...and the cheap roles stay cheap.
+            self.assertEqual(self._stage_model(tmp, "verifier", model="fable"), "sonnet")
+        with tempfile.TemporaryDirectory() as tmp:
+            # The 1M context choice carries through to the frontier stages too.
+            self.assertEqual(self._stage_model(tmp, "planner", model="opus[1m]"), "opus[1m]")
+
+    def test_a_cheaper_selection_caps_the_roles_that_asked_for_more(self) -> None:
+        # Picking Haiku is a budget decision; a role asking for Opus must not
+        # quietly spend it anyway.
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(self._stage_model(tmp, "planner", model="haiku"), "haiku")
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(self._stage_model(tmp, "verifier", model="haiku"), "haiku")
 
     def test_missing_structured_output_is_an_error_not_an_empty_result(self) -> None:
         # The silent version of this cost a whole pipeline run: no structured output
@@ -434,6 +516,12 @@ class ExternalExtensionMcpTest(unittest.TestCase):
         for name in declared:
             self.assertIn(name, servers)
             spec = servers[name]
+            if spec.get("url"):
+                # A remote server is an endpoint and nothing else: the provider CLI
+                # holds the OAuth token, so no credential exists to leak onto argv.
+                self.assertNotIn("command", spec)
+                self.assertNotIn("env", spec)
+                continue
             self.assertEqual(spec["command"], sys.executable)
             self.assertIn("mcp-server", spec["args"])
             self.assertNotIn("env", spec)
@@ -839,7 +927,9 @@ class OrchestrationLogTest(unittest.TestCase):
         original_stream = ctxgit.run_process_with_progress
         original_run = ctxgit.subprocess.run
 
-        def fake_stream(cmd, cwd, timeout, progress, stdin_text=None, event_formatter=None):
+        def fake_stream(
+            cmd, cwd, timeout, progress, stdin_text=None, event_formatter=None, stdin_channel=None
+        ):
             sink = getattr(progress, "event_sink", None)
             if sink:
                 for line in stream_lines:
@@ -1054,3 +1144,521 @@ class RevealBranchDirTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StreamedStdinTest(unittest.TestCase):
+    """Deciding when a steered turn's stdin can be closed.
+
+    A message dropped into a running turn lands in one of two ways and the CLI does
+    not say which in advance: inside the tool loop it joins that turn, otherwise it
+    becomes a follow-up turn. Closing stdin on the first result would silently drop
+    the second case, so the replay echo is what the close waits on.
+    """
+
+    def _user_echo(self, text: str) -> str:
+        return json.dumps(
+            {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": text}]}}
+        )
+
+    def _tool_result_echo(self) -> str:
+        return json.dumps(
+            {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}],
+                },
+            }
+        )
+
+    def test_a_plain_turn_closes_on_its_result(self) -> None:
+        channel = ctxgit.StreamedStdin()
+        self.assertFalse(channel.observe('{"type":"assistant"}'))
+        self.assertTrue(channel.observe('{"type":"result","result":"done"}'))
+
+    def test_an_unconsumed_interjection_holds_stdin_open(self) -> None:
+        channel = ctxgit.StreamedStdin()
+        channel.queue("actually, skip the rest")
+        # The turn reports a result before the CLI has taken the message: it is
+        # about to run as a follow-up turn, so stdin must stay open for it.
+        self.assertFalse(channel.observe('{"type":"result","result":"first"}'))
+        # The echo only marks it taken; the close decision waits for that turn's
+        # own result.
+        self.assertFalse(channel.observe(self._user_echo("actually, skip the rest")))
+        self.assertTrue(channel.observe('{"type":"result","result":"second"}'))
+
+    def test_a_consumed_interjection_lets_the_turn_end(self) -> None:
+        channel = ctxgit.StreamedStdin()
+        channel.queue("skip the rest")
+        # Steered inside the tool loop: taken first, then one result for the turn.
+        self.assertFalse(channel.observe(self._user_echo("skip the rest")))
+        self.assertTrue(channel.observe('{"type":"result","result":"done"}'))
+
+    def test_tool_results_are_not_mistaken_for_the_echo(self) -> None:
+        channel = ctxgit.StreamedStdin()
+        channel.queue("skip the rest")
+        self.assertFalse(channel.observe(self._tool_result_echo()))
+        self.assertFalse(channel.observe('{"type":"result","result":"done"}'))
+
+    def test_drain_hands_over_each_message_once(self) -> None:
+        channel = ctxgit.StreamedStdin()
+        channel.queue("first")
+        channel.queue("  ")  # blank input is not a message
+        channel.queue("second")
+        lines = channel.drain()
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(json.loads(lines[0])["message"]["content"][0]["text"], "first")
+        self.assertTrue(lines[0].endswith("\n"))
+        self.assertEqual(channel.drain(), [])
+
+
+class SequenceRoomInterjectionTest(unittest.TestCase):
+    """A room's interjection has to reach the agent that is speaking now.
+
+    It used to only be appended to history, so the speaking agent never heard it —
+    the one after it did, by reading the transcript. A room is one job running a
+    chain of agent processes, so the job's queue has to travel down to whichever
+    process is live.
+    """
+
+    def test_the_room_agent_inherits_the_job_interjection_queue(self) -> None:
+        handed: list[str] = []
+
+        def progress(_message: str) -> None:
+            return None
+
+        progress.take_interjections = lambda: ["mid-run steer"]  # type: ignore[attr-defined]
+        progress.cancelled = lambda: False  # type: ignore[attr-defined]
+
+        wrapped = ctxgit.stream_capturing_progress(orch.StreamTranscript(), progress)
+        take = getattr(wrapped, "take_interjections", None)
+        self.assertIsNotNone(take, "the room agent cannot be spoken to without this")
+        handed.extend(take())
+        self.assertEqual(handed, ["mid-run steer"])
+        # Cancellation still rides along; the wrapper carries both.
+        self.assertFalse(getattr(wrapped, "cancelled")())
+
+    def test_a_queue_survives_until_a_process_asks_for_it(self) -> None:
+        # Queued between two replies, taken by the next agent that starts.
+        registry = ctxgit.JobStore.__new__(ctxgit.JobStore)
+        registry._lock = threading.RLock()
+        registry._jobs = {"j1": {"id": "j1", "status": "running"}}
+        registry.persist_locked = lambda _job: None
+        registry.snapshot = lambda job_id, root=None: {"id": job_id}
+        registry.load_locked = lambda job_id, root=None: None
+
+        registry.interject("j1", "hold on")
+        self.assertEqual(registry.take_interjections("j1"), ["hold on"])
+        # Taken once only: a second agent must not replay it.
+        self.assertEqual(registry.take_interjections("j1"), [])
+
+    def test_a_finished_job_refuses_instead_of_swallowing_the_message(self) -> None:
+        registry = ctxgit.JobStore.__new__(ctxgit.JobStore)
+        registry._lock = threading.RLock()
+        registry._jobs = {"j1": {"id": "j1", "status": "done"}}
+        registry.persist_locked = lambda _job: None
+        registry.snapshot = lambda job_id, root=None: {"id": job_id}
+        registry.load_locked = lambda job_id, root=None: None
+
+        result = registry.interject("j1", "too late")
+        self.assertEqual(result.get("error"), "job_not_running")
+
+
+class ChatEnvelopeRecoveryTest(unittest.TestCase):
+    """When the reply wraps the envelope in something else.
+
+    The contract is "return JSON only". When a reply adds a line of preamble or
+    puts the object in a fenced block, the whole thing used to be stored verbatim,
+    so the chat showed raw JSON with literal \\n where the answer should be. This is
+    the strict-schema fallback's normal failure shape, so it has to be recovered.
+    """
+
+    ENVELOPE = json.dumps(
+        {"assistant": "코드는 통일됐다.", "artifacts": [], "approvalRequests": []},
+        ensure_ascii=False,
+    )
+
+    def test_preamble_before_the_object(self) -> None:
+        raw = "확인 끝. 정리해서 답한다.\n\n" + self.ENVELOPE
+        self.assertEqual(ctxgit.parse_chat_result(raw)["assistant"], "코드는 통일됐다.")
+
+    def test_object_inside_a_fenced_block(self) -> None:
+        raw = "확인 끝.\n\n```json\n" + self.ENVELOPE + "\n```"
+        self.assertEqual(ctxgit.parse_chat_result(raw)["assistant"], "코드는 통일됐다.")
+
+    def test_prose_after_the_object(self) -> None:
+        raw = self.ENVELOPE + "\n\n필요하면 더 하겠다."
+        self.assertEqual(ctxgit.parse_chat_result(raw)["assistant"], "코드는 통일됐다.")
+
+    def test_an_answer_that_quotes_other_json_is_left_alone(self) -> None:
+        # Dev chat quotes config and API payloads constantly. Only an object with a
+        # string `assistant` is the envelope; nothing else has that shape.
+        answer = '설정은 이렇다:\n```json\n{"port": 5180}\n```'
+        raw = json.dumps(
+            {"assistant": answer, "artifacts": [], "approvalRequests": []}, ensure_ascii=False
+        )
+        self.assertEqual(ctxgit.parse_chat_result(raw)["assistant"], answer)
+
+    def test_a_reply_that_is_only_someone_elses_json_stays_raw(self) -> None:
+        raw = 'here is the config: {"port": 5180, "mode": "dev"}'
+        self.assertEqual(ctxgit.parse_chat_result(raw)["assistant"], raw)
+
+    def test_plain_prose_still_falls_through(self) -> None:
+        self.assertEqual(ctxgit.parse_chat_result("그냥 산문이다.")["assistant"], "그냥 산문이다.")
+
+    def test_braces_inside_strings_do_not_cut_the_span_short(self) -> None:
+        envelope = json.dumps(
+            {"assistant": 'closing brace: "}" here', "artifacts": [], "approvalRequests": []},
+            ensure_ascii=False,
+        )
+        raw = "먼저 한마디.\n\n" + envelope
+        self.assertEqual(ctxgit.parse_chat_result(raw)["assistant"], 'closing brace: "}" here')
+
+    def test_recovery_reaches_the_claude_result_path(self) -> None:
+        # The same reply as it actually arrives: a stream-json result event whose
+        # `result` string carries the preamble.
+        stream = json.dumps(
+            {"type": "result", "subtype": "success", "result": "확인 끝.\n\n" + self.ENVELOPE}
+        )
+        self.assertEqual(ctxgit.parse_claude_result(stream)["assistant"], "코드는 통일됐다.")
+
+
+class SequenceRoomParticipantIntegrityTest(unittest.TestCase):
+    """A room that has quietly lost a speaker must not run.
+
+    Observed 2026-08-23: a save while the participant panel was open left one
+    usable order, the room ran anyway, and the evaluator answered and graded
+    itself for all six replies. The job reported success, the branch got no reply
+    anyone wanted, and the run was only visible as "Sequence evaluation 6" in the
+    event log. The count check that existed passed, because it counted the raw
+    list rather than the orders the room actually speaks from.
+    """
+
+    def _room(self, tmp: str, participants: list, speaking_order=None, stop_decider=2):
+        root = Path(tmp)
+        store = ctxgit.ContextStore(root)
+        store.init(create_initial_branch=False)
+        store.create_branch("room")
+        config = {
+            "participants": participants,
+            "speakingOrder": speaking_order if speaking_order is not None else [1, 2],
+            "stopDecider": stop_decider,
+            "defaultMaxAgentReplies": 6,
+            "minimumEvaluatorRounds": 2,
+        }
+        store.sequence_room_config = lambda _branch, _config=config: _config
+        return root, store
+
+    def _participant(self, order: int, source: str):
+        return {"order": order, "sourceBranch": source, "accessMode": "info-chat"}
+
+    def _run(self, root, store):
+        return ctxgit.run_sequence_room_turn(root, store, "room", "go")
+
+    def test_two_participants_sharing_an_order_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._room(
+                tmp, [self._participant(2, "a"), self._participant(2, "b")]
+            )
+            with self.assertRaises(ValueError) as caught:
+                self._run(root, store)
+            self.assertIn("duplicate order", str(caught.exception))
+
+    def test_a_participant_with_no_order_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._room(
+                tmp, [self._participant(1, "a"), {"sourceBranch": "b", "accessMode": "send"}]
+            )
+            with self.assertRaises(ValueError) as caught:
+                self._run(root, store)
+            self.assertIn("no speaking order", str(caught.exception))
+
+    def test_a_lone_speaker_who_is_also_the_evaluator_is_refused(self) -> None:
+        # The room's stopDecider is 2 and the saved order names only 2, so that one
+        # agent would answer and then grade its own answer, round after round.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._room(
+                tmp,
+                [self._participant(1, "a"), self._participant(2, "b")],
+                speaking_order=[2],
+            )
+            with self.assertRaises(ValueError) as caught:
+                self._run(root, store)
+            self.assertIn("also its evaluator", str(caught.exception))
+
+    def test_a_single_speaker_with_no_evaluator_takes_one_reply_and_stops(self) -> None:
+        """Naming one participant and no evaluator is a real setup, not a mistake.
+
+        The integrity check first written here refused any room that resolved to one
+        speaker, which also refused this — the "just this one agent, once" case.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._room(
+                tmp,
+                [self._participant(1, "a"), self._participant(2, "b")],
+                speaking_order=[1],
+                stop_decider=None,
+            )
+            calls: list[str] = []
+            original = ctxgit.call_provider_prompt
+
+            def fake(provider, *_args, **_kwargs):
+                calls.append(provider)
+                return {"assistant": f"reply {len(calls)}"}
+
+            ctxgit.call_provider_prompt = fake
+            try:
+                result = self._run(root, store)
+            finally:
+                ctxgit.call_provider_prompt = original
+            self.assertEqual(len(calls), 1, "one speaker, one reply")
+            self.assertEqual(result["sequenceRun"]["stopReason"].count("speaking-order cycle"), 1)
+
+
+class ProviderStandingDirectiveParityTest(unittest.TestCase):
+    """Whatever governs a turn has to reach both providers the same way.
+
+    Guiding knowledge goes three places on a chat turn — the provider's standing
+    instructions, the prompt body, and a reminder after the user message — because
+    the body alone did not hold. Room turns went through a different entry point
+    that had no standing-instruction channel at all, so on either provider a room
+    agent only ever saw guiding as one section of a very long user message.
+    """
+
+    def test_the_shared_entry_point_carries_it_to_both_providers(self) -> None:
+        seen: dict[str, str] = {}
+
+        original_claude = ctxgit.call_claude_prompt
+        original_codex = ctxgit.call_codex_prompt
+        ctxgit.call_claude_prompt = lambda *a, **k: seen.setdefault("claude", k.get("system_extra", "")) or {}
+        ctxgit.call_codex_prompt = lambda *a, **k: seen.setdefault("codex", k.get("system_extra", "")) or {}
+        try:
+            for provider in ("claude", "codex"):
+                ctxgit.call_provider_prompt(
+                    provider, Path("/tmp"), "prompt", writable=False, system_extra="STANDING_RULE"
+                )
+        finally:
+            ctxgit.call_claude_prompt = original_claude
+            ctxgit.call_codex_prompt = original_codex
+
+        self.assertEqual(seen.get("claude"), "STANDING_RULE")
+        self.assertEqual(seen.get("codex"), "STANDING_RULE")
+
+    def test_codex_puts_it_in_developer_instructions_on_the_exec_path(self) -> None:
+        # `codex exec` has no system prompt flag; the native field is where a
+        # standing rule stops competing with history inside the user prompt.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.init(create_initial_branch=False)
+            cmd: list[str] = []
+            ctxgit.apply_codex_session_config(cmd, root, developer_extra="STANDING_RULE")
+            joined = " ".join(cmd)
+            self.assertIn("developer_instructions=", joined)
+            self.assertIn("STANDING_RULE", joined)
+            # The record stance rides the same channel on both providers.
+            self.assertIn("read later, outside this", joined)
+
+
+class BtwAsideTest(unittest.TestCase):
+    """A BTW lookup is recorded but does not join the conversation.
+
+    It is asked on the side while a real turn runs. Keeping it in the timeline puts
+    a throwaway question in the middle of the thread being read, and keeping it in
+    the prompt puts that question in front of the model on every turn that follows.
+    The record itself stays in history.jsonl so an answer can still be traced.
+    """
+
+    def _branch(self, tmp: str):
+        root = Path(tmp)
+        store = ctxgit.ContextStore(root)
+        store.init(create_initial_branch=False)
+        store.create_branch("b1")
+        return root, store
+
+    def test_an_aside_is_written_but_hidden_from_the_timeline_and_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._branch(tmp)
+            store.append_history("b1", "user", "REAL_QUESTION", extra={"mode": "chat"})
+            store.append_history("b1", "assistant", "REAL_ANSWER", extra={"mode": "chat"})
+            store.append_history("b1", "user", "ASIDE_QUESTION", extra={"mode": "info-chat", "aside": True})
+            store.append_history(
+                "b1", "assistant", "ASIDE_ANSWER", extra={"mode": "info-chat", "aside": True}
+            )
+
+            # Still on disk: the branch keeps a full record.
+            raw = [record["text"] for record in store.iter_history("b1")]
+            self.assertIn("ASIDE_QUESTION", raw)
+            self.assertIn("ASIDE_ANSWER", raw)
+
+            payload = ctxgit.branch_payload(store, "b1")
+            shown = [record["text"] for record in payload["history"]]
+            self.assertEqual(shown, ["REAL_QUESTION", "REAL_ANSWER"])
+
+            prompt = ctxgit.build_chat_prompt(store, "b1", "next")
+            self.assertIn("REAL_QUESTION", prompt)
+            self.assertNotIn("ASIDE_QUESTION", prompt)
+            self.assertNotIn("ASIDE_ANSWER", prompt)
+
+    def test_the_info_chat_prompt_hides_it_too(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._branch(tmp)
+            store.append_history("b1", "user", "REAL_QUESTION", extra={"mode": "chat"})
+            store.append_history("b1", "user", "ASIDE_QUESTION", extra={"aside": True})
+            prompt = ctxgit.build_history_chat_prompt(store, "b1", "next")
+            self.assertIn("REAL_QUESTION", prompt)
+            self.assertNotIn("ASIDE_QUESTION", prompt)
+
+    def test_an_ordinary_info_chat_turn_is_untouched(self) -> None:
+        # Only BTW marks asides; a normal Info chat turn stays in the thread.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._branch(tmp)
+            store.append_history("b1", "user", "INFO_QUESTION", extra={"mode": "info-chat"})
+            payload = ctxgit.branch_payload(store, "b1")
+            self.assertIn("INFO_QUESTION", [record["text"] for record in payload["history"]])
+
+
+class RunningTurnVisibilityTest(unittest.TestCase):
+    """A side question has to know what it was asked alongside.
+
+    Observed on muse_for_1shot_gen: asked "지금 뭐하고 있냐, 브랜치 돌잖아" while a
+    real turn was working, the answer was "돌고 있는 건 이 대화 턴 하나다". It was not
+    wrong to conclude that — the request in flight has no answer in history yet, and
+    what the turn is doing lives in the job record, which no prompt had ever read.
+    """
+
+    def _branch(self, tmp: str):
+        root = Path(tmp)
+        store = ctxgit.ContextStore(root)
+        store.init(create_initial_branch=False)
+        store.create_branch("b1")
+        return root, store
+
+    def _job(self, root: Path, job_id: str, **fields) -> None:
+        jobs = root / "contexts" / "jobs"
+        jobs.mkdir(parents=True, exist_ok=True)
+        ctxgit.dump_json(jobs / f"{job_id}.json", {"id": job_id, **fields})
+
+    def test_the_prompt_carries_the_request_and_the_latest_activity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._branch(tmp)
+            store.append_history("b1", "user", "REBUILD_THE_DECK", extra={"mode": "chat", "turnId": "t1"})
+            self._job(
+                root,
+                "20260823T130500000000Z",
+                branch="b1",
+                mode="chat",
+                status="running",
+                createdAt="2026-08-23T13:05:00Z",
+                events=[{"message": "Using tool: Bash · pdf build", "createdAt": "2026-08-23T13:06:00Z"}],
+            )
+
+            prompt = ctxgit.build_history_chat_prompt(store, "b1", "지금 뭐하고 있어?")
+            self.assertIn("<running_turn>", prompt)
+            self.assertIn("REBUILD_THE_DECK", prompt)
+            self.assertIn("Using tool: Bash", prompt)
+            self.assertIn("It cannot hear you and it is not finished", prompt)
+
+    def test_an_answered_turn_is_not_reported_as_in_flight(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._branch(tmp)
+            store.append_history("b1", "user", "OLD_REQUEST", extra={"mode": "chat", "turnId": "t1"})
+            store.append_history("b1", "assistant", "OLD_ANSWER", extra={"mode": "chat", "turnId": "t1"})
+            self._job(
+                root,
+                "20260823T130500000000Z",
+                branch="b1",
+                mode="chat",
+                status="done",
+                createdAt="2026-08-23T13:05:00Z",
+            )
+            prompt = ctxgit.build_history_chat_prompt(store, "b1", "뭐 하고 있어?")
+            self.assertNotIn("<running_turn>", prompt)
+
+    def test_side_questions_are_not_reported_as_the_running_turn(self) -> None:
+        # Otherwise a BTW lookup answers "what is running?" with itself, which is
+        # the same non-answer in a new costume.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._branch(tmp)
+            for mode in ("btw", "info-chat", "context-chat"):
+                self._job(
+                    root,
+                    f"20260823T1305000000{len(mode):02d}Z",
+                    branch="b1",
+                    mode=mode,
+                    status="running",
+                    createdAt="2026-08-23T13:05:00Z",
+                )
+            prompt = ctxgit.build_history_chat_prompt(store, "b1", "뭐 하고 있어?")
+            self.assertNotIn("<running_turn>", prompt)
+
+    def test_another_branch_is_not_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._branch(tmp)
+            store.create_branch("b2")
+            self._job(
+                root,
+                "20260823T130500000000Z",
+                branch="b2",
+                mode="chat",
+                status="running",
+                createdAt="2026-08-23T13:05:00Z",
+            )
+            prompt = ctxgit.build_history_chat_prompt(store, "b1", "뭐 하고 있어?")
+            self.assertNotIn("<running_turn>", prompt)
+
+
+class ClaudeSessionFlagTest(unittest.TestCase):
+    """The first turn opens a session id; later turns resume it."""
+
+    def _project(self, tmp: str):
+        root = Path(tmp)
+        store = ctxgit.ContextStore(root)
+        store.init(create_initial_branch=False)
+        store.create_branch("b1")
+        ctxgit.write_provider_config(root, {"provider": "claude"})
+        return root, store
+
+    def _capture(self, root, store):
+        seen: list[list[str]] = []
+        original = ctxgit.subprocess.run
+
+        def fake_run(cmd, **_kwargs):
+            if "auth" in cmd and "status" in cmd:
+                return FakeCompleted(stdout="Logged in")
+            seen.append(cmd)
+            return FakeCompleted(
+                stdout=structured_result({"assistant": "ok", "artifacts": [], "approvalRequests": []})
+            )
+
+        ctxgit.subprocess.run = fake_run
+        try:
+            ctxgit.call_claude_chat(root, store, "b1", "hello")
+        finally:
+            ctxgit.subprocess.run = original
+        return seen[0]
+
+    def test_first_turn_opens_a_session_and_the_next_resumes_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+
+            first = self._capture(root, store)
+            self.assertIn("--session-id", first)
+            self.assertNotIn("--no-session-persistence", first)
+            opened = first[first.index("--session-id") + 1]
+
+            second = self._capture(root, store)
+            self.assertIn("--resume", second)
+            self.assertEqual(second[second.index("--resume") + 1], opened)
+
+    def test_switching_model_starts_a_separate_session(self) -> None:
+        # A session belongs to the model that built it.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            first = self._capture(root, store)
+            opened = first[first.index("--session-id") + 1]
+
+            ctxgit.write_provider_config(root, {"provider": "claude", "model": "sonnet"})
+            after = self._capture(root, store)
+            self.assertIn("--session-id", after, "a new model gets its own session")
+            self.assertNotEqual(after[after.index("--session-id") + 1], opened)

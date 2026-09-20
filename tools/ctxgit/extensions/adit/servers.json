@@ -22,17 +22,23 @@
       "label": "ADIT 콘솔 (광고주·파트너·캠페인·정산)",
       "enabled": true,
       "command": "npm",
-      "args": ["run", "--silent", "mcp"],
+      "args": [
+        "run",
+        "--silent",
+        "mcp"
+      ],
       "cwd": "adit-backend",
       "env": {
         "MCP_ADMIN_TOKEN": "${ADIT_MCP_ADMIN_TOKEN}"
       },
-      "requires": ["ADIT_MCP_ADMIN_TOKEN"]
+      "requires": [
+        "ADIT_MCP_ADMIN_TOKEN"
+      ]
     },
     {
       "id": "adit-remote",
       "label": "ADIT 원격 MCP (api.adit.now) — OAuth",
-      "enabled": false,
+      "enabled": true,
       "url": "https://api.adit.now/mcp",
       "note": [
         "Cognito OAuth로 보호된 원격 MCP다 (Bearer). ctxgit은 OAuth 플로우를 구현하지",
@@ -50,28 +56,36 @@
       "label": "Adit Analytics (방문자·세션 읽기)",
       "enabled": true,
       "command": "node",
-      "args": ["mcp/server.mjs"],
+      "args": [
+        "mcp/server.mjs"
+      ],
       "cwd": "adit-analytics",
       "env": {
         "ANALYTICS_URL": "https://analytics.adit.now",
         "CF_ACCESS_CLIENT_ID": "8f60eb2eed444dfa7192e7087bc306e4.access",
         "CF_ACCESS_CLIENT_SECRET": "${ADIT_ANALYTICS_MCP_SECRET}"
       },
-      "requires": ["ADIT_ANALYTICS_MCP_SECRET"]
+      "requires": [
+        "ADIT_ANALYTICS_MCP_SECRET"
+      ]
     },
     {
       "id": "adit-ablab",
       "label": "A/B Lab (실험 스펙·구현 제출)",
       "enabled": true,
       "command": "node",
-      "args": ["mcp/server.mjs"],
+      "args": [
+        "mcp/server.mjs"
+      ],
       "cwd": "AB-Lab",
       "env": {
         "ABLAB_URL": "https://ablab.adit.now",
         "CF_ACCESS_CLIENT_ID": "a23bcee48df93afb45c6a6be41595d6a.access",
         "CF_ACCESS_CLIENT_SECRET": "${ABLAB_MCP_SECRET}"
       },
-      "requires": ["ABLAB_MCP_SECRET"]
+      "requires": [
+        "ABLAB_MCP_SECRET"
+      ]
     }
   ]
 }

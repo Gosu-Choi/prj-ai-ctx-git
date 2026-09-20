@@ -1241,6 +1241,7 @@ class CtxgitTest(unittest.TestCase):
                 calls.append({"args": args, "kwargs": kwargs})
                 cwd = Path(kwargs["cwd"])
                 (cwd / f"agent-{len(calls)}.md").write_text(f"# Agent {len(calls)}\n", encoding="utf-8")
+                (cwd / f"agent-{len(calls)}.pdf").write_bytes(f"%PDF-1.4 agent {len(calls)}".encode())
                 return {"assistant": f"Agent {len(calls)} wrote in workspace."}
 
             ctxgit.call_provider_prompt = fake_call
@@ -1261,10 +1262,18 @@ class CtxgitTest(unittest.TestCase):
             self.assertFalse((root / "contexts" / "branches" / "writer" / "agent-1.md").exists())
             self.assertIn("Never create, edit, move, or delete files in the source branch directory.", calls[0]["args"][2])
             self.assertIn("contexts/branches/room/workspace", calls[0]["args"][2])
+            artifacts = result["history"][1]["artifacts"]
             self.assertIn(
-                {"kind": "created-md", "title": "agent-1.md", "path": "contexts/branches/room/workspace/agent-1.md"},
-                result["history"][1]["artifacts"],
+                {
+                    "kind": "created-pdf",
+                    "title": "agent-1.pdf",
+                    "path": "contexts/branches/room/workspace/agent-1.pdf",
+                },
+                artifacts,
             )
+            # The markdown it also wrote is not named: that is the churn the list
+            # used to drown in.
+            self.assertEqual([item for item in artifacts if item["path"].endswith(".md")], [])
 
     def test_sequence_evaluation_defaults_to_continue_when_invalid_or_changes_remain(self) -> None:
         criteria = list(ctxgit.DEFAULT_SEQUENCE_ACCEPTANCE_CRITERIA)
@@ -2520,7 +2529,9 @@ class CtxgitTest(unittest.TestCase):
                 ["one", "two"], "room", "Room", ["", ""],
                 ["info-chat", "info-chat"], 4,
             )
-            for index in range(20):
+            # Enough material to sit above the retained tail, or compaction will
+            # correctly decline and this test has nothing to snapshot.
+            for index in range(40):
                 store.append_history("one", "assistant", f"UPDATED-ONE-{index}-" + ("u" * 3000))
 
             original = ctxgit.call_provider_history_compaction
@@ -2754,6 +2765,165 @@ class CtxgitTest(unittest.TestCase):
             self.assertNotIn("<guiding_knowledge>", other_chat)
             self.assertEqual(store.branch_guiding_ids("AItrust"), [document["id"]])
 
+    def test_guiding_is_restated_after_the_user_message(self) -> None:
+        """The block near the top is tens of thousands of characters from the answer.
+
+        What the model reads last has to point back at it, or the branch's own
+        earlier prose in <history> is the most recent style instruction in the
+        prompt.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.init()
+            store.create_branch("AItrust")
+            store.create_branch("AIdiscipline")
+            document = store.create_knowledge_document("House Style")
+            store.append_knowledge_entry(document["id"], "## Rule\n\nGUIDING_KNOWLEDGE_FACT")
+            store.set_branch_guiding("AItrust", [document["id"]])
+
+            for prompt in (
+                ctxgit.build_chat_prompt(store, "AItrust", "Continue."),
+                ctxgit.build_history_chat_prompt(store, "AItrust", "Continue."),
+            ):
+                self.assertLess(
+                    prompt.index("</user_message>"),
+                    prompt.index("Before answering, check your draft"),
+                )
+                # The reminder is a pointer, not a second copy of the documents.
+                self.assertEqual(prompt.count("GUIDING_KNOWLEDGE_FACT"), 1)
+
+            # A branch with nothing switched on gets no reminder either.
+            self.assertNotIn(
+                "Before answering, check your draft",
+                ctxgit.build_chat_prompt(store, "AIdiscipline", "Continue."),
+            )
+
+    def test_every_prose_prompt_states_the_reading_conditions_last(self) -> None:
+        """Shown a chat timeline, a model casts itself as the other party in a live
+        conversation and writes for someone who is present to answer back. The
+        conditions the answer is actually read under have to be stated after the
+        user message, where they are the last thing read, and they do not depend on
+        guiding being switched on.
+
+        The assertions stay at that level on purpose. Pinning the behaviors we want
+        out of these conditions would put a list of expressions into the program,
+        which is the thing this replaced."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.init()
+            store.create_branch("AItrust")
+
+            for prompt in (
+                ctxgit.build_chat_prompt(store, "AItrust", "Continue."),
+                ctxgit.build_history_chat_prompt(store, "AItrust", "Continue."),
+                ctxgit.build_context_chat_prompt(store, "무슨 브랜치가 있지?"),
+            ):
+                self.assertIn("committed to this branch and read later", prompt)
+                self.assertIn("no further turn is available", prompt)
+                self.assertLess(
+                    prompt.index("</user_message>"),
+                    prompt.index("committed to this branch and read later"),
+                )
+                # The old framing is what invited the conversational turn.
+                self.assertNotIn("answer to show in the chat timeline", prompt)
+
+    def test_guiding_reaches_the_provider_system_prompt(self) -> None:
+        """Inside the prompt body guiding is one section of a very long user
+        message. Providers that take a system prompt get it there too."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.init()
+            store.create_branch("AItrust")
+            document = store.create_knowledge_document("House Style")
+            store.append_knowledge_entry(document["id"], "## Rule\n\nGUIDING_KNOWLEDGE_FACT")
+            store.set_branch_guiding("AItrust", [document["id"]])
+
+            captured: dict[str, str] = {}
+            original = ctxgit.call_claude_prompt
+            try:
+                def fake_call_claude_prompt(_root, prompt, **kwargs):
+                    captured["prompt"] = prompt
+                    captured["system_extra"] = kwargs.get("system_extra", "")
+                    return {"assistant": "ok"}
+
+                ctxgit.call_claude_prompt = fake_call_claude_prompt
+                ctxgit.call_claude_history_chat(root, store, "AItrust", "Continue.")
+            finally:
+                ctxgit.call_claude_prompt = original
+
+            self.assertIn("GUIDING_KNOWLEDGE_FACT", captured["system_extra"])
+            self.assertIn("GUIDING_KNOWLEDGE_FACT", captured["prompt"])
+
+    def test_guiding_system_directive_is_empty_without_guiding(self) -> None:
+        self.assertEqual(ctxgit.guiding_system_directive("(none)"), "")
+        self.assertEqual(ctxgit.guiding_system_directive(""), "")
+        self.assertEqual(ctxgit.guiding_enforcement_parts("(none)"), [])
+
+    def test_history_compaction_prompt_carries_guiding(self) -> None:
+        """A compaction outlives the turn that wrote it and is re-injected into
+        every later prompt, so one written without guiding contradicts it forever."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.init()
+            config = ctxgit.load_json(root / ".ctxgit" / "config.json")
+            config["llm"]["provider"] = "claude"
+            ctxgit.dump_json(root / ".ctxgit" / "config.json", config)
+            store.create_branch("AItrust")
+            document = store.create_knowledge_document("House Style")
+            store.append_knowledge_entry(document["id"], "## Rule\n\nGUIDING_KNOWLEDGE_FACT")
+            store.set_branch_guiding("AItrust", [document["id"]])
+            records = [{"createdAt": "2026-06-22T00:00:00Z", "role": "user", "text": "hello"}]
+
+            captured: dict[str, str] = {}
+            original = ctxgit.call_claude_prompt
+            try:
+                def fake_call_claude_prompt(_root, prompt, **kwargs):
+                    captured["prompt"] = prompt
+                    captured["system_extra"] = kwargs.get("system_extra", "")
+                    return {"assistant": "summary"}
+
+                ctxgit.call_claude_prompt = fake_call_claude_prompt
+                ctxgit.call_provider_history_compaction(root, store, "AItrust", records)
+            finally:
+                ctxgit.call_claude_prompt = original
+
+            self.assertIn("GUIDING_KNOWLEDGE_FACT", captured["prompt"])
+            self.assertIn("GUIDING_KNOWLEDGE_FACT", captured["system_extra"])
+
+    def test_untouched_report_sections_are_dropped_from_prompts(self) -> None:
+        """A fresh report is ~1,200 characters of placeholders. Injecting them
+        teaches the model nothing and pushes real instructions further away."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.init()
+            store.create_branch("AItrust")
+
+            untouched = ctxgit.branch_report_for_prompt(store, "AItrust")
+            self.assertNotIn("One-paragraph summary of what this branch currently knows.", untouched)
+            self.assertNotIn("State the central question this branch is trying to answer.", untouched)
+            # Empty is still reported as empty rather than silently hidden.
+            self.assertIn("Still at the template default", untouched)
+            self.assertIn("Executive Summary", untouched)
+            # Real per-branch values survive.
+            self.assertIn("Report Metadata", untouched)
+            self.assertLess(len(untouched), len(store.context_excerpt("AItrust")))
+
+            paths = store.branch_paths("AItrust")
+            filled = ctxgit.read_text(paths.context).replace(
+                "- One-paragraph summary of what this branch currently knows.",
+                "- FILLED_IN_SUMMARY_SENTINEL",
+            )
+            ctxgit.write_text(paths.context, filled)
+            after = ctxgit.branch_report_for_prompt(store, "AItrust")
+            self.assertIn("FILLED_IN_SUMMARY_SENTINEL", after)
+            self.assertIn("## Executive Summary", after)
+            self.assertNotIn("Executive Summary,", after.split("Still at the template default")[-1])
+
     def test_guiding_selection_survives_and_drops_deleted_documents(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2892,28 +3062,36 @@ class CtxgitTest(unittest.TestCase):
             self.assertEqual(payload["history"][-2]["resources"], [rel])
             self.assertIn(rel, ctxgit.format_history_record(payload["history"][-2]))
 
-    def test_chat_turn_links_created_and_modified_markdown_files(self) -> None:
+    def test_chat_turn_links_rebuilt_pdfs_and_ignores_markdown_churn(self) -> None:
+        """A turn names the PDFs it rebuilt, not the markdown it touched.
+
+        Markdown moves on nearly every turn — branch context, notes, ledgers, the
+        index — so listing it buried the answer under paths that told the reader
+        nothing. A rebuilt PDF is rare and deliberate.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             store = ctxgit.ContextStore(root)
             store.create_branch("AItrust")
-            existing = root / "notes.md"
-            existing.write_text("before\n", encoding="utf-8")
+            existing = root / "deck.pdf"
+            existing.write_bytes(b"%PDF-1.4 before")
             original = ctxgit.call_codex_chat
             try:
                 def fake_chat(*_args, **_kwargs):
-                    existing.write_text("after\n", encoding="utf-8")
-                    (root / "draft.md").write_text("# Draft\n", encoding="utf-8")
-                    return {"assistant": "Updated markdown files.", "artifacts": [], "approvalRequests": []}
+                    existing.write_bytes(b"%PDF-1.4 after, and longer")
+                    (root / "report.pdf").write_bytes(b"%PDF-1.4 fresh")
+                    (root / "notes.md").write_text("churn\n", encoding="utf-8")
+                    return {"assistant": "Rebuilt the deck.", "artifacts": [], "approvalRequests": []}
 
                 ctxgit.call_codex_chat = fake_chat
-                payload = ctxgit.run_chat_turn(root, store, "AItrust", "Write markdown.")
+                payload = ctxgit.run_chat_turn(root, store, "AItrust", "Rebuild it.")
             finally:
                 ctxgit.call_codex_chat = original
 
             artifacts = payload["history"][-1]["artifacts"]
-            self.assertIn({"kind": "created-md", "title": "draft.md", "path": "draft.md"}, artifacts)
-            self.assertIn({"kind": "modified-md", "title": "notes.md", "path": "notes.md"}, artifacts)
+            self.assertIn({"kind": "created-pdf", "title": "report.pdf", "path": "report.pdf"}, artifacts)
+            self.assertIn({"kind": "modified-pdf", "title": "deck.pdf", "path": "deck.pdf"}, artifacts)
+            self.assertEqual([item for item in artifacts if item["path"].endswith(".md")], [])
 
     def test_history_chat_turn_records_assistant_without_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3530,6 +3708,42 @@ class CtxgitTest(unittest.TestCase):
                 ctxgit.provider_status = original
             self.assertEqual(ctxgit.read_llm_config(root)["codex"]["model"], "gpt-5.6-terra")
 
+    def test_claude_offers_fable_and_the_1m_context_variants(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.create_branch("AItrust")
+            offered = [item["id"] for item in ctxgit.LLM_PROVIDER_MODELS["claude"]]
+            self.assertEqual(offered[0], "fable")
+            self.assertIn("opus[1m]", offered)
+
+            original = ctxgit.provider_status
+            ctxgit.provider_status = lambda _root: {"ok": True, "provider": "claude"}
+            try:
+                for model in offered:
+                    ctxgit.write_provider_config(root, {"provider": "claude", "model": model})
+                    self.assertEqual(ctxgit.read_llm_config(root)["claude"]["model"], model)
+                with self.assertRaises(ValueError):
+                    ctxgit.write_provider_config(root, {"provider": "claude", "model": "opus-9"})
+            finally:
+                ctxgit.provider_status = original
+
+    def test_claude_stage_model_reads_a_role_tier_relative_to_the_selection(self) -> None:
+        # Frontier roles follow the project's choice; cheaper roles stay cheap
+        # unless the choice itself is cheaper than the role asked for.
+        self.assertEqual(ctxgit.claude_stage_model("opus", "fable"), "fable")
+        self.assertEqual(ctxgit.claude_stage_model("opus", "opus[1m]"), "opus[1m]")
+        self.assertEqual(ctxgit.claude_stage_model("opus", "opus"), "opus")
+        self.assertEqual(ctxgit.claude_stage_model("sonnet", "fable"), "sonnet")
+        self.assertEqual(ctxgit.claude_stage_model("haiku", "opus"), "haiku")
+        self.assertEqual(ctxgit.claude_stage_model("sonnet", "haiku"), "haiku")
+        # No role tier: the project's model. No selection: the role's tier.
+        self.assertEqual(ctxgit.claude_stage_model("", "fable[1m]"), "fable[1m]")
+        self.assertEqual(ctxgit.claude_stage_model("sonnet", ""), "sonnet")
+        # A pinned model id on either side is deliberate, so it is left alone.
+        self.assertEqual(ctxgit.claude_stage_model("claude-opus-4-5", "fable"), "claude-opus-4-5")
+        self.assertEqual(ctxgit.claude_model_tier("Fable[1M]"), "fable")
+
     def test_llm_config_defaults_web_search_on(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3725,3 +3939,1599 @@ class CtxgitTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CodexThreadLifetimeTest(unittest.TestCase):
+    """One Codex thread per turn, not one per branch.
+
+    ctxgit rebuilds the whole context every turn — project instructions, guiding
+    knowledge, branch report, budgeted history. A resumed thread already holds all
+    of that from every previous turn, so resuming and re-sending stacks the branch
+    history N deep by turn N and leaves N copies of the guiding block with the
+    newest buried among superseded ones. Claude avoids this with
+    `--no-session-persistence`; Codex asks for an ephemeral thread.
+    """
+
+    def test_a_resumed_turn_sends_only_what_is_new(self) -> None:
+        """Resuming is safe only because the turn stops re-sending the context.
+
+        The first attempt resumed the thread *and* re-sent the whole rebuilt prompt,
+        so by turn N the branch history was nested N deep and the current guiding
+        block sat among N-1 superseded copies.
+        """
+        source = Path(ctxgit.__file__).read_text(encoding="utf-8")
+        self.assertIn("thread/resume", source)
+        self.assertIn("def build_continuation_prompt(", source)
+
+    def test_a_turn_without_a_progress_channel_takes_codex_exec(self) -> None:
+        # Nothing to stream to and nobody to interject, so the app-server
+        # handshake buys nothing.
+        self.assertIsNone(ctxgit.codex_steerable_progress(None))
+
+        def progress(_message: str) -> None:
+            return None
+
+        self.assertIs(ctxgit.codex_steerable_progress(progress), progress)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class TrackedOutputTest(unittest.TestCase):
+    """What a turn changed, and how much of it is worth reading.
+
+    Markdown was the only tracked format, so a turn that rebuilt a PDF said
+    nothing about it. PDFs are signed by size and mtime rather than hashed: a
+    project can hold hundreds of megabytes of them and a turn snapshots twice.
+    """
+
+    def test_only_pdfs_are_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "deck.pdf").write_bytes(b"%PDF-1.4 first")
+            before = ctxgit.tracked_file_snapshot(root)
+
+            (root / "deck.pdf").write_bytes(b"%PDF-1.4 second and longer")
+            (root / "report.pdf").write_bytes(b"%PDF-1.4 brand new")
+            # Markdown churns on every turn — context, notes, ledgers, the index —
+            # and naming all of it buried the answer.
+            (root / "note.md").write_text("new", encoding="utf-8")
+            (root / "context.md").write_text("changed", encoding="utf-8")
+            refs = ctxgit.changed_tracked_file_refs(root, before, ctxgit.tracked_file_snapshot(root))
+
+            by_path = {ref["path"]: ref["kind"] for ref in refs}
+            self.assertEqual(by_path.get("deck.pdf"), "modified-pdf")
+            self.assertEqual(by_path.get("report.pdf"), "created-pdf")
+            self.assertNotIn("note.md", by_path)
+            self.assertNotIn("context.md", by_path)
+
+    def test_an_untouched_pdf_is_not_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "keep.pdf").write_bytes(b"%PDF-1.4 stable")
+            before = ctxgit.tracked_file_snapshot(root)
+            self.assertEqual(
+                ctxgit.changed_tracked_file_refs(root, before, ctxgit.tracked_file_snapshot(root)), []
+            )
+
+
+class HistoryIndexMappingTest(unittest.TestCase):
+    """The index the UI holds and the row in the file stopped being the same thing.
+
+    BTW asides are written to history.jsonl but not shown, so a delete aimed at the
+    last visible message pointed a few rows short. The createdAt guard caught it and
+    said "record changed before delete; refresh and try again" — which reads like a
+    race, so refreshing never helped and the message could not be removed.
+    """
+
+    def _branch(self, tmp: str):
+        root = Path(tmp)
+        store = ctxgit.ContextStore(root)
+        store.init(create_initial_branch=False)
+        store.create_branch("b1")
+        return root, store
+
+    def test_a_visible_index_maps_past_the_hidden_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._branch(tmp)
+            store.append_history("b1", "user", "FIRST")
+            store.append_history("b1", "user", "ASIDE_A", extra={"aside": True})
+            store.append_history("b1", "user", "ASIDE_B", extra={"aside": True})
+            store.append_history("b1", "user", "SECOND")
+
+            visible = [record["text"] for record in ctxgit.branch_payload(store, "b1")["history"]]
+            self.assertEqual(visible, ["FIRST", "SECOND"])
+            # "SECOND" is index 1 on screen and index 3 in the file.
+            self.assertEqual(ctxgit.raw_history_index(store, "b1", 1), 3)
+            self.assertEqual(ctxgit.raw_history_index(store, "b1", 0), 0)
+
+    def test_deleting_the_last_visible_message_removes_that_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._branch(tmp)
+            store.append_history("b1", "user", "KEEP")
+            store.append_history("b1", "user", "ASIDE", extra={"aside": True})
+            store.append_history("b1", "user", "REMOVE_ME")
+
+            shown = ctxgit.branch_payload(store, "b1")["history"]
+            target = len(shown) - 1
+            removed = store.delete_history_record(
+                "b1",
+                ctxgit.raw_history_index(store, "b1", target),
+                expected_created_at=shown[target]["createdAt"],
+                expected_role="user",
+            )
+            self.assertEqual(removed["text"], "REMOVE_ME")
+            remaining = [record["text"] for record in store.iter_history("b1")]
+            self.assertEqual(remaining, ["KEEP", "ASIDE"])
+
+    def test_a_branch_with_no_asides_is_unaffected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._branch(tmp)
+            for text in ("a", "b", "c"):
+                store.append_history("b1", "user", text)
+            for index in range(3):
+                self.assertEqual(ctxgit.raw_history_index(store, "b1", index), index)
+
+
+class CompactionHysteresisTest(unittest.TestCase):
+    """Compaction has to leave a gap behind it.
+
+    The trigger measured everything uncompacted, but a compaction only folds what
+    sits above the tail it keeps. With the threshold and the tail budget both at
+    40k, a branch that compacted once came back holding a 40k tail — already at the
+    threshold — so the next single message crossed it again. From then on every
+    turn paid for an extra model call that folded one or two records, which is what
+    tripled info-chat turn times on the busy branches.
+    """
+
+    def _busy_branch(self, store, branch: str, records: int, size: int) -> None:
+        store.create_branch(branch)
+        for index in range(records):
+            store.append_history(branch, "user" if index % 2 == 0 else "assistant", "x" * size)
+
+    def test_a_branch_sitting_on_a_full_tail_does_not_recompact_every_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.init(create_initial_branch=False)
+            # ~52k of history: over the 40k trigger, but only ~17k of it sits above
+            # the 40k tail — not enough to be worth folding.
+            self._busy_branch(store, "b1", records=13, size=4000)
+            self.assertGreater(
+                ctxgit.history_records_char_count(list(store.iter_history("b1"))),
+                ctxgit.DEFAULT_COMPACTION_THRESHOLD,
+            )
+            self.assertIsNone(store.maybe_compact_history("b1", use_ai=False))
+
+    def test_enough_material_above_the_tail_still_compacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.init(create_initial_branch=False)
+            self._busy_branch(store, "b1", records=40, size=4000)
+            self.assertIsNotNone(store.maybe_compact_history("b1", use_ai=False))
+
+    def test_compacting_twice_needs_a_second_run_up(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.init(create_initial_branch=False)
+            self._busy_branch(store, "b1", records=40, size=4000)
+            self.assertIsNotNone(store.maybe_compact_history("b1", use_ai=False))
+            # One more message is not a reason to fold again.
+            store.append_history("b1", "user", "x" * 4000)
+            self.assertIsNone(store.maybe_compact_history("b1", use_ai=False))
+
+
+class BranchProviderOverrideTest(unittest.TestCase):
+    """One branch can sit on a different model without moving the project.
+
+    Provider settings were project-wide, so trying a heavier model on one branch
+    switched every branch onto it — and switching back was the only way out.
+    """
+
+    def _project(self, tmp: str):
+        root = Path(tmp)
+        store = ctxgit.ContextStore(root)
+        store.init(create_initial_branch=False)
+        store.create_branch("plain")
+        store.create_branch("heavy")
+        return root, store
+
+    def test_an_override_moves_only_its_own_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            store.set_branch_llm("heavy", {"provider": "claude", "model": "fable"})
+
+            self.assertEqual(ctxgit.read_llm_config(root, "heavy")["provider"], "claude")
+            self.assertEqual(ctxgit.read_llm_config(root, "heavy")["claude"]["model"], "fable")
+            # The project and every other branch are untouched.
+            self.assertEqual(ctxgit.read_llm_config(root)["claude"]["model"], "opus")
+            self.assertEqual(ctxgit.read_llm_config(root, "plain")["claude"]["model"], "opus")
+
+    def test_clearing_an_override_follows_the_project_again(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            store.set_branch_llm("heavy", {"provider": "claude", "model": "fable"})
+            store.set_branch_llm("heavy", {"provider": None, "model": None})
+
+            self.assertEqual(store.set_branch_llm("heavy", {}), {})
+            self.assertEqual(
+                ctxgit.read_llm_config(root, "heavy")["claude"]["model"],
+                ctxgit.read_llm_config(root)["claude"]["model"],
+            )
+            # Following, not frozen: a later project change reaches the branch.
+            ctxgit.provider_status = lambda _root: {"ok": True, "provider": "claude"}
+            ctxgit.write_provider_config(root, {"provider": "claude", "model": "sonnet"})
+            self.assertEqual(ctxgit.read_llm_config(root, "heavy")["claude"]["model"], "sonnet")
+
+    def test_a_model_is_checked_against_the_provider_offering_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            with self.assertRaises(ValueError):
+                store.set_branch_llm("heavy", {"provider": "claude", "model": "gpt-5.6-sol"})
+            with self.assertRaises(ValueError):
+                store.set_branch_llm("heavy", {"provider": "nope"})
+
+    def test_settings_land_on_the_provider_that_will_answer(self) -> None:
+        # A timeout pinned for a Claude branch must not reach the project's Codex.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            store.set_branch_llm("heavy", {"provider": "claude", "timeoutSeconds": 120})
+            resolved = ctxgit.read_llm_config(root, "heavy")
+            self.assertEqual(resolved["claude"]["timeoutSeconds"], 120)
+            self.assertNotEqual(resolved["codex"]["timeoutSeconds"], 120)
+
+
+class BranchProviderAuthorityTest(unittest.TestCase):
+    """A pinned branch decides, even when the request names a provider.
+
+    The UI sends a provider with every turn because it needs one for worker
+    routing, and the server read the branch pin only when nobody had said anything
+    — which is almost never. So a branch pinned to Claude was answered by Codex.
+    """
+
+    def _project(self, tmp: str):
+        root = Path(tmp)
+        store = ctxgit.ContextStore(root)
+        store.init(create_initial_branch=False)
+        store.create_branch("pinned")
+        store.create_branch("loose")
+        store.set_branch_llm("pinned", {"provider": "claude", "model": "opus[1m]"})
+        return root, store
+
+    def test_the_pin_beats_the_requested_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = self._project(tmp)
+            self.assertEqual(
+                ctxgit.branch_provider_authority(root, "pinned", "codex"), "claude"
+            )
+            # Worker routing is Codex-only, so it drops out with the provider.
+            self.assertEqual(
+                ctxgit.branch_provider_authority(root, "pinned", "codex-worker"), "claude"
+            )
+
+    def test_an_unpinned_branch_still_honours_the_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = self._project(tmp)
+            self.assertEqual(
+                ctxgit.branch_provider_authority(root, "loose", "codex-worker"), "codex-worker"
+            )
+            self.assertIsNone(ctxgit.branch_provider_authority(root, "loose", None))
+
+    def test_the_pinned_model_travels_with_the_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = self._project(tmp)
+            resolved = ctxgit.read_llm_config(root, "pinned")
+            self.assertEqual(resolved["provider"], "claude")
+            self.assertEqual(resolved["claude"]["model"], "opus[1m]")
+
+
+class RequestHandlerScopeTest(unittest.TestCase):
+    """Handlers that consult a branch pin must actually have a branch.
+
+    `branch_provider_authority` was added to every endpoint that reads a provider
+    off the request body, including two that have no branch: the contexts chat is
+    project-wide and a merge spans several branches. Both raised NameError, the
+    handler thread died mid-response, and the browser reported "Failed to fetch" —
+    a network error for what was a missing local variable.
+    """
+
+    def test_every_branch_pin_lookup_has_a_branch_in_scope(self) -> None:
+        lines = Path(ctxgit.__file__).read_text(encoding="utf-8").split("\n")
+        call = "branch_provider_authority(root, branch_id, provider)"
+        sites = [index for index, line in enumerate(lines) if call in line]
+        self.assertTrue(sites, "the pin lookup vanished; this guard is now pointless")
+        for index in sites:
+            window = lines[max(0, index - 14) : index]
+            self.assertTrue(
+                any("branch_id = " in line for line in window),
+                f"{call} at line {index + 1} has no branch_id assigned above it",
+            )
+
+
+class AddBranchBesideTest(unittest.TestCase):
+    """"Add one here" makes an empty sibling — it copies nothing.
+
+    Branches fork off `initial` into folders like Sales. Starting the next Sales
+    branch by forking anything — the branch or its parent — brought a conversation
+    and a directory of artifacts, resources and workspace files with it. This
+    creates a blank branch instead: parent set to the pointed-at branch's parent so
+    it sits beside it, filed in the folder the user was standing in.
+    """
+
+    def _project(self, tmp: str):
+        root = Path(tmp)
+        store = ctxgit.ContextStore(root)
+        store.init(create_initial_branch=False)
+        store.create_branch("initial", title="Initial")
+        store.append_history("initial", "user", "SHARED_BASE")
+        store.create_branch("sales_a", title="Sales A", parent="initial")
+        store.set_branch_folder("sales_a", "Sales")
+        store.append_history("sales_a", "user", "ONLY_A")
+        (store.branch_paths("sales_a").root / "artifacts").mkdir(exist_ok=True)
+        (store.branch_paths("sales_a").root / "artifacts" / "note.md").write_text("x", encoding="utf-8")
+        return root, store
+
+    def _add_beside(self, store, beside: str, target: str) -> str:
+        """What the endpoint does, kept in one place so the test pins the behaviour."""
+        beside_meta = ctxgit.load_json(store.branch_paths_for_read(beside).meta)
+        folder = str(beside_meta.get("folder") or "")
+        parent = str(beside_meta.get("parent") or beside_meta.get("forkedFrom") or "").strip()
+        store.create_branch(target, title=target, parent=parent or None)
+        store.set_branch_folder(target, folder)
+        return parent
+
+    def test_the_new_branch_is_empty_and_carries_no_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            self._add_beside(store, "sales_a", "sales_b")
+
+            self.assertEqual(list(store.iter_history("sales_b")), [])
+            artifacts = store.branch_paths("sales_b").root / "artifacts"
+            self.assertFalse(
+                artifacts.exists() and any(artifacts.iterdir()),
+                "a fresh branch must not inherit the sibling's artifacts",
+            )
+
+    def test_it_sits_beside_the_branch_rather_than_under_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            parent = self._add_beside(store, "sales_a", "sales_b")
+
+            self.assertEqual(parent, "initial")
+            meta = ctxgit.load_json(store.branch_paths("sales_b").meta)
+            self.assertEqual(meta.get("parent"), "initial")
+            self.assertEqual(meta.get("folder"), "Sales")
+            # Nothing about it should look forked.
+            self.assertNotIn("forkedFrom", meta)
+            self.assertNotIn("forkedAtIndex", meta)
+
+    def test_a_branch_with_no_parent_gives_a_parentless_sibling(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            parent = self._add_beside(store, "initial", "fresh")
+            self.assertEqual(parent, "")
+            self.assertEqual(list(store.iter_history("fresh")), [])
+
+    def test_the_branch_pointed_at_is_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            self._add_beside(store, "sales_a", "sales_b")
+            self.assertEqual(
+                [record["text"] for record in store.iter_history("sales_a")], ["ONLY_A"]
+            )
+            self.assertEqual(
+                ctxgit.load_json(store.branch_paths("sales_a").meta).get("folder"), "Sales"
+            )
+
+
+class SequenceSeatProviderTest(unittest.TestCase):
+    """Each seat in a room can run on its own provider and model.
+
+    A room used to resolve one provider and run every reply on it, so a writer and
+    the evaluator grading it were the same model — one model marking its own work.
+    """
+
+    def _room(self, tmp: str):
+        root = Path(tmp)
+        store = ctxgit.ContextStore(root)
+        store.init(create_initial_branch=False)
+        store.create_branch("writer")
+        store.create_branch("critic")
+        store.create_sequence_room(
+            ["writer", "critic"], "room", "Room", ["Write.", "Critique."],
+            ["info-chat", "info-chat"], 4,
+        )
+        store.update_sequence_speaking_order("room", [1, 2], evaluator_order=None, update_evaluator=True)
+        return root, store
+
+    def _run(self, root, store):
+        calls: list[dict] = []
+        original = ctxgit.call_provider_prompt
+
+        def fake(provider, _root, _prompt, **kwargs):
+            calls.append({"provider": provider, "model": kwargs.get("model_override", "")})
+            return {"assistant": f"reply {len(calls)}"}
+
+        ctxgit.call_provider_prompt = fake
+        try:
+            ctxgit.run_sequence_room_turn(root, store, "room", "go", run_mode="info-chat")
+        finally:
+            ctxgit.call_provider_prompt = original
+        return calls
+
+    def test_seats_run_on_what_they_were_given(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._room(tmp)
+            store.update_sequence_participant("room", 1, llm={"provider": "claude", "model": "fable"})
+            store.update_sequence_participant("room", 2, llm={"provider": "codex", "model": "gpt-5.6-luna"})
+            calls = self._run(root, store)
+            self.assertEqual(calls[0], {"provider": "claude", "model": "fable"})
+            self.assertEqual(calls[1], {"provider": "codex", "model": "gpt-5.6-luna"})
+
+    def test_a_seat_that_says_nothing_follows_the_room(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._room(tmp)
+            store.update_sequence_participant("room", 1, llm={"provider": "claude", "model": "fable"})
+            calls = self._run(root, store)
+            self.assertEqual(calls[0]["provider"], "claude")
+            # Seat 2 was never pinned, so it runs on the room's provider.
+            self.assertEqual(calls[1]["provider"], "codex")
+            self.assertEqual(calls[1]["model"], "")
+
+    def test_clearing_a_seat_hands_it_back_to_the_room(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._room(tmp)
+            store.update_sequence_participant("room", 1, llm={"provider": "claude", "model": "fable"})
+            participant = store.update_sequence_participant("room", 1, llm={"provider": None, "model": None})
+            self.assertNotIn("llm", participant)
+
+    def test_a_model_is_checked_against_its_own_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._room(tmp)
+            with self.assertRaises(ValueError):
+                store.update_sequence_participant("room", 1, llm={"provider": "claude", "model": "gpt-5.6-sol"})
+
+
+class CodexModelListTest(unittest.TestCase):
+    """The Codex list has to name models the installed CLI actually accepts.
+
+    A model offered in the picker but unknown to the CLI is worse than absent: it
+    looks selectable and then every turn on it fails.
+    """
+
+    def test_astra_is_offered_and_accepted(self) -> None:
+        offered = [item["id"] for item in ctxgit.LLM_PROVIDER_MODELS["codex"]]
+        self.assertEqual(offered[0], "gpt-6-astra", "the frontier model leads the list")
+        self.assertIn("gpt-5.6-sol", offered)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.init(create_initial_branch=False)
+            original = ctxgit.provider_status
+            ctxgit.provider_status = lambda _root: {"ok": True, "provider": "codex"}
+            try:
+                for model in offered:
+                    ctxgit.write_provider_config(root, {"provider": "codex", "model": model})
+                    self.assertEqual(ctxgit.read_llm_config(root)["codex"]["model"], model)
+                with self.assertRaises(ValueError):
+                    ctxgit.write_provider_config(root, {"provider": "codex", "model": "gpt-6-nope"})
+            finally:
+                ctxgit.provider_status = original
+
+    def test_the_claude_tier_map_still_points_at_models_we_offer(self) -> None:
+        offered = {item["id"] for item in ctxgit.LLM_PROVIDER_MODELS["codex"]}
+        for tier, codex_model in ctxgit.CLAUDE_TO_CODEX_TIER.items():
+            self.assertIn(codex_model, offered, f"tier {tier} maps to a model not offered")
+
+
+class SessionContinuityTest(unittest.TestCase):
+    """Branch turns resume the branch's own session, and send only what is new.
+
+    Continuity was removed once already because it was paired with re-sending the
+    rebuilt context every turn: the branch history stacked one copy deeper per turn
+    and the current guiding block ended up buried among superseded ones. The thing
+    that makes it safe is the continuation prompt, so these tests pin both halves.
+    """
+
+    def _project(self, tmp: str):
+        root = Path(tmp)
+        store = ctxgit.ContextStore(root)
+        store.init(create_initial_branch=False)
+        store.create_branch("b1")
+        store.append_history("b1", "user", "EARLIER_TURN")
+        store.append_history("b1", "assistant", "EARLIER_ANSWER")
+        return root, store
+
+    def test_a_continuation_omits_what_the_session_already_holds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            full = ctxgit.build_chat_prompt(store, "b1", "next question")
+            cont = ctxgit.build_continuation_prompt(store, "b1", "next question")
+
+            self.assertIn("EARLIER_TURN", full)
+            self.assertNotIn("EARLIER_TURN", cont, "the session already has this")
+            self.assertNotIn("<branch_report>", cont)
+            self.assertIn("next question", cont)
+            self.assertLess(len(cont), len(full) // 2)
+
+    def test_guiding_is_restated_on_every_continuation(self) -> None:
+        # The one thing that must beat everything earlier in the session.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            document = store.create_knowledge_document("House Style")
+            store.append_knowledge_entry(document["id"], "## Rule\n\nGUIDING_FACT")
+            store.set_branch_guiding("b1", [document["id"]])
+            cont = ctxgit.build_continuation_prompt(
+                store, "b1", "next", guiding_context=ctxgit.chat_guiding_context(store, "b1")
+            )
+            self.assertIn("Before answering, check your draft", cont)
+
+    def test_a_session_is_keyed_so_a_changed_setup_starts_a_new_one(self) -> None:
+        base = ctxgit.session_key("b1", "chat", "claude", "opus", "guiding text")
+        self.assertEqual(base, ctxgit.session_key("b1", "chat", "claude", "opus", "guiding text"))
+        # A different model, provider, mode, branch, or guiding is a different session.
+        self.assertNotEqual(base, ctxgit.session_key("b1", "chat", "claude", "fable", "guiding text"))
+        self.assertNotEqual(base, ctxgit.session_key("b1", "chat", "codex", "opus", "guiding text"))
+        self.assertNotEqual(base, ctxgit.session_key("b1", "info-chat", "claude", "opus", "guiding text"))
+        self.assertNotEqual(base, ctxgit.session_key("b2", "chat", "claude", "opus", "guiding text"))
+        self.assertNotEqual(base, ctxgit.session_key("b1", "chat", "claude", "opus", "REPLACED rules"))
+
+    def test_the_store_survives_having_no_file_yet(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = self._project(tmp)
+            self.assertEqual(ctxgit.remembered_session(root, "anything"), "")
+            ctxgit.remember_session(root, "k", "sess-1")
+            self.assertEqual(ctxgit.remembered_session(root, "k"), "sess-1")
+            ctxgit.forget_session(root, "k")
+            self.assertEqual(ctxgit.remembered_session(root, "k"), "")
+
+    def test_continuity_can_be_switched_off(self) -> None:
+        self.assertTrue(ctxgit.session_continuity_enabled({}))
+        self.assertFalse(ctxgit.session_continuity_enabled({"sessionContinuity": False}))
+
+
+class CodexOutputDepthTest(unittest.TestCase):
+    """Codex answers short because its models ship that way, not because we asked.
+
+    Every Codex model defaults to `verbosity: "low"`, and the frontier ones
+    (`gpt-5.6-sol`, `gpt-6-astra`) to `reasoning: "low"` as well — the shortest and
+    shallowest combination available. ctxgit set neither, so the same prompt that
+    made Claude write a page made Codex answer in three lines.
+    """
+
+    def test_depth_is_named_rather_than_left_to_the_model_default(self) -> None:
+        cmd: list[str] = []
+        ctxgit.apply_codex_output_depth(cmd, {})
+        joined = " ".join(cmd)
+        self.assertIn('model_verbosity="medium"', joined)
+        self.assertIn('model_reasoning_effort="xhigh"', joined)
+
+    def test_a_project_can_set_its_own_depth(self) -> None:
+        cmd: list[str] = []
+        ctxgit.apply_codex_output_depth(cmd, {"verbosity": "high", "reasoningEffort": "max"})
+        joined = " ".join(cmd)
+        self.assertIn('model_verbosity="high"', joined)
+        self.assertIn('model_reasoning_effort="max"', joined)
+
+    def test_a_level_codex_would_reject_is_dropped(self) -> None:
+        # Better to fall through to the model default than to hand Codex a value
+        # it refuses and fail the turn.
+        cmd: list[str] = []
+        ctxgit.apply_codex_output_depth(cmd, {"verbosity": "ultra", "reasoningEffort": "nope"})
+        joined = " ".join(cmd)
+        self.assertNotIn("model_verbosity", joined, "ultra is a reasoning level, not a verbosity one")
+        self.assertNotIn("model_reasoning_effort", joined)
+
+    def test_both_codex_transports_carry_it(self) -> None:
+        source = Path(ctxgit.__file__).read_text(encoding="utf-8")
+        # `codex exec` gets it through the session config; the app-server path is a
+        # different command builder and had to be wired separately.
+        self.assertIn("apply_codex_output_depth(cmd, config)", source)
+        self.assertIn('apply_codex_output_depth(cmd, read_llm_config(root).get("codex", {}))', source)
+
+
+class TurnNarrationTest(unittest.TestCase):
+    """What the agent said while working stays on the turn.
+
+    The live panel is cleared when a turn ends, so the only account of how the
+    answer was reached used to vanish with it — it survived only in the job's event
+    file, which the branch never shows.
+    """
+
+    def test_narration_is_kept_and_machinery_is_not(self) -> None:
+        collected: list[str] = []
+        progress = ctxgit.narration_collecting_progress(None, collected)
+        for line in [
+            "Preparing branch context",          # ctxgit step label
+            "Using tool: Bash · npx tsc",        # machinery
+            "Now the regression test that reproduces the failure:",
+            "Command finished",                  # machinery
+            "프로세스 종료 코드: 0",              # machinery
+            "실행 중 발견한 오류도 고쳤습니다.",
+            "완료됨",                            # machinery
+        ]:
+            progress(line)
+        self.assertEqual(
+            collected,
+            ["Now the regression test that reproduces the failure:", "실행 중 발견한 오류도 고쳤습니다."],
+        )
+
+    def test_a_repeated_line_is_not_stored_twice(self) -> None:
+        collected: list[str] = []
+        progress = ctxgit.narration_collecting_progress(None, collected)
+        progress("Looking at the parser now")
+        progress("Looking at the parser now")
+        self.assertEqual(len(collected), 1)
+
+    def test_the_wrapper_passes_cancellation_and_interjections_through(self) -> None:
+        # It sits in front of the real callback, so the turn must still be able to
+        # be stopped and spoken to.
+        def base(_message: str) -> None:
+            return None
+
+        base.cancelled = lambda: True
+        base.take_interjections = lambda: ["hi"]
+        wrapped = ctxgit.narration_collecting_progress(base, [])
+        self.assertTrue(getattr(wrapped, "cancelled")())
+        self.assertEqual(getattr(wrapped, "take_interjections")(), ["hi"])
+
+    def test_narration_never_reaches_a_later_prompt(self) -> None:
+        # Stored beside the record, not inside its text: the prompt builder reads
+        # role and text only, so working notes do not become context forever.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.init(create_initial_branch=False)
+            store.create_branch("b1")
+            store.append_history(
+                "b1", "assistant", "THE_ANSWER", extra={"progress": ["WORKING_NOTE"]}
+            )
+            prompt = ctxgit.build_chat_prompt(store, "b1", "next")
+            self.assertIn("THE_ANSWER", prompt)
+            self.assertNotIn("WORKING_NOTE", prompt)
+            # But the branch payload carries it, so the chat can show it.
+            payload = ctxgit.branch_payload(store, "b1")
+            self.assertEqual(payload["history"][-1]["progress"], ["WORKING_NOTE"])
+
+
+class RuntimeDirectiveTest(unittest.TestCase):
+    """A send-mode turn is allowed to finish the job it was opened for.
+
+    The standing contract forbade push, publish and deploy in every mode, so a
+    writable turn would build, test and commit and then stop at the last step to
+    report it was not permitted to ship. The sandbox and the approval gate are the
+    boundaries; that sentence only made the end of the turn useless.
+    """
+
+    def test_a_writable_turn_is_not_told_to_stop_short_of_shipping(self) -> None:
+        writable = ctxgit.ctxgit_runtime_directive(writable=True)
+        self.assertNotIn("Do not push", writable)
+        self.assertNotIn("deploy", writable)
+
+    def test_a_read_only_turn_still_is(self) -> None:
+        read_only = ctxgit.ctxgit_runtime_directive(writable=False)
+        self.assertIn("Do not push, publish, or deploy.", read_only)
+
+    def test_the_outside_workspace_rule_survives_both(self) -> None:
+        # That one is a mechanism (approvalRequests), not a request.
+        for writable in (True, False):
+            directive = ctxgit.ctxgit_runtime_directive(writable=writable)
+            self.assertIn("outside the current working directory", directive)
+            self.assertIn("Return the required structured output", directive)
+
+    def test_codex_read_only_paths_keep_the_ban(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ctxgit.ContextStore(root).init(create_initial_branch=False)
+            for writable, expected in ((False, True), (True, False)):
+                cmd: list[str] = []
+                ctxgit.apply_codex_session_config(cmd, root, writable=writable)
+                joined = " ".join(cmd)
+                self.assertEqual("Do not push" in joined, expected)
+
+    def test_one_wording_serves_every_provider_and_transport(self) -> None:
+        """Three hand-maintained copies became one function.
+
+        Claude, `codex exec` and the Codex app-server each carried their own copy of
+        this sentence, so a change to the contract had to be made three times or the
+        providers quietly diverged.
+        """
+        source = Path(ctxgit.__file__).read_text(encoding="utf-8")
+        # The sentence lives only in the helper (twice: writable and read-only).
+        self.assertEqual(source.count("You are running inside ctxgit."), 2)
+        # One use per surface: codex exec, the codex app-server, and Claude.
+        self.assertEqual(source.count("ctxgit_runtime_directive(writable="), 3)
+
+
+class CodexCommentaryTest(unittest.TestCase):
+    """Codex does talk between tool calls; ctxgit was dropping it.
+
+    The app-server sends `agentMessage` items with `phase: "commentary"` around
+    each tool call. The progress formatter handled four item types and none of them
+    was that, so every Codex turn showed as an unbroken run of "Running command:".
+    """
+
+    def _event(self, method: str, item: dict) -> dict:
+        return {"method": method, "params": {"item": item}}
+
+    def test_commentary_becomes_progress(self) -> None:
+        said = ctxgit.codex_app_server_progress(
+            self._event(
+                "item/completed",
+                {"type": "agentMessage", "phase": "commentary", "text": "I'm about to run the build."},
+            )
+        )
+        self.assertEqual(said, "I'm about to run the build.")
+
+    def test_the_answer_itself_is_not_narrated_twice(self) -> None:
+        # The turn's answer comes back as structured output; only commentary is
+        # progress, or the whole reply would appear in the log and again as the reply.
+        for phase in ("final", "", "answer"):
+            self.assertEqual(
+                ctxgit.codex_app_server_progress(
+                    self._event(
+                        "item/completed",
+                        {"type": "agentMessage", "phase": phase, "text": "THE WHOLE ANSWER"},
+                    )
+                ),
+                "",
+            )
+
+    def test_tool_lines_still_report(self) -> None:
+        self.assertEqual(
+            ctxgit.codex_app_server_progress(
+                self._event("item/started", {"type": "commandExecution", "command": "npm test"})
+            ),
+            "Running command: npm test",
+        )
+
+    def test_commentary_counts_as_narration_and_tool_lines_do_not(self) -> None:
+        # So it lands in the turn's stored working log, and the machinery does not.
+        self.assertTrue(ctxgit.is_progress_narration("I'm about to run the build."))
+        self.assertFalse(ctxgit.is_progress_narration("Running command: npm test"))
+        self.assertFalse(ctxgit.is_progress_narration("Command finished"))
+
+
+class CancelKillsTheWholeTreeTest(unittest.TestCase):
+    """Stopping a turn has to stop what the turn started.
+
+    A provider turn is a tree: the agent spawns shells, builds, test runners. Only
+    the direct child was killed, so Stop returned at once and looked like it had
+    worked while `npm test` and a render job carried on in the background — still
+    writing into the workspace after the turn was supposedly over.
+    """
+
+    def _cancel_after(self, seconds: float):
+        flag = {"stop": False}
+
+        def progress(_message: str) -> None:
+            return None
+
+        progress.cancelled = lambda: flag["stop"]
+        threading.Timer(seconds, lambda: flag.__setitem__("stop", True)).start()
+        return progress
+
+    def test_a_grandchild_does_not_survive_the_cancel(self) -> None:
+        marker = f"ctxgit-cancel-probe-{os.getpid()}"
+        progress = self._cancel_after(1.0)
+        with self.assertRaises(ctxgit.JobCancelledError):
+            ctxgit.run_process_with_progress(
+                ["/bin/sh", "-c", f"sleep 43 # {marker}"], Path("."), 60, progress
+            )
+        time.sleep(0.5)
+        found = subprocess.run(["pgrep", "-f", marker], capture_output=True, text=True)
+        self.assertEqual(found.stdout.strip(), "", "the shell's child outlived the cancel")
+
+    def test_every_kill_path_goes_through_the_tree_aware_one(self) -> None:
+        # Two runners (the streaming one and the Codex app-server loop) each cancel
+        # and time out; a plain process.kill() in any of them leaks the tree again.
+        source = Path(ctxgit.__file__).read_text(encoding="utf-8")
+        self.assertEqual(source.count("terminate_process_tree(process)"), 4)
+        self.assertEqual(source.count("start_new_session=os.name != \"nt\""), 2)
+
+
+class TelegramRemoteTest(unittest.TestCase):
+    """Driving a branch from chat.
+
+    The workspace runs with full file access, so the gate that matters is not
+    politeness — it is that an unexpected sender can reach a machine. Everything
+    here is about who is allowed to speak and what a message is allowed to do.
+    """
+
+    def _remote(self, root: Path):
+        class Jobs:
+            def __init__(self): self.created, self.interjected, self.canceled = [], [], []
+            def running_jobs(self, root=None): return list(getattr(self, "running", []))
+            def create(self, kind, work, root=None, branch=None, mode=None):
+                self.created.append({"kind": kind, "branch": branch, "mode": mode}); return {"id": "j1"}
+            def interject(self, job_id, text, root=None):
+                self.interjected.append((job_id, text)); return {}
+            def cancel(self, job_id, root=None):
+                self.canceled.append(job_id); return {}
+
+        class State:
+            def root(self_inner): return root
+
+        class Registry:
+            def list_projects(self, active_root=None): return [{"path": str(root)}]
+
+        jobs = Jobs()
+        remote = ctxgit.TelegramRemote(State(), Registry(), jobs)
+        sent: list[str] = []
+        remote._say = lambda token, chat, text, reply_to=None: sent.append(text) or 1
+        return remote, jobs, sent
+
+    def _project(self, tmp: str, env: str) -> Path:
+        root = Path(tmp)
+        store = ctxgit.ContextStore(root)
+        store.init(create_initial_branch=False)
+        store.create_branch("alpha")
+        store.create_branch("beta")
+        (root / ".ctxgit").mkdir(exist_ok=True)
+        (root / ".ctxgit" / ".env").write_text(env, encoding="utf-8")
+        return root
+
+    # The ctxgit repo's own .env is a fallback for every project, so a machine that
+    # has configured an allowlist would otherwise reject this test's sender. Each
+    # project below states its own, which is what a real project should do too.
+    def _msg(self, text: str, chat: str = "42", user: int = 7) -> dict:
+        return {"message": {"text": text, "chat": {"id": chat}, "from": {"id": user}, "message_id": 100}}
+
+    def test_a_message_from_the_wrong_chat_is_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project(
+                tmp, "TELEGRAM_BOT_TOKEN=t\nTELEGRAM_CHAT_ID=42\nTELEGRAM_ALLOWED_USER_IDS=7\n"
+            )
+            remote, jobs, sent = self._remote(root)
+            remote._handle(self._msg("/use alpha", chat="999"), "t")
+            self.assertEqual(sent, [], "an unknown chat must not even get an answer")
+            self.assertEqual(jobs.created, [])
+
+    def test_a_sender_outside_the_allowlist_is_ignored(self) -> None:
+        # A group can gain members; matching the chat alone would hand each of them
+        # the same control over this machine.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project(
+                tmp, "TELEGRAM_BOT_TOKEN=t\nTELEGRAM_CHAT_ID=42\nTELEGRAM_ALLOWED_USER_IDS=7\n"
+            )
+            remote, jobs, sent = self._remote(root)
+            remote._handle(self._msg("/use alpha", user=8), "t")
+            self.assertEqual(sent, [])
+            remote._handle(self._msg("/use alpha", user=7), "t")
+            self.assertTrue(sent)
+
+    def test_plain_text_is_read_only_and_send_is_the_writable_one(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project(
+                tmp, "TELEGRAM_BOT_TOKEN=t\nTELEGRAM_CHAT_ID=42\nTELEGRAM_ALLOWED_USER_IDS=7\n"
+            )
+            remote, jobs, sent = self._remote(root)
+            remote._handle(self._msg("/use alpha"), "t")
+            remote._handle(self._msg("무슨 상태야?"), "t")
+            remote._handle(self._msg("/send 빌드 고쳐줘"), "t")
+            self.assertEqual([c["kind"] for c in jobs.created], ["info-chat", "chat"])
+            self.assertEqual([c["branch"] for c in jobs.created], ["alpha", "alpha"])
+
+    def test_a_reply_to_a_notification_addresses_that_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project(
+                tmp, "TELEGRAM_BOT_TOKEN=t\nTELEGRAM_CHAT_ID=42\nTELEGRAM_ALLOWED_USER_IDS=7\n"
+            )
+            ctxgit.remember_telegram_reply(root, 555, "beta")
+            remote, jobs, sent = self._remote(root)
+            update = self._msg("이어서 해줘")
+            update["message"]["reply_to_message"] = {"message_id": 555}
+            remote._handle(update, "t")
+            self.assertEqual([c["branch"] for c in jobs.created], ["beta"])
+
+    def test_a_busy_branch_is_interjected_rather_than_queued(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project(
+                tmp, "TELEGRAM_BOT_TOKEN=t\nTELEGRAM_CHAT_ID=42\nTELEGRAM_ALLOWED_USER_IDS=7\n"
+            )
+            remote, jobs, sent = self._remote(root)
+            jobs.running = [{"id": "live", "branch": "alpha", "mode": "chat"}]
+            remote._handle(self._msg("/use alpha"), "t")
+            remote._handle(self._msg("그거 말고 이거부터"), "t")
+            self.assertEqual(jobs.interjected, [("live", "그거 말고 이거부터")])
+            self.assertEqual(jobs.created, [])
+
+    def test_a_branch_name_can_be_shortened(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project(
+                tmp, "TELEGRAM_BOT_TOKEN=t\nTELEGRAM_CHAT_ID=42\nTELEGRAM_ALLOWED_USER_IDS=7\n"
+            )
+            remote, _, _ = self._remote(root)
+            self.assertEqual(remote._resolve_branch(root, "alp"), "alpha")
+            self.assertEqual(remote._resolve_branch(root, "nope"), "")
+
+
+class ForeignJobVisibilityTest(unittest.TestCase):
+    """A turn started elsewhere has to look like one started here.
+
+    The Telegram remote can run in its own process, and its jobs live in the same
+    files but not in this server's memory. Without reading them the browser shows
+    no running marker, no live progress, and the answer only appears on a reload.
+    """
+
+    def _store(self, tmp: str):
+        root = Path(tmp)
+        ctxgit.ContextStore(root).init(create_initial_branch=False)
+
+        class State:
+            def root(self_inner): return root
+
+        registry = ctxgit.JobStore(State())
+        return root, registry
+
+    def _write_job(self, root: Path, job_id: str, status: str, age_seconds: float = 0.0) -> None:
+        jobs_dir = root / "contexts" / "jobs"
+        jobs_dir.mkdir(parents=True, exist_ok=True)
+        path = jobs_dir / f"{job_id}.json"
+        ctxgit.dump_json(path, {
+            "id": job_id, "status": status, "branch": "alpha", "mode": "chat",
+            "projectPath": str(root), "events": [],
+        })
+        if age_seconds:
+            old = time.time() - age_seconds
+            os.utime(path, (old, old))
+
+    def test_a_live_job_from_another_process_is_listed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, jobs = self._store(tmp)
+            self._write_job(root, "20260919T120000000000Z", "running")
+            listed = [j["id"] for j in jobs.running_jobs(root=root)]
+            self.assertEqual(listed, ["20260919T120000000000Z"])
+
+    def test_a_job_whose_process_died_drops_out(self) -> None:
+        # It stopped being written to, so nothing is keeping it alive.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, jobs = self._store(tmp)
+            self._write_job(root, "20260919T110000000000Z", "running", age_seconds=600)
+            self.assertEqual(jobs.running_jobs(root=root), [])
+
+    def test_a_finished_job_is_not_listed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, jobs = self._store(tmp)
+            self._write_job(root, "20260919T130000000000Z", "done")
+            self.assertEqual(jobs.running_jobs(root=root), [])
+
+    def test_the_browser_adopts_foreign_turns_on_a_timer(self) -> None:
+        # Otherwise the page only learns about them when it is reloaded.
+        source = Path(__file__).resolve().parents[1].joinpath("web", "app.js").read_text(encoding="utf-8")
+        self.assertIn("rehydrateRunningJobs().catch(() => {});\n}, 5000);", source)
+
+
+class AnswerEnvelopeNotNarrationTest(unittest.TestCase):
+    """The reply is not commentary, even though it arrives on the same channel.
+
+    Claude streams its final structured answer as ordinary assistant text, so the
+    `{"assistant": ...}` envelope was shown in the progress panel as if the agent
+    had said it — a wall of JSON in the place where the answer was about to be
+    rendered properly a moment later.
+    """
+
+    ENVELOPE = '```json { "assistant": "긴 답변", "artifacts": [], "approvalRequests": [] } ```'
+
+    def test_the_envelope_is_not_treated_as_something_said(self) -> None:
+        self.assertTrue(ctxgit.looks_like_chat_envelope(self.ENVELOPE))
+        self.assertTrue(ctxgit.looks_like_chat_envelope('{"assistant": "x", "artifacts": []}'))
+        self.assertFalse(ctxgit.is_progress_narration(self.ENVELOPE))
+
+    def test_real_commentary_still_counts(self) -> None:
+        for line in ("Now running the gate to see whether it measures.", "실행 중 오류도 고쳤습니다."):
+            self.assertFalse(ctxgit.looks_like_chat_envelope(line))
+            self.assertTrue(ctxgit.is_progress_narration(line))
+
+    def test_the_stream_formatter_drops_it(self) -> None:
+        event = json.dumps({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": self.ENVELOPE}]},
+        })
+        self.assertEqual(ctxgit.claude_stream_progress(event), "")
+
+    def test_the_stream_formatter_keeps_commentary(self) -> None:
+        event = json.dumps({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "Now checking the build."}]},
+        })
+        self.assertIn("Now checking the build", ctxgit.claude_stream_progress(event))
+
+    def test_the_browser_hides_it_too(self) -> None:
+        source = Path(__file__).resolve().parents[1].joinpath("web", "app.js").read_text(encoding="utf-8")
+        self.assertIn("function looksLikeChatEnvelope", source)
+        self.assertIn("if (looksLikeChatEnvelope(text)) return false;", source)
+
+
+class TrackedSnapshotPruningTest(unittest.TestCase):
+    """The output scan must not walk the whole workspace.
+
+    It runs twice a turn — once before the model and once after — so the second
+    call lands exactly in the gap before an answer appears. `rglob` descended into
+    every directory and discarded the results afterwards, which on a workspace with
+    vendored checkouts and browser profiles cost about nine seconds a call.
+    """
+
+    def _workspace(self, tmp: str) -> Path:
+        root = Path(tmp)
+        ctxgit.ContextStore(root).init(create_initial_branch=False)
+        (root / "out").mkdir()
+        (root / "out" / "deck.pdf").write_bytes(b"%PDF-1.4 real")
+        # The kinds of directory that made the walk expensive.
+        for noisy in ("node_modules/pkg", ".chrome-profile/Default", ".ctxgit/git/objects"):
+            target = root / noisy
+            target.mkdir(parents=True, exist_ok=True)
+            (target / "buried.pdf").write_bytes(b"%PDF-1.4 noise")
+        return root
+
+    def test_only_real_output_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._workspace(tmp)
+            found = set(ctxgit.tracked_file_snapshot(root))
+            self.assertIn("out/deck.pdf", found)
+            self.assertEqual(
+                [p for p in found if "node_modules" in p or p.startswith(".")],
+                [],
+                "vendored and hidden directories must not be scanned",
+            )
+
+    def test_the_pruned_directories_are_never_entered(self) -> None:
+        # Not just filtered afterwards: entering them is the cost.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._workspace(tmp)
+            visited: list[str] = []
+            original = os.walk
+
+            def watched(path, *args, **kwargs):
+                for current, dirnames, filenames in original(path, *args, **kwargs):
+                    visited.append(str(current))
+                    yield current, dirnames, filenames
+
+            os.walk = watched
+            try:
+                ctxgit.tracked_file_snapshot(root)
+            finally:
+                os.walk = original
+            self.assertFalse(
+                [v for v in visited if "node_modules" in v or "/.ctxgit/git" in v],
+                "the walk descended into a directory it was going to discard",
+            )
+
+
+class TelegramSequenceRoomRoutingTest(unittest.TestCase):
+    """A room driven from chat has to run as a room.
+
+    A sequence room is an ordered set of agents with its own turn function, not a
+    chat branch. Sending it an ordinary chat turn produced nothing visible, so a
+    question asked from the phone looked simply unanswered.
+    """
+
+    def test_a_room_branch_runs_the_room_turn(self) -> None:
+        source = Path(ctxgit.__file__).read_text(encoding="utf-8")
+        start = source.index("def _start_turn(")
+        body = source[start : start + 2000]
+        self.assertIn("branch_is_sequence_room(store, branch)", body)
+        self.assertIn("run_sequence_room_turn(", body)
+        # And the room's own mode decides read-only vs writable.
+        self.assertIn('run_mode="send" if writable else "info-chat"', body)
+
+    def test_a_failing_poller_says_so(self) -> None:
+        # Telegram allows one getUpdates at a time; a second caller gets 409. When
+        # that was silent, a stalled poller looked exactly like a dead thread.
+        source = Path(ctxgit.__file__).read_text(encoding="utf-8")
+        self.assertIn("telegram remote: retrying after", source)
+
+
+class _BossJobs:
+    """A JobStore stand-in: records what would have been started, runs nothing."""
+
+    def __init__(self):
+        self.created, self.interjected, self.running = [], [], []
+
+    def running_jobs(self, root=None):
+        return list(self.running)
+
+    def create(self, kind, work, root=None, branch=None, mode=None):
+        self.created.append({"kind": kind, "branch": branch, "mode": mode, "work": work})
+        return {"id": f"job-{len(self.created)}"}
+
+    def interject(self, job_id, text, root=None):
+        self.interjected.append((job_id, text))
+        return {}
+
+
+class _BossModel:
+    """Swap the provider call for a canned answer, capturing the prompt."""
+
+    def __init__(self, answer, raw=False):
+        self.answer, self.prompts, self.raw = answer, [], raw
+
+    def __enter__(self):
+        self.original = ctxgit.call_provider_prompt
+
+        def fake(provider, root, prompt, **kwargs):
+            self.prompts.append(prompt)
+            if self.raw:
+                return self.answer
+            # The shape providers really return: a chat envelope, with the object
+            # that was asked for as fenced text in `assistant`. A fake that handed
+            # the dict straight back is how a desk that could never draft passed.
+            text = json.dumps(self.answer, ensure_ascii=False, indent=2)
+            return {"assistant": f"```json\n{text}\n```", "artifacts": [], "approvalRequests": []}
+
+        ctxgit.call_provider_prompt = fake
+        return self
+
+    def __exit__(self, *exc):
+        ctxgit.call_provider_prompt = self.original
+
+
+class BossChatTest(unittest.TestCase):
+    """Boss chat drafts, the user reviews, then it dispatches.
+
+    Nothing is sent on the model's say-so: the wording each branch receives is
+    shown first and can be edited, argued with, or dropped. That review step is the
+    feature — it is the difference between delegating and being surprised.
+    """
+
+    def _project(self, tmp: str):
+        root = Path(tmp)
+        store = ctxgit.ContextStore(root)
+        store.init(create_initial_branch=False)
+        store.create_branch("sales", title="Sales")
+        store.set_branch_folder("sales", "Sales")
+        store.create_branch("dev", title="Dev")
+        store.set_branch_folder("dev", "Dev")
+        store.create_branch("untouched", title="Untouched")
+        return root, store
+
+    def _draft(self, root, store, assignments, message="오늘 할 일", summary="나눴습니다"):
+        with _BossModel({"assignments": assignments, "summary": summary}):
+            return ctxgit.draft_boss_assignments(root, store, message)
+
+    def test_drafting_sends_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            ctxgit.write_boss_config(store, ["sales", "dev"])
+            items = self._draft(root, store, [
+                {"branch": "sales", "instruction": "견적 정리", "suggestedMode": "send"},
+            ])
+            self.assertEqual([i["branch"] for i in items], ["sales"])
+            self.assertEqual(items[0]["request"], "오늘 할 일")
+            # The model may hint at a mode; it never gets to choose one.
+            self.assertEqual(items[0]["suggestedMode"], "send")
+            self.assertNotIn("mode", items[0])
+            history = ctxgit.iter_boss_history(store)
+            self.assertEqual([r["role"] for r in history], ["user", "assistant"])
+            self.assertEqual(history[0]["text"], "오늘 할 일")
+            self.assertEqual(history[1]["kind"], "draft")
+            for branch in ("sales", "dev"):
+                self.assertEqual(list(store.iter_history(branch)), [], "no branch was spoken to")
+
+    def test_the_http_path_can_record_the_request_itself(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            ctxgit.write_boss_config(store, ["sales"])
+            ctxgit.append_boss_history(store, "user", "오늘 할 일")
+            with _BossModel({"assignments": [], "summary": ""}):
+                ctxgit.draft_boss_assignments(root, store, "오늘 할 일", record_request=False)
+            users = [r for r in ctxgit.iter_boss_history(store) if r["role"] == "user"]
+            self.assertEqual(len(users), 1, "the request is not recorded twice")
+
+    def test_a_request_nobody_can_take_says_so(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            ctxgit.write_boss_config(store, ["sales"])
+            self.assertEqual(self._draft(root, store, [], summary=""), [])
+            self.assertIn("찾지 못했습니다", ctxgit.iter_boss_history(store)[-1]["text"])
+
+    def test_an_unreadable_reply_fails_loudly(self) -> None:
+        # "Succeeded with zero drafts" is what this used to look like.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            ctxgit.write_boss_config(store, ["sales"])
+            envelope = {"assistant": "죄송합니다, 나눌 수 없었습니다.", "artifacts": [], "approvalRequests": []}
+            with _BossModel(envelope, raw=True):
+                with self.assertRaises(RuntimeError):
+                    ctxgit.draft_boss_assignments(root, store, "오늘 할 일")
+
+    def test_prose_around_the_json_is_tolerated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            ctxgit.write_boss_config(store, ["sales"])
+            reply = '나눠봤습니다.\n{"assignments": [{"branch": "sales", "instruction": "견적"}], "summary": "s"}\n이상입니다.'
+            with _BossModel({"assistant": reply, "artifacts": [], "approvalRequests": []}, raw=True):
+                items = ctxgit.draft_boss_assignments(root, store, "오늘 할 일")
+            self.assertEqual([i["branch"] for i in items], ["sales"])
+
+    def test_drafting_needs_a_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            with self.assertRaises(ValueError):
+                self._draft(root, store, [])
+
+    def test_only_chosen_branches_survive_the_draft(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            ctxgit.write_boss_config(store, ["sales"])
+            items = self._draft(root, store, [
+                {"branch": "sales", "instruction": "견적"},
+                {"branch": "untouched", "instruction": "몰래"},
+            ])
+            self.assertEqual([i["branch"] for i in items], ["sales"])
+
+    def test_the_user_chooses_the_mode_per_branch_per_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            ctxgit.write_boss_config(store, ["sales", "dev"])
+            self._draft(root, store, [
+                {"branch": "sales", "instruction": "견적"},
+                {"branch": "dev", "instruction": "빌드"},
+            ])
+            jobs = _BossJobs()
+            payload = ctxgit.dispatch_boss_items(root, store, jobs, [
+                {"branch": "sales", "instruction": "견적 정리해줘", "mode": "send"},
+                {"branch": "dev", "instruction": "빌드 봐줘", "mode": "info-chat"},
+            ])
+            self.assertEqual(
+                [(c["branch"], c["kind"]) for c in jobs.created],
+                [("sales", "chat"), ("dev", "info-chat")],
+            )
+            self.assertEqual([s["jobId"] for s in payload["started"]], ["job-1", "job-2"])
+
+    def test_dispatch_without_a_mode_is_refused(self) -> None:
+        # Send or info-chat is the user's call; there is no default to fall back on.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            ctxgit.write_boss_config(store, ["sales"])
+            self._draft(root, store, [{"branch": "sales", "instruction": "견적", "suggestedMode": "send"}])
+            jobs = _BossJobs()
+            with self.assertRaises(ValueError):
+                ctxgit.dispatch_boss_items(root, store, jobs, [{"branch": "sales", "instruction": "견적"}])
+            self.assertEqual(jobs.created, [])
+            self.assertEqual(len(ctxgit.boss_pending_items(store)), 1, "the draft is still there")
+
+    def test_dispatch_cannot_reach_outside_the_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            ctxgit.write_boss_config(store, ["sales"])
+            jobs = _BossJobs()
+            with self.assertRaises(ValueError):
+                ctxgit.dispatch_boss_items(root, store, jobs, [
+                    {"branch": "untouched", "instruction": "몰래", "mode": "send"},
+                ])
+            self.assertEqual(jobs.created, [])
+
+    def test_edited_wording_is_what_gets_sent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            ctxgit.write_boss_config(store, ["sales"])
+            self._draft(root, store, [{"branch": "sales", "instruction": "모델이 쓴 문장"}])
+            captured = {}
+            original = ctxgit.start_branch_turn
+            ctxgit.start_branch_turn = lambda r, st, j, b, text, **k: captured.update(text=text, **k) or {"id": "x"}
+            try:
+                ctxgit.dispatch_boss_items(root, store, _BossJobs(), [
+                    {"branch": "sales", "instruction": "내가 고친 문장", "mode": "info-chat"},
+                ])
+            finally:
+                ctxgit.start_branch_turn = original
+            self.assertEqual(captured["text"], "내가 고친 문장")
+            self.assertFalse(captured["writable"])
+
+    def test_hand_edits_are_kept_on_the_desk(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            ctxgit.write_boss_config(store, ["sales"])
+            before = self._draft(root, store, [{"branch": "sales", "instruction": "모델이 쓴 문장"}])[0]
+            ctxgit.save_boss_edits(store, [{"branch": "sales", "instruction": "내가 고친 문장"}])
+            item = ctxgit.boss_pending_items(store)[0]
+            self.assertEqual(item["instruction"], "내가 고친 문장")
+            self.assertTrue(item["edited"])
+            self.assertEqual(item["id"], before["id"], "an edit is the same draft, not a new one")
+
+    def test_feedback_rewrites_from_the_current_wording(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            ctxgit.write_boss_config(store, ["sales", "dev"])
+            before = self._draft(root, store, [
+                {"branch": "sales", "instruction": "원래 문장"},
+                {"branch": "dev", "instruction": "개발 문장"},
+            ])
+            ctxgit.save_boss_edits(store, [{"branch": "sales", "instruction": "내가 고친 문장"}])
+            answer = {"assignments": [{"branch": "sales", "instruction": "고친 문장", "suggestedMode": "send"}], "summary": "줄였습니다"}
+            with _BossModel(answer) as model:
+                ctxgit.revise_boss_items(root, store, "더 짧게", only=["sales"])
+            self.assertIn("내가 고친 문장", model.prompts[0])
+            self.assertIn("더 짧게", model.prompts[0])
+            self.assertNotIn("개발 문장", model.prompts[0], "only the named branch is up for rewriting")
+            items = {i["branch"]: i for i in ctxgit.boss_pending_items(store)}
+            self.assertEqual(items["sales"]["instruction"], "고친 문장")
+            self.assertEqual(items["sales"]["revision"], 1)
+            self.assertEqual(items["sales"]["request"], "오늘 할 일")
+            self.assertNotEqual(items["sales"]["id"], before[0]["id"])
+            self.assertEqual(items["dev"]["instruction"], "개발 문장")
+            kinds = [r.get("kind") for r in ctxgit.iter_boss_history(store)]
+            self.assertEqual(kinds[-2:], ["feedback", "revision"])
+
+    def test_a_rewrite_cannot_add_a_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            ctxgit.write_boss_config(store, ["sales", "dev"])
+            self._draft(root, store, [{"branch": "sales", "instruction": "원래"}])
+            answer = {"assignments": [
+                {"branch": "sales", "instruction": "고침"},
+                {"branch": "dev", "instruction": "끼워넣기"},
+            ], "summary": ""}
+            with _BossModel(answer):
+                ctxgit.revise_boss_items(root, store, "더 짧게")
+            self.assertEqual([i["branch"] for i in ctxgit.boss_pending_items(store)], ["sales"])
+
+    def test_feedback_with_nothing_to_revise_is_an_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            ctxgit.write_boss_config(store, ["sales"])
+            with self.assertRaises(ValueError):
+                ctxgit.revise_boss_items(root, store, "더 짧게")
+
+    def test_a_busy_branch_is_interjected_instead_of_queued(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            ctxgit.write_boss_config(store, ["sales"])
+            self._draft(root, store, [{"branch": "sales", "instruction": "이거 먼저"}])
+            jobs = _BossJobs()
+            jobs.running = [{"id": "live", "branch": "sales"}]
+            ctxgit.dispatch_boss_items(root, store, jobs, [
+                {"branch": "sales", "instruction": "이거 먼저", "mode": "info-chat"},
+            ])
+            self.assertEqual(jobs.interjected, [("live", "이거 먼저")])
+            self.assertEqual(jobs.created, [])
+
+    def test_dispatch_records_the_turn_and_clears_only_what_it_sent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            ctxgit.write_boss_config(store, ["sales", "dev"])
+            self._draft(root, store, [
+                {"branch": "sales", "instruction": "세일즈"},
+                {"branch": "dev", "instruction": "빌드 고쳐"},
+            ])
+            ctxgit.dispatch_boss_items(root, store, _BossJobs(), [
+                {"branch": "dev", "instruction": "빌드 고쳐", "mode": "info-chat"},
+            ])
+            last = ctxgit.iter_boss_history(store)[-1]
+            self.assertEqual(last["kind"], "dispatch")
+            self.assertIn("dev", last["text"])
+            self.assertEqual([i["branch"] for i in ctxgit.boss_pending_items(store)], ["sales"])
+            thread = ctxgit.boss_threads(store)["dev"]
+            self.assertEqual(thread["lastInstruction"], "빌드 고쳐")
+            self.assertEqual(thread["request"], "오늘 할 일")
+            self.assertEqual(thread["lastMode"], "info-chat")
+
+    def test_discarding_one_draft_leaves_the_others(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            ctxgit.write_boss_config(store, ["sales", "dev"])
+            self._draft(root, store, [
+                {"branch": "sales", "instruction": "세일즈"},
+                {"branch": "dev", "instruction": "개발"},
+            ])
+            ctxgit.drop_boss_items(store, {"sales"})
+            self.assertEqual([i["branch"] for i in ctxgit.boss_pending_items(store)], ["dev"])
+            ctxgit.drop_boss_items(store)
+            self.assertEqual(ctxgit.boss_pending_items(store), [])
+
+    def test_deselecting_a_branch_takes_its_draft_off_the_desk(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            ctxgit.write_boss_config(store, ["sales", "dev"])
+            self._draft(root, store, [
+                {"branch": "sales", "instruction": "세일즈"},
+                {"branch": "dev", "instruction": "개발"},
+            ])
+            ctxgit.write_boss_config(store, ["dev"])
+            self.assertEqual([i["branch"] for i in ctxgit.boss_pending_items(store)], ["dev"])
+
+    def test_a_stale_selection_is_dropped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            ctxgit.write_boss_config(store, ["sales", "dev"])
+            ctxgit.dump_json(
+                ctxgit.boss_config_path(store), {"branches": ["sales", "deleted"]}
+            )
+            self.assertEqual(ctxgit.read_boss_config(store)["branches"], ["sales"])
+
+    def test_an_unknown_branch_cannot_be_selected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            with self.assertRaises(ValueError):
+                ctxgit.write_boss_config(store, ["nope"])
+
+    def test_reset_clears_the_conversation_and_any_pending_draft(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            ctxgit.write_boss_config(store, ["sales"])
+            self._draft(root, store, [{"branch": "sales", "instruction": "x"}])
+            store.reset_boss_chat()
+            self.assertEqual(ctxgit.iter_boss_history(store), [])
+            self.assertEqual(ctxgit.read_boss_draft(store), {})
+            self.assertEqual(ctxgit.read_boss_config(store)["branches"], ["sales"], "the selection survives")
+
+    def test_a_branch_made_here_is_badged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            ctxgit.append_boss_history(store, "user", "여기서 갈라나간다")
+            store.create_branch_from_boss_chat("spun", title="Spun")
+            item = next(b for b in store.list_branches() if b["id"] == "spun")
+            self.assertTrue(item["fromBossChat"])
+            self.assertFalse(next(b for b in store.list_branches() if b["id"] == "sales")["fromBossChat"])
+            self.assertIn("여기서 갈라나간다", [r["text"] for r in store.iter_history("spun")])
+
+    def test_the_payload_carries_the_board(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            ctxgit.write_boss_config(store, ["sales"])
+            store.append_history("sales", "assistant", "견적 초안 만들었습니다.")
+            self._draft(root, store, [{"branch": "sales", "instruction": "견적"}])
+            jobs = _BossJobs()
+            jobs.running = [{"id": "f", "branch": ctxgit.boss_followup_job_key("sales")}]
+            payload = ctxgit.boss_chat_payload(store, jobs)
+            self.assertIn("Sales", payload["folders"])
+            rows = {b["id"]: b for b in payload["branches"]}
+            self.assertEqual(rows["sales"]["folder"], "Sales")
+            self.assertEqual(rows["untouched"]["folder"], "")
+            self.assertTrue(rows["sales"]["selected"])
+            self.assertIn("견적 초안", rows["sales"]["lastAnswer"])
+            self.assertTrue(rows["sales"]["draftingFollowup"])
+            self.assertFalse(rows["sales"]["running"], "a follow-up being drafted is not the branch running")
+            self.assertNotIn("lastAnswer", rows["untouched"])
+            self.assertEqual([i["branch"] for i in payload["pending"]], ["sales"])
+
+    def test_concurrent_writers_do_not_drop_each_other_s_items(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            for index in range(8):
+                store.create_branch(f"b{index}")
+            threads = [
+                threading.Thread(
+                    target=ctxgit.upsert_boss_items,
+                    args=(store, [ctxgit.new_boss_item(f"b{index}", "x")]),
+                )
+                for index in range(8)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            self.assertEqual(len(ctxgit.boss_pending_items(store)), 8)
+
+
+class BossFollowUpTest(unittest.TestCase):
+    """When a branch answers, the next message is already waiting.
+
+    A delegated task rarely finishes in one exchange, and the moment the answer
+    lands is when the next instruction is obvious. Drafting it then keeps the desk
+    a step ahead — still as a draft, reviewed like everything else.
+    """
+
+    def _project(self, tmp: str):
+        root = Path(tmp)
+        store = ctxgit.ContextStore(root)
+        store.init(create_initial_branch=False)
+        store.create_branch("sales", title="Sales")
+        ctxgit.write_boss_config(store, ["sales"])
+        return root, store
+
+    def _answer(self, instruction, reason="이유", done=False, mode="info-chat"):
+        return {"instruction": instruction, "reason": reason, "done": done, "suggestedMode": mode}
+
+    def test_the_answer_becomes_a_reviewable_next_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            with _BossModel({"assignments": [{"branch": "sales", "instruction": "견적 만들어줘"}], "summary": ""}):
+                ctxgit.draft_boss_assignments(root, store, "이번 주 견적 마무리")
+            ctxgit.dispatch_boss_items(root, store, _BossJobs(), [
+                {"branch": "sales", "instruction": "견적 만들어줘", "mode": "send"},
+            ])
+            store.append_history("sales", "assistant", "견적 초안 만들었고 단가는 확인 못 했습니다.")
+            with _BossModel(self._answer("단가는 어디서 막혔는지 알려줘", "단가 확인이 빠졌습니다")) as model:
+                ctxgit.draft_boss_followup(root, store, "sales")
+            # Written against what was asked and what was last said, not in a vacuum.
+            self.assertIn("이번 주 견적 마무리", model.prompts[0])
+            self.assertIn("견적 만들어줘", model.prompts[0])
+            self.assertIn("단가는 확인 못", model.prompts[0])
+            items = ctxgit.boss_pending_items(store)
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0]["origin"], "followup")
+            self.assertEqual(items[0]["instruction"], "단가는 어디서 막혔는지 알려줘")
+            self.assertIn("단가", items[0]["reason"])
+            self.assertEqual(items[0]["request"], "이번 주 견적 마무리")
+            # Nothing is sent: it waits for approval like any other draft.
+            self.assertEqual(len(list(store.iter_history("sales"))), 1)
+
+    def test_a_finished_turn_schedules_the_next_draft(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            jobs = _BossJobs()
+            original = ctxgit.run_history_chat_turn
+            ctxgit.run_history_chat_turn = lambda *a, **k: {"ok": True}
+            try:
+                ctxgit.dispatch_boss_items(root, store, jobs, [
+                    {"branch": "sales", "instruction": "질문", "mode": "info-chat"},
+                ])
+                jobs.created[0]["work"](lambda message: None)  # the branch turn finishes
+            finally:
+                ctxgit.run_history_chat_turn = original
+            self.assertEqual(
+                [(c["kind"], c["branch"]) for c in jobs.created],
+                [("info-chat", "sales"), ("boss-followup", ctxgit.boss_followup_job_key("sales"))],
+            )
+
+    def test_a_failed_turn_schedules_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            jobs = _BossJobs()
+            original = ctxgit.run_history_chat_turn
+
+            def boom(*a, **k):
+                raise RuntimeError("provider down")
+
+            ctxgit.run_history_chat_turn = boom
+            try:
+                ctxgit.dispatch_boss_items(root, store, jobs, [
+                    {"branch": "sales", "instruction": "질문", "mode": "info-chat"},
+                ])
+                with self.assertRaises(RuntimeError):
+                    jobs.created[0]["work"](lambda message: None)
+            finally:
+                ctxgit.run_history_chat_turn = original
+            self.assertEqual(len(jobs.created), 1)
+
+    def test_a_branch_outside_the_selection_gets_no_follow_up(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            store.create_branch("stranger")
+            store.append_history("stranger", "assistant", "답")
+            self.assertEqual(ctxgit.draft_boss_followup(root, store, "stranger"), {})
+            self.assertEqual(ctxgit.boss_pending_items(store), [])
+
+    def test_a_branch_that_never_answered_gets_no_follow_up(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            self.assertEqual(ctxgit.draft_boss_followup(root, store, "sales"), {})
+
+    def test_a_follow_up_replaces_that_branch_s_pending_item(self) -> None:
+        # One line per branch on the board; a second answer supersedes the first.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            store.append_history("sales", "assistant", "1차 답변")
+            with _BossModel(self._answer("첫 후속")):
+                ctxgit.draft_boss_followup(root, store, "sales")
+            ctxgit.dispatch_boss_items(root, store, _BossJobs(), [
+                {"branch": "sales", "instruction": "첫 후속", "mode": "info-chat"},
+            ])
+            with _BossModel(self._answer("두 번째 후속", done=True)):
+                ctxgit.draft_boss_followup(root, store, "sales")
+            items = ctxgit.boss_pending_items(store)
+            self.assertEqual([i["instruction"] for i in items], ["두 번째 후속"])
+            self.assertTrue(items[0]["done"])
+
+    def test_a_follow_up_does_not_overwrite_what_the_user_queued_meanwhile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            ctxgit.dispatch_boss_items(root, store, _BossJobs(), [
+                {"branch": "sales", "instruction": "먼저 이거", "mode": "info-chat"},
+            ])
+            store.append_history("sales", "assistant", "답변")
+            # While the branch was working, a new request produced a newer draft.
+            ctxgit.upsert_boss_items(store, [ctxgit.new_boss_item("sales", "새 요청에서 온 초안", createdAt="9999")])
+            with _BossModel(self._answer("후속")):
+                self.assertEqual(ctxgit.draft_boss_followup(root, store, "sales"), {})
+            self.assertEqual(ctxgit.boss_pending_items(store)[0]["instruction"], "새 요청에서 온 초안")
+
+    def test_boss_jobs_do_not_notify_as_branch_completions(self) -> None:
+        source = Path(ctxgit.__file__).read_text(encoding="utf-8")
+        self.assertIn('str(job.get("mode") or "").startswith("boss")', source)

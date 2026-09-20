@@ -34,6 +34,7 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import socketserver
 import subprocess
 import sys
@@ -97,12 +98,26 @@ DEFAULT_RESEARCH_MIN_PAPERS = 3
 DEFAULT_RESEARCH_MAX_SOURCES = 24
 DEFAULT_RESEARCH_MAX_FETCHES = 8
 DEFAULT_CODEX_SANDBOX = "workspace-write"
-ALLOWED_CODEX_SANDBOXES = {"read-only", "workspace-write", "danger-full-access"}
+#: The opt-out value. On Codex it is the sandbox level; on Claude it selects the
+#: permission mode (see claude_permission_mode). One setting, same meaning on both.
+SANDBOX_FULL_ACCESS = "danger-full-access"
+ALLOWED_CODEX_SANDBOXES = {"read-only", "workspace-write", SANDBOX_FULL_ACCESS}
+#: How much Codex says, and how hard it thinks before saying it. Separate sets
+#: because effort goes further than verbosity does.
+CODEX_VERBOSITY_LEVELS = {"low", "medium", "high"}
+#: Matched to Claude's answer length, with thinking pushed past `high` for the
+#: code and analysis these turns actually do.
+DEFAULT_CODEX_VERBOSITY = "medium"
+DEFAULT_CODEX_REASONING = "xhigh"
+CODEX_REASONING_LEVELS = {"low", "medium", "high", "xhigh", "max", "ultra"}
 APPROVAL_STATUSES = {"approved", "denied"}
 PROJECT_ENV_ALLOWED_KEYS = {
     "BRAVE_API_KEY",
     "TELEGRAM_BOT_TOKEN",
     "TELEGRAM_CHAT_ID",
+    # Who may drive ctxgit from that chat. Absent means everyone in it, which is
+    # only safe for a private one-to-one chat.
+    "TELEGRAM_ALLOWED_USER_IDS",
 }
 REPO_ENV_FILES = (".env",)
 PROJECT_ENV_FILES = (".ctxgit/.env", ".env")
@@ -854,6 +869,82 @@ def apply_codex_extension_mcps(cmd: list[str], root: Path) -> None:
         cmd.extend(["-c", f'mcp_servers.{name}.default_tools_approval_mode="approve"'])
 
 
+def apply_codex_output_depth(cmd: list[str], config: dict[str, Any]) -> None:
+    """Raise Codex's verbosity and reasoning off their defaults.
+
+    Every Codex model ships `default_verbosity: "low"`, and the frontier ones
+    (`gpt-5.6-sol`, `gpt-6-astra`) also default to `reasoning: "low"` — the
+    shortest, shallowest combination on offer. ctxgit set neither, so the same
+    prompt that made Claude write a page made Codex answer in three lines and leave
+    out what it had found. The settings are named here rather than left to the model
+    defaults because a ctxgit answer is a record someone reads later, which is the
+    opposite of what "low" is tuned for.
+
+    Verbosity is set to match Claude's answer length rather than maxed; effort is
+    pushed past `high` because the work these turns do is code and analysis, which
+    is what the deeper levels are for. Both are configurable per provider, since
+    depth costs time and money.
+    """
+    verbosity = str(config.get("verbosity") or DEFAULT_CODEX_VERBOSITY).strip()
+    effort = str(config.get("reasoningEffort") or DEFAULT_CODEX_REASONING).strip()
+    if verbosity in CODEX_VERBOSITY_LEVELS:
+        cmd.extend(["-c", f"model_verbosity={json.dumps(verbosity)}"])
+    if effort in CODEX_REASONING_LEVELS:
+        cmd.extend(["-c", f"model_reasoning_effort={json.dumps(effort)}"])
+
+
+def ctxgit_runtime_directive(*, writable: bool) -> str:
+    """The standing contract a ctxgit turn runs under.
+
+    Read-only turns are told not to push, publish or deploy. Writable turns are
+    not: a send-mode turn is the one the user opened precisely so the agent could
+    finish the job, and the ban meant it would build, test and commit and then stop
+    at the last step to report that it was not allowed to ship. Refusing there is
+    not a safety boundary — the sandbox and the approval gate are — it was only a
+    sentence that made the turn useless at the end.
+
+    The outside-workspace rule stays in both: writes beyond the project still go
+    through approvalRequests, which is a mechanism rather than a request.
+    """
+    opening = (
+        "You are running inside ctxgit."
+        if writable
+        else "You are running inside ctxgit. Do not push, publish, or deploy."
+    )
+    return (
+        f"{opening} Do not modify files outside the current working directory and "
+        "explicitly added directories. Respect the requested read-only or writable "
+        "mode. Return the required structured output."
+    )
+
+
+def apply_codex_session_config(
+    cmd: list[str],
+    root: Path,
+    *,
+    developer_extra: str = "",
+    writable: bool = True,
+) -> None:
+    """Give Codex the same high-priority ctxgit contract Claude receives.
+
+    `developer_instructions` is a native Codex configuration field, so standing
+    rules no longer have to compete with history inside the user prompt.
+    """
+    config = read_llm_config(root).get("codex", {})
+    active_exts = active_extensions()
+    directive = ctxgit_runtime_directive(writable=writable) + RECORD_VOICE_SYSTEM_DIRECTIVE
+    if active_exts:
+        names = ", ".join(f"{ext.NAME} (MCP server {ext.ID})" for ext in active_exts)
+        directive += (
+            f" These integrations are available through MCP: {names}. Use them "
+            "when the user asks about that data."
+        )
+    if developer_extra:
+        directive += developer_extra
+    cmd.extend(["-c", "developer_instructions=" + json.dumps(directive)])
+    apply_codex_output_depth(cmd, config)
+
+
 def run_google_auth() -> int:
     """One-time OAuth (loopback) to grant ctxgit read-only Gmail + Drive access.
 
@@ -911,13 +1002,27 @@ def run_google_auth() -> int:
     return 0
 
 
-def send_telegram_message(token: str, chat_id: str, text: str, timeout: int = 8) -> None:
-    """Send a Telegram text message via the Bot API. Raises on failure."""
+def send_telegram_message(
+    token: str,
+    chat_id: str,
+    text: str,
+    timeout: int = 8,
+    reply_to: int | None = None,
+) -> int:
+    """Send a Telegram text message via the Bot API. Raises on failure.
+
+    Returns the sent message's id, which is what lets a later reply to it be
+    resolved back to the branch it came from.
+    """
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode("utf-8")
+    fields: dict[str, Any] = {"chat_id": chat_id, "text": text}
+    if reply_to:
+        fields["reply_to_message_id"] = reply_to
+    data = urllib.parse.urlencode(fields).encode("utf-8")
     request = urllib.request.Request(url, data=data, method="POST")
     with urllib.request.urlopen(request, timeout=timeout) as response:
-        response.read()
+        payload = json.loads(response.read().decode("utf-8") or "{}")
+    return int(((payload.get("result") or {}).get("message_id")) or 0)
 
 
 def send_telegram_document(
@@ -927,7 +1032,8 @@ def send_telegram_document(
     content: bytes,
     caption: str = "",
     timeout: int = 20,
-) -> None:
+    reply_to: int | None = None,
+) -> int:
     """Upload a document to a Telegram chat via the Bot API. Raises on failure.
 
     Used to deliver long content (e.g. an answer) as a .txt attachment so the
@@ -945,6 +1051,8 @@ def send_telegram_document(
         parts.append(value.encode("utf-8"))
 
     field("chat_id", chat_id)
+    if reply_to:
+        field("reply_to_message_id", str(reply_to))
     if caption:
         field("caption", caption)
     parts.append(f"--{boundary}".encode("utf-8"))
@@ -964,7 +1072,8 @@ def send_telegram_document(
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
-        response.read()
+        payload = json.loads(response.read().decode("utf-8") or "{}")
+    return int(((payload.get("result") or {}).get("message_id")) or 0)
 
 
 def job_answer_text(job: dict[str, Any]) -> str:
@@ -991,6 +1100,64 @@ def job_branch_label(job: dict[str, Any]) -> str:
     return str(job.get("mode") or job.get("kind") or "job").strip() or "job"
 
 
+#: Telegram message id -> the branch that message was about, so replying to a
+#: notification in the chat addresses that branch without naming it. Kept on disk
+#: because the notification usually outlives the server process that sent it.
+TELEGRAM_REPLY_MAP_RELPATH = (".ctxgit", "telegram-replies.json")
+
+
+def telegram_reply_map_path(root: Path) -> Path:
+    return root.joinpath(*TELEGRAM_REPLY_MAP_RELPATH)
+
+
+def read_telegram_reply_map(root: Path) -> dict[str, str]:
+    path = telegram_reply_map_path(root)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+
+
+def remember_telegram_reply(root: Path, message_id: int, branch_id: str) -> None:
+    if not message_id or not branch_id:
+        return
+    mapping = read_telegram_reply_map(root)
+    mapping[str(message_id)] = branch_id
+    # Only recent notifications are worth answering; the rest is dead weight.
+    if len(mapping) > 500:
+        mapping = dict(list(mapping.items())[-500:])
+    with contextlib.suppress(OSError):
+        dump_json(telegram_reply_map_path(root), mapping)
+
+
+def branch_for_telegram_reply(root: Path, message_id: int | None) -> str:
+    if not message_id:
+        return ""
+    return read_telegram_reply_map(root).get(str(message_id), "")
+
+
+def telegram_remote_config(root: Path) -> tuple[str, str, set[int]]:
+    """Bot token, chat id, and the user ids allowed to drive ctxgit from chat.
+
+    The allowlist is separate from the chat id because a group can gain members:
+    matching the chat alone would hand whoever is added the same control over this
+    machine that the owner has. An empty allowlist means "anyone in that chat",
+    which is only safe for a private one-to-one chat.
+    """
+    token, chat_id = telegram_config_for_root(root)
+    users: set[int] = set()
+    with contextlib.suppress(Exception):
+        values, _ = read_project_env(root)
+        raw = str(values.get("TELEGRAM_ALLOWED_USER_IDS", "") or "")
+        for piece in re.split(r"[,\s]+", raw):
+            if piece.strip().isdigit():
+                users.add(int(piece.strip()))
+    return token, chat_id, users
+
+
 def notify_job_completion_telegram(job: dict[str, Any]) -> None:
     """Fire a best-effort Telegram message that a branch's job completed.
 
@@ -998,6 +1165,10 @@ def notify_job_completion_telegram(job: dict[str, Any]) -> None:
     """
     try:
         if not telegram_notify_enabled():
+            return
+        # Boss drafting is desk bookkeeping, not a branch finishing its work; the
+        # branch turn it leads to sends its own notification.
+        if str(job.get("mode") or "").startswith("boss"):
             return
         root_value = str(job.get("projectPath") or "").strip()
         if not root_value:
@@ -1009,17 +1180,21 @@ def notify_job_completion_telegram(job: dict[str, Any]) -> None:
         caption = f'✅ ctxgit: branch "{label}" complete'
         answer = job_answer_text(job)
 
+        branch_id = str(job.get("branch") or "")
+
         def worker() -> None:
             try:
                 if answer:
                     # Deliver the answer as a .txt attachment so long output does
                     # not clutter the chat; the short status rides along as caption.
                     filename = f"{slugify(label, fallback='branch')}-answer.txt"
-                    send_telegram_document(
+                    message_id = send_telegram_document(
                         token, chat_id, filename, answer.encode("utf-8"), caption=caption
                     )
                 else:
-                    send_telegram_message(token, chat_id, caption)
+                    message_id = send_telegram_message(token, chat_id, caption)
+                # Replying to this message in the chat continues that branch.
+                remember_telegram_reply(Path(root_value), message_id, branch_id)
             except Exception:  # noqa: BLE001 - best-effort notification
                 pass
 
@@ -2044,6 +2219,64 @@ class ContextStore:
                 selected.append(doc_id)
         return selected
 
+    def set_branch_llm(self, branch_id: str, updates: dict[str, Any]) -> dict[str, Any]:
+        """Pin some provider settings to one branch, or hand them back to the project.
+
+        A key sent as null (or an empty string) is removed rather than stored, so a
+        branch returns to following the project instead of being frozen at whatever
+        the project said when the override was written.
+        """
+        paths = self.branch_paths(branch_id)
+        if not paths.root.exists():
+            die(f"branch does not exist: {branch_id}")
+        meta = load_json(paths.meta)
+        current = meta.get("llm") if isinstance(meta.get("llm"), dict) else {}
+        override = {key: current[key] for key in BRANCH_LLM_OVERRIDE_KEYS if key in current}
+        for key in BRANCH_LLM_OVERRIDE_KEYS:
+            if key not in updates:
+                continue
+            value = updates[key]
+            if value is None or (isinstance(value, str) and not value.strip()):
+                override.pop(key, None)
+                continue
+            if key == "provider":
+                provider = str(value).strip().lower()
+                if provider not in {"codex", "claude"}:
+                    raise ValueError("provider must be codex or claude")
+                override["provider"] = provider
+            elif key == "model":
+                override["model"] = str(value).strip()
+            elif key == "sandbox":
+                sandbox = str(value).strip()
+                if sandbox not in ALLOWED_CODEX_SANDBOXES:
+                    raise ValueError(f"sandbox must be one of: {', '.join(sorted(ALLOWED_CODEX_SANDBOXES))}")
+                override["sandbox"] = sandbox
+            elif key == "orchestration":
+                mode = str(value).strip().lower()
+                if mode not in ORCHESTRATION_MODES:
+                    raise ValueError(f"orchestration must be one of: {', '.join(sorted(ORCHESTRATION_MODES))}")
+                override["orchestration"] = mode
+            elif key == "webSearch":
+                override["webSearch"] = value is True
+            elif key == "timeoutSeconds":
+                seconds = coerce_positive_int(value, 0)
+                if seconds <= 0:
+                    raise ValueError("timeoutSeconds must be a positive integer")
+                override["timeoutSeconds"] = seconds
+        # A model only means something next to the provider that offers it.
+        provider = str(override.get("provider") or "")
+        if "model" in override and provider:
+            allowed = {item["id"] for item in LLM_PROVIDER_MODELS[provider]}
+            if override["model"] not in allowed:
+                raise ValueError(f"model must be one of: {', '.join(sorted(allowed))}")
+        if override:
+            meta["llm"] = override
+        else:
+            meta.pop("llm", None)
+        meta["updatedAt"] = utc_now()
+        dump_json(paths.meta, meta)
+        return override
+
     def set_branch_guiding(self, branch_id: str, doc_ids: list[str]) -> list[str]:
         self.require_initialized()
         paths = self.branch_paths(branch_id)
@@ -2359,6 +2592,36 @@ class ContextStore:
         meta["updatedAt"] = now
         dump_json(target_paths.meta, meta)
         self.write_index()
+
+    def create_branch_from_boss_chat(self, branch_id: str, title: str | None = None) -> Path:
+        """Start a branch from the boss chat, seeded with what was handed out.
+
+        Marked `createdFromBossChat` so the sidebar can badge it: these branches
+        are made mid-delegation and would otherwise be indistinguishable from the
+        long-running work around them.
+        """
+        self.require_initialized()
+        records = iter_boss_history(self)
+        parent = "initial" if self.branch_paths("initial").root.exists() else None
+        self.create_branch_files(branch_id, title=title, parent=parent, tags=["from-boss-chat"])
+        paths = self.branch_paths(branch_id)
+        if records:
+            write_text(
+                paths.history,
+                "".join(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n" for r in records),
+            )
+        meta = load_json(paths.meta)
+        meta["createdFromBossChat"] = True
+        dump_json(paths.meta, meta)
+        self.write_index()
+        return paths.root
+
+    def reset_boss_chat(self) -> None:
+        """Clear the boss conversation and any draft waiting for review."""
+        self.require_initialized()
+        boss_dir(self).mkdir(parents=True, exist_ok=True)
+        write_text(boss_history_path(self), "")
+        clear_boss_draft(self)
 
     def create_branch_from_context_chat(self, branch_id: str, title: str | None = None) -> Path:
         """Create a fresh branch seeded with the top-level contexts chat.
@@ -3984,6 +4247,10 @@ class ContextStore:
             "updatedAt": meta.get("updatedAt"),
             "lastMessageAt": last_message_at,
             "lastUserMessageAt": last_user_message_at,
+            # Branches spun out of boss chat are badged in the sidebar: they are
+            # created mid-delegation and would otherwise be indistinguishable from
+            # the long-running work around them.
+            "fromBossChat": meta.get("createdFromBossChat") is True,
             "historyCount": len(history),
         }
 
@@ -4375,6 +4642,7 @@ class ContextStore:
         acceptance_criteria: list[str] | None = None,
         minimum_evaluator_rounds: int | None = None,
         default_max_agent_replies: int | None = None,
+        llm: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         paths = self.branch_paths(branch_id)
         meta = load_json(paths.meta)
@@ -4401,6 +4669,35 @@ class ContextStore:
             if normalized_access not in {"send", "info-chat"}:
                 raise ValueError("participant access mode must be send or info-chat")
             participant["accessMode"] = normalized_access
+        if llm is not None:
+            # Each seat can name its own provider and model. A key sent empty is
+            # removed, so that seat goes back to whatever the room resolves to
+            # rather than freezing today's value.
+            current = participant.get("llm") if isinstance(participant.get("llm"), dict) else {}
+            override = {key: current[key] for key in ("provider", "model") if key in current}
+            for key in ("provider", "model"):
+                if key not in llm:
+                    continue
+                value = llm[key]
+                if value is None or not str(value).strip():
+                    override.pop(key, None)
+                    continue
+                if key == "provider":
+                    provider_id = str(value).strip().lower()
+                    if provider_id not in {"codex", "claude"}:
+                        raise ValueError("provider must be codex or claude")
+                    override["provider"] = provider_id
+                else:
+                    override["model"] = str(value).strip()
+            chosen = str(override.get("provider") or "")
+            if "model" in override and chosen:
+                allowed = {item["id"] for item in LLM_PROVIDER_MODELS[chosen]}
+                if override["model"] not in allowed:
+                    raise ValueError(f"model must be one of: {', '.join(sorted(allowed))}")
+            if override:
+                participant["llm"] = override
+            else:
+                participant.pop("llm", None)
         if acceptance_criteria is not None:
             config["acceptanceCriteria"] = normalize_sequence_acceptance_criteria(acceptance_criteria)
         if minimum_evaluator_rounds is not None:
@@ -4860,6 +5157,15 @@ class ContextStore:
         tail_records = recent_history_tail(uncompacted_records, keep_tail)
         compact_records = uncompacted_records[: max(0, len(uncompacted_records) - len(tail_records))]
         if len(compact_records) < min_records:
+            return None
+        # The gate above measures everything uncompacted, but a compaction only
+        # consumes what sits *above* the tail it keeps. With the threshold and the
+        # tail budget both at 40k, a branch that compacted once came back holding a
+        # 40k tail — already at the threshold — so the next single message crossed
+        # it again and every turn from then on paid for a model call that folded up
+        # one or two records. Require the material actually being folded to be worth
+        # the call, which is what puts a gap between compactions.
+        if history_records_char_count(compact_records) < threshold:
             return None
         paths.compactions.mkdir(parents=True, exist_ok=True)
         now = utc_now()
@@ -5735,6 +6041,8 @@ def default_llm_config() -> dict[str, Any]:
             "bin": "codex",
             "model": "gpt-5.6-sol",
             "webSearch": True,
+            "verbosity": DEFAULT_CODEX_VERBOSITY,
+            "reasoningEffort": DEFAULT_CODEX_REASONING,
             "sandbox": DEFAULT_CODEX_SANDBOX,
             "timeoutSeconds": 900,
             "contextBudgetCharacters": DEFAULT_CONTEXT_BUDGET_CHARS,
@@ -5764,34 +6072,145 @@ def default_llm_config() -> dict[str, Any]:
 LLM_PROVIDER_MODELS = {
     # GPT-5.6 has three tiers (like Claude) -> keep all three.
     "codex": [
-        {"id": "gpt-5.6-sol", "label": "GPT-5.6 Sol (frontier)"},
+        {"id": "gpt-6-astra", "label": "GPT-6 Astra (frontier)"},
+        {"id": "gpt-5.6-sol", "label": "GPT-5.6 Sol"},
         {"id": "gpt-5.6-terra", "label": "GPT-5.6 Terra (balanced)"},
         {"id": "gpt-5.6-luna", "label": "GPT-5.6 Luna (fast)"},
     ],
-    # Claude has tiers -> keep the best three. These CLI aliases auto-resolve to
-    # the latest model in each tier, so they stay current without hardcoding IDs.
+    # Claude tiers, most capable first. These CLI aliases auto-resolve to the
+    # latest model in each tier, so they stay current without hardcoding IDs.
+    # The `[1m]` variants ask for the 1M-token context window; Claude Code only
+    # accepts them on an account entitled to it, so they are offered as separate
+    # choices instead of silently becoming the default.
     "claude": [
+        {"id": "fable", "label": "Claude Fable (most capable)"},
+        {"id": "fable[1m]", "label": "Claude Fable (1M context)"},
         {"id": "opus", "label": "Claude Opus (latest)"},
+        {"id": "opus[1m]", "label": "Claude Opus (1M context)"},
         {"id": "sonnet", "label": "Claude Sonnet (latest)"},
         {"id": "haiku", "label": "Claude Haiku (latest)"},
     ],
 }
 
+#: Claude tier aliases, cheapest first. The agent library states a role's tier in
+#: this vocabulary, and the provider config stores one of these ids (possibly with
+#: a `[1m]` context suffix).
+CLAUDE_MODEL_TIERS = ("haiku", "sonnet", "opus", "fable")
 
-def read_llm_config(root: Path) -> dict[str, Any]:
+#: The tier the agent library uses to mean "the frontier model". The roles were
+#: written when Opus was the top tier, so a role asking for Opus is asking for
+#: whatever the project selected as its main model — see claude_stage_model.
+CLAUDE_LEAD_TIER = "opus"
+
+
+def claude_model_tier(model: Any) -> str:
+    """The bare tier alias behind a `--model` value (`opus[1m]` -> `opus`)."""
+    return re.sub(r"\[\d+m\]$", "", str(model or "").strip().lower())
+
+
+def claude_stage_model(role_model: Any, configured: Any) -> str:
+    """Which model one team-pipeline stage should run on.
+
+    A role's declared tier is relative, not absolute: it says "this stage needs the
+    frontier model" or "cheap is fine". So the project's selection is both a floor
+    and a ceiling for the frontier roles — picking Fable has to actually reach the
+    stages that asked for the top tier, and picking Haiku must not be overruled by a
+    role that asks for Opus. Cheaper roles stay cheap.
+    """
+    role_model = str(role_model or "").strip()
+    configured = str(configured or "").strip()
+    if not role_model:
+        return configured
+    tier = claude_model_tier(role_model)
+    ceiling = claude_model_tier(configured)
+    if tier not in CLAUDE_MODEL_TIERS or ceiling not in CLAUDE_MODEL_TIERS:
+        # A pinned model id on either side is a deliberate choice; honor the role's.
+        return role_model
+    threshold = min(
+        CLAUDE_MODEL_TIERS.index(CLAUDE_LEAD_TIER), CLAUDE_MODEL_TIERS.index(ceiling)
+    )
+    if CLAUDE_MODEL_TIERS.index(tier) >= threshold:
+        return configured
+    return role_model
+
+
+#: What one branch may decide for itself. Everything else stays project-wide.
+#:
+#: `provider` picks which CLI answers; the rest are settings of whichever provider
+#: ends up active, so a branch pinned to Fable does not also drag its timeout onto
+#: the project's Codex turns.
+BRANCH_LLM_OVERRIDE_KEYS = (
+    "provider",
+    "model",
+    "sandbox",
+    "webSearch",
+    "orchestration",
+    "timeoutSeconds",
+)
+
+
+def branch_llm_override(root: Path, branch_id: str) -> dict[str, Any]:
+    """A branch's own provider settings, or `{}` if it follows the project.
+
+    Only keys the user actually set are stored, so "follow the project" stays the
+    default forever rather than being frozen to whatever the project happened to
+    say the day the branch was made.
+    """
+    if not branch_id:
+        return {}
+    with contextlib.suppress(Exception):
+        store = ContextStore(root)
+        meta = load_json(store.branch_paths_for_read(branch_id).meta)
+        raw = meta.get("llm")
+        if isinstance(raw, dict):
+            return {key: raw[key] for key in BRANCH_LLM_OVERRIDE_KEYS if key in raw}
+    return {}
+
+
+def branch_provider_authority(root: Path, branch_id: str, requested: str | None) -> str | None:
+    """Which provider a branch turn runs on when the caller also named one.
+
+    A pinned branch wins. The request carries a provider because the UI needs one
+    for worker routing, and treating that as authoritative meant a branch pinned to
+    Claude was answered by Codex — the pin was read only when nobody had said
+    anything, which is almost never. Worker routing is Codex-only and drops out with
+    it, which is correct: a Claude branch has no worker to hand the turn to.
+    """
+    pinned = str(branch_llm_override(root, branch_id).get("provider") or "").strip().lower()
+    return pinned or requested
+
+
+def read_llm_config(root: Path, branch_id: str = "") -> dict[str, Any]:
+    """The provider settings in force, optionally as one branch sees them.
+
+    Called without a branch this is the project configuration, which is what every
+    project-level surface wants. Called with one, that branch's overrides are laid
+    on top — which is how a single branch can sit on a different model without the
+    rest of the project following it there.
+    """
     config = load_json(root / ".ctxgit" / "config.json")
     defaults = default_llm_config()
     llm = config.get("llm")
     if not isinstance(llm, dict):
-        return defaults
+        llm = {}
     raw_codex = llm.get("codex") if isinstance(llm.get("codex"), dict) else {}
     raw_claude = llm.get("claude") if isinstance(llm.get("claude"), dict) else {}
     codex = {**defaults["codex"], **raw_codex}
     claude = {**defaults["claude"], **raw_claude}
+    provider = str(llm.get("provider") or defaults["provider"])
+
+    override = branch_llm_override(root, branch_id)
+    if override:
+        provider = str(override.get("provider") or provider)
+        active = claude if provider == "claude" else codex
+        for key in BRANCH_LLM_OVERRIDE_KEYS:
+            if key != "provider" and key in override:
+                active[key] = override[key]
+
     codex["model"] = str(codex.get("model") or defaults["codex"]["model"])
     claude["model"] = str(claude.get("model") or defaults["claude"]["model"])
     return {
-        "provider": str(llm.get("provider") or defaults["provider"]),
+        "provider": provider,
         "codex": codex,
         "claude": claude,
     }
@@ -5853,6 +6272,30 @@ def codex_sandbox_mode(codex_config: dict[str, Any]) -> str:
     return sandbox if sandbox in ALLOWED_CODEX_SANDBOXES else DEFAULT_CODEX_SANDBOX
 
 
+def claude_permission_mode(claude_config: dict[str, Any], *, writable: bool) -> str:
+    """Which `--permission-mode` a Claude session runs under.
+
+    A writable session normally goes through Claude Code's auto-mode classifier,
+    which decides per command and is not deterministic: the same `gh pr merge` is
+    allowed one day and "Blocked by classifier" the next, read-only commands get
+    refused, and once a session has collected refusals it starts refusing things it
+    had already allowed. That is fine for an interactive session where a person can
+    approve the prompt, and wrong for ctxgit, which runs `-p` with nobody there.
+
+    The sandbox setting is the opt-out, and it is the same value Codex already takes
+    for its own sandbox, so one setting reads the same way on both providers. It is
+    deliberately not the default: full access means an agent turn can run any command
+    the account can run.
+
+    Read-only sessions bypass too, as they always have — their restriction is carried
+    by the tool denylist, so the classifier has nothing left to decide.
+    """
+    if not writable:
+        return "bypassPermissions"
+    sandbox = str(claude_config.get("sandbox") or DEFAULT_CODEX_SANDBOX).strip()
+    return "bypassPermissions" if sandbox == SANDBOX_FULL_ACCESS else "auto"
+
+
 def bundled_codex_binary() -> Path | None:
     if os.name != "nt":
         return None
@@ -5894,6 +6337,32 @@ def display_codex_command(root: Path) -> str:
     return " ".join(shlex.quote(part) for part in resolve_codex_command(root))
 
 
+_CODEX_APP_SERVER_SUPPORT: dict[tuple[str, ...], bool] = {}
+
+
+def codex_app_server_supported(root: Path) -> bool:
+    """Whether this installed CLI exposes the steerable app-server transport."""
+    command = tuple(resolve_codex_command(root))
+    if command in _CODEX_APP_SERVER_SUPPORT:
+        return _CODEX_APP_SERVER_SUPPORT[command]
+    try:
+        completed = subprocess.run(
+            [*command, "app-server", "--help"],
+            cwd=root,
+            check=False,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=10,
+        )
+        supported = completed.returncode == 0 and "--listen" in (completed.stdout or "")
+    except (OSError, subprocess.SubprocessError, ValueError):
+        supported = False
+    _CODEX_APP_SERVER_SUPPORT[command] = supported
+    return supported
+
+
 def resolve_claude_command(root: Path) -> list[str]:
     override = os.environ.get("CTXGIT_CLAUDE_BIN")
     if override:
@@ -5930,6 +6399,7 @@ def claude_login_status(root: Path) -> dict[str, Any]:
             "orchestration": orchestration_mode(root, "claude"),
             "sandbox": str(config.get("sandbox") or DEFAULT_CODEX_SANDBOX),
             "timeoutSeconds": coerce_positive_int(config.get("timeoutSeconds"), 900),
+            "supportsInterjection": False,
             "envFiles": env_status.get("files", []),
         }
     raw = (completed.stdout or completed.stderr).strip()
@@ -5951,6 +6421,7 @@ def claude_login_status(root: Path) -> dict[str, Any]:
         "orchestration": orchestration_mode(root, "claude"),
         "sandbox": str(config.get("sandbox") or DEFAULT_CODEX_SANDBOX),
         "timeoutSeconds": coerce_positive_int(config.get("timeoutSeconds"), 900),
+        "supportsInterjection": True,
         "auth": auth,
         "envFiles": env_status.get("files", []),
     }
@@ -5977,6 +6448,9 @@ def provider_status(root: Path) -> dict[str, Any]:
                     "loginCommand": "claude auth login" if name == "claude" else "codex login --device-auth",
                     "model": str(config.get("model") or ""),
                 }
+    if statuses.get("codex", {}).get("ok") is True:
+        supported = codex_app_server_supported(root)
+        statuses["codex"]["supportsInterjection"] = supported
     active = dict(statuses.get(provider) or statuses["codex"])
     active["providers"] = [
         {
@@ -6036,6 +6510,7 @@ def codex_login_status(root: Path) -> dict[str, Any]:
             "orchestration": orchestration_mode(root, "codex"),
             "sandbox": codex_sandbox_mode(codex_config),
             "timeoutSeconds": timeout_seconds,
+            "supportsInterjection": False,
             "braveApiKeyConfigured": brave_configured,
             "braveApiKeySource": brave_source,
             "envFiles": env_status.get("files", []),
@@ -6053,6 +6528,7 @@ def codex_login_status(root: Path) -> dict[str, Any]:
         "orchestration": orchestration_mode(root, "codex"),
         "sandbox": codex_sandbox_mode(codex_config),
         "timeoutSeconds": coerce_positive_int(codex_config.get("timeoutSeconds"), 900),
+        "supportsInterjection": False,
         "braveApiKeyConfigured": brave_configured,
         "braveApiKeySource": brave_source,
         "envFiles": env_status.get("files", []),
@@ -6079,6 +6555,10 @@ def call_codex_history_compaction(
     counts = ", ".join(f"{role}={count}" for role, count in sorted(role_counts.items()))
     start = records[0].get("createdAt", "") if records else ""
     end = records[-1].get("createdAt", "") if records else ""
+    # A compaction is written once and then re-injected into every later prompt, so
+    # a summary written without the branch's guiding knowledge keeps contradicting
+    # it for the rest of the branch's life.
+    guiding_context = guiding_context_sections(store, branch_id, DEFAULT_GUIDING_BUDGET_CHARS)
     prompt = "\n".join(
         [
             "You are compacting older ctxgit conversation history into durable branch memory.",
@@ -6088,6 +6568,7 @@ def call_codex_history_compaction(
             "source references, file/artifact references, constraints, and changes in direction.",
             "Separate stable memory from ephemeral chatter and mark uncertainty explicitly.",
             "",
+            *guiding_prompt_parts(guiding_context),
             "Return Markdown only with these sections:",
             "- Metadata",
             "- Durable Memory",
@@ -6106,11 +6587,22 @@ def call_codex_history_compaction(
             "<history_records>",
             formatted_records,
             "</history_records>",
+            "",
+            *guiding_enforcement_parts(guiding_context),
         ]
     )
     with tempfile.TemporaryDirectory(prefix="ctxgit-compact-") as tmp:
         output_path = Path(tmp) / "compaction.md"
         cmd = resolve_codex_command(root)
+        apply_codex_extension_mcps(cmd, root)
+        apply_codex_session_config(
+            cmd,
+            root,
+            developer_extra=guiding_system_directive(guiding_context),
+            writable=False,
+        )
+        if codex_config.get("webSearch") is not False:
+            cmd.append("--search")
         cmd.extend(
             [
                 "--ask-for-approval",
@@ -6119,7 +6611,7 @@ def call_codex_history_compaction(
                 "--cd",
                 str(root),
                 "--sandbox",
-                codex_sandbox_mode(codex_config),
+                "read-only",
                 "--output-last-message",
                 str(output_path),
             ]
@@ -6180,11 +6672,18 @@ def call_provider_history_compaction(
     if provider == "codex":
         return call_codex_history_compaction(root, store, branch_id, records)
     formatted = "\n".join(format_history_record(record) for record in records)
+    # See the note in call_codex_history_compaction: a compaction outlives the turn
+    # that wrote it, so it has to obey the same guiding knowledge.
+    guiding_context = guiding_context_sections(store, branch_id, DEFAULT_GUIDING_BUDGET_CHARS)
     prompt = "\n".join([
         "Compact this older ctxgit conversation into durable Markdown memory.",
         "Do not invent facts. Preserve goals, decisions, constraints, sources, unresolved questions, and timeline.",
         "Return the summary in the `assistant` field.",
+        "",
+        *guiding_prompt_parts(guiding_context),
         "<history_records>", formatted, "</history_records>",
+        "",
+        *guiding_enforcement_parts(guiding_context),
     ])
     result = call_claude_prompt(
         root, prompt, cwd=root, writable=False,
@@ -6192,6 +6691,7 @@ def call_provider_history_compaction(
             "type": "object", "additionalProperties": False, "required": ["assistant"],
             "properties": {"assistant": {"type": "string"}},
         },
+        system_extra=guiding_system_directive(guiding_context),
     )
     raw = str(result.get("assistant") or "").strip()
     if not raw:
@@ -6289,19 +6789,90 @@ def guiding_context_sections(store: ContextStore, branch_id: str, budget_chars: 
     return "\n\n".join(sections) or "(none)"
 
 
+def has_guiding_context(guiding_context: str) -> bool:
+    return bool(guiding_context) and guiding_context != "(none)"
+
+
 def guiding_prompt_parts(guiding_context: str) -> list[str]:
-    if not guiding_context or guiding_context == "(none)":
+    if not has_guiding_context(guiding_context):
         return []
     return [
-        "Guiding knowledge switched on for this branch. Treat it as standing",
-        "instructions and established facts that always apply here, at the same",
-        "level as the project instructions. Follow it unless the user overrides it",
-        "in this turn, and say so explicitly when you do:",
+        "Guiding knowledge switched on for this branch. It is binding: treat it as",
+        "standing instructions and established facts that always apply here, ranking",
+        "above the project instructions above and above anything in <history>.",
+        "Earlier replies in this branch may predate it, so they are a record of what",
+        "was said, not examples to imitate. Follow it unless the user overrides it in",
+        "this turn, and say so explicitly when you do:",
         "<guiding_knowledge>",
         guiding_context,
         "</guiding_knowledge>",
         "",
     ]
+
+
+def guiding_system_directive(guiding_context: str) -> str:
+    """The guiding text again, phrased for a provider's system prompt.
+
+    The prompt body is one long user message, so guiding sitting inside it reads
+    as reference material the user pasted rather than a rule the model is under.
+    Providers that accept a system prompt get it there as well; the duplication
+    is the point.
+    """
+    if not has_guiding_context(guiding_context):
+        return ""
+    return "\n".join([
+        "",
+        "",
+        "Guiding knowledge is switched on for this ctxgit branch. It is binding for",
+        "everything you write this turn, wording and word choice included. It",
+        "outranks the conversation history you are shown: earlier replies in this",
+        "branch may have been written before it applied, so do not take their style",
+        "as the standard. Re-read your draft against it before returning.",
+        "<guiding_knowledge>",
+        guiding_context,
+        "</guiding_knowledge>",
+    ])
+
+
+def guiding_enforcement_parts(guiding_context: str) -> list[str]:
+    """A last-position restatement, read immediately before the model answers.
+
+    Position carries this, not repetition. The guiding block sits near the top of
+    the prompt, tens of thousands of characters before the answer gets written,
+    with the branch's own earlier prose in between. This is the last thing read.
+    """
+    if not has_guiding_context(guiding_context):
+        return []
+    return [
+        "Before answering, check your draft against <guiding_knowledge> above. It is",
+        "binding for this branch and outranks the style of anything in <history>.",
+        "Rewrite whatever violates it. Do not mention this check in your answer.",
+        "",
+    ]
+
+
+def chat_guiding_context(store: ContextStore, branch_id: str) -> str:
+    """Guiding text at the chat-turn budget. Shared by the prompt body and the
+    system prompt so both carry the same document set."""
+    config = active_llm_provider_config(store.root)
+    budget = coerce_positive_int(
+        config.get("contextBudgetCharacters"), DEFAULT_CONTEXT_BUDGET_CHARS
+    )
+    return guiding_context_sections(
+        store, branch_id, min(DEFAULT_GUIDING_BUDGET_CHARS, max(4000, budget // 4))
+    )
+
+
+def info_chat_guiding_context(store: ContextStore, branch_id: str) -> str:
+    """Guiding text at the info-chat budget. See `chat_guiding_context`."""
+    config = active_llm_provider_config(store.root)
+    budget = coerce_positive_int(
+        config.get("infoChatBudgetCharacters") or config.get("historyOnlyBudgetCharacters"),
+        DEFAULT_INFO_CHAT_BUDGET_CHARS,
+    )
+    return guiding_context_sections(
+        store, branch_id, min(DEFAULT_GUIDING_BUDGET_CHARS, max(4000, budget // 4))
+    )
 
 
 def source_context_sections(store: ContextStore, branch_id: str, budget_chars: int) -> str:
@@ -6507,6 +7078,44 @@ def recent_history_tail(records: list[dict[str, Any]], budget_chars: int) -> lis
     return select_history_for_budget(records, budget_chars)
 
 
+def raw_history_index(store: ContextStore, branch_id: str, visible_index: int) -> int:
+    """Map an index in the history the UI shows onto one in `history.jsonl`.
+
+    The two drifted apart the moment BTW asides stopped being displayed: the UI
+    counts only what it renders, the file still holds everything, and every
+    index-based action — delete, revise, cut, fork — quietly pointed a few rows off.
+    The createdAt guard caught it and said "record changed before delete; refresh
+    and try again", which reads like a race rather than an off-by-N, so the row
+    simply could not be deleted no matter how often you refreshed.
+    """
+    if visible_index < 0:
+        return visible_index
+    seen = -1
+    for raw_index, record in enumerate(store.iter_history(branch_id)):
+        if record.get("aside"):
+            continue
+        seen += 1
+        if seen == visible_index:
+            return raw_index
+    return visible_index
+
+
+def visible_history_records(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """History minus the BTW asides.
+
+    An aside is a side question asked while a real turn was running. It stays in
+    `history.jsonl` so the branch keeps a full record, but it is not part of the
+    conversation the branch is having: it does not belong in the timeline the user
+    reads, and putting a throwaway lookup in front of the model on every later turn
+    is worse than not recording it at all.
+
+    Filtered here rather than in `iter_history` on purpose — compaction counts raw
+    records by index, so dropping rows upstream would shift what
+    `compacted_history_count` points at.
+    """
+    return [record for record in records if not record.get("aside")]
+
+
 def prompt_history_records(
     store: ContextStore,
     branch_id: str,
@@ -6515,7 +7124,7 @@ def prompt_history_records(
 ) -> tuple[list[dict[str, Any]], int, int]:
     records = list(store.iter_history(branch_id))
     compacted_count = min(store.compacted_history_count(branch_id), len(records))
-    live_records = records[compacted_count:]
+    live_records = visible_history_records(records[compacted_count:])
     selected = select_history_for_budget(live_records, budget_chars, max_records=max_records)
     omitted_live = max(0, len(live_records) - len(selected))
     return selected, compacted_count, omitted_live
@@ -6556,6 +7165,69 @@ def history_budget_from_config(codex_config: dict[str, Any], *keys: str) -> int:
     return DEFAULT_HISTORY_CONTEXT_BUDGET_CHARS
 
 
+#: Kept even when untouched — it holds this branch's real parent, tags, and dates
+#: rather than placeholder prose.
+ALWAYS_KEPT_REPORT_SECTIONS = frozenset({"## Report Metadata"})
+
+
+def markdown_h2_sections(text: str) -> list[tuple[str, str]]:
+    """Split markdown into (heading, body) pairs. The preamble comes first with an
+    empty heading."""
+    sections: list[tuple[str, str]] = []
+    heading = ""
+    buffer: list[str] = []
+    for line in text.splitlines():
+        if line.startswith("## "):
+            sections.append((heading, "\n".join(buffer).strip()))
+            heading = line.strip()
+            buffer = []
+        else:
+            buffer.append(line)
+    sections.append((heading, "\n".join(buffer).strip()))
+    return sections
+
+
+def prune_untouched_report_sections(text: str, template: str) -> str:
+    """Drop branch-report sections still byte-identical to the generated template.
+
+    A fresh report is ~1,200 characters of placeholders ("One-paragraph summary of
+    what this branch currently knows.", empty table rows). Injecting those teaches
+    the model nothing and pushes the instructions that matter further from the
+    answer. Anything the user or the agent actually wrote is kept verbatim, and
+    the dropped headings are still named so an empty section stays visible as
+    empty rather than as missing.
+    """
+    template_bodies = {heading: body for heading, body in markdown_h2_sections(template) if heading}
+    kept: list[str] = []
+    dropped: list[str] = []
+    for heading, body in markdown_h2_sections(text):
+        if not heading:
+            if body:
+                kept.append(body)
+            continue
+        if heading not in ALWAYS_KEPT_REPORT_SECTIONS and template_bodies.get(heading) == body:
+            dropped.append(heading[3:].strip())
+            continue
+        kept.append(f"{heading}\n\n{body}" if body else heading)
+    result = "\n\n".join(part for part in kept if part).strip()
+    if dropped:
+        note = f"_Still at the template default, nothing written yet: {', '.join(dropped)}._"
+        result = f"{result}\n\n{note}".strip() if result else note
+    return result
+
+
+def branch_report_for_prompt(store: ContextStore, branch_id: str) -> str:
+    """The branch report as the model should see it, minus untouched boilerplate."""
+    text = store.context_excerpt(branch_id)
+    meta = load_json(store.branch_paths_for_read(branch_id).meta)
+    try:
+        template = store.default_context_markdown(meta)
+    except KeyError:
+        # A branch.json without id/createdAt predates the template; leave it alone.
+        return text
+    return prune_untouched_report_sections(text, template) or text
+
+
 def build_context_bundle(store: ContextStore, branch_id: str) -> dict[str, str]:
     codex_config = active_llm_provider_config(store.root)
     budget = coerce_positive_int(
@@ -6563,7 +7235,6 @@ def build_context_bundle(store: ContextStore, branch_id: str) -> dict[str, str]:
         DEFAULT_CONTEXT_BUDGET_CHARS,
     )
     project_budget = max(4000, budget // 5)
-    guiding_budget = min(DEFAULT_GUIDING_BUDGET_CHARS, max(4000, budget // 4))
     branch_budget = max(12000, budget // 4)
     source_budget = max(10000, budget // 5)
     resource_budget = max(4000, budget // 12)
@@ -6571,8 +7242,8 @@ def build_context_bundle(store: ContextStore, branch_id: str) -> dict[str, str]:
     history_budget = history_budget_from_config(codex_config, "historyBudgetCharacters")
     history_record_limit = history_record_limit_from_config(codex_config)
     project_context = "\n\n".join(project_context_sections(store, project_budget)).strip()
-    guiding_context = guiding_context_sections(store, branch_id, guiding_budget)
-    branch_context = truncate_middle(store.context_excerpt(branch_id), branch_budget).strip()
+    guiding_context = chat_guiding_context(store, branch_id)
+    branch_context = truncate_middle(branch_report_for_prompt(store, branch_id), branch_budget).strip()
     source_context = source_context_sections(store, branch_id, source_budget)
     resource_context = resource_context_sections(store, branch_id, resource_budget)
     compaction_context = compaction_context_sections(store, branch_id, compaction_budget)
@@ -6594,6 +7265,93 @@ def build_context_bundle(store: ContextStore, branch_id: str) -> dict[str, str]:
         "archives": archive_reference_section(store, branch_id),
         "history": "\n".join(history_lines) or "(none)",
     }
+
+
+#: The conditions a ctxgit answer will be read under, restated at the end of every
+#: prompt that produces user-facing prose.
+#:
+#: Shown a chat timeline and a user message, a model casts itself as the other party
+#: in a live conversation and writes accordingly. That self-image is what is wrong,
+#: not any particular phrasing it produces — so this states the situation and stops
+#: there. Naming the behaviors we want instead would only cover the situations we
+#: happened to imagine, and would leave this program carrying a list of expressions
+#: that are wrong in one language, one domain, and one kind of turn.
+RECORD_VOICE_DIRECTIVE = [
+    "What you return is committed to this branch and read later, outside this",
+    "moment, by someone who was not part of it. Nothing you could point at now is",
+    "present for that reader, and no further turn is available to repair it.",
+    "Write so that it holds under those conditions.",
+]
+
+#: The same conditions for a provider's system prompt, where they hold for the whole
+#: session rather than sitting inside one long user message.
+RECORD_VOICE_SYSTEM_DIRECTIVE = (
+    " What you write is committed to a branch and read later, outside this moment,"
+    " by someone who was not part of it: nothing you could point at now is present"
+    " for that reader, and no further turn is available to repair it. Write so that"
+    " it holds under those conditions."
+)
+
+
+def record_voice_parts() -> list[str]:
+    return [*RECORD_VOICE_DIRECTIVE, ""]
+
+
+def build_continuation_prompt(
+    store: ContextStore,
+    branch_id: str,
+    user_message: str,
+    *,
+    guiding_context: str = "",
+    resource_paths: list[str] | None = None,
+) -> str:
+    """What a resumed session gets: the new turn, and nothing it already holds.
+
+    This is the whole point of resuming. The session already contains the project
+    instructions, the branch report and every earlier message, so re-sending the
+    rebuilt prompt would stack the branch history one copy deeper per turn and bury
+    the current standing rules among superseded ones — which is exactly what went
+    wrong the first time sessions were resumed here.
+
+    Guiding is the exception and is restated every turn. It is the one thing that
+    has to win against everything earlier in the session, and position is what
+    makes it win: last read, right before the answer.
+    """
+    parts = [
+        "Continuing the same ctxgit branch. You already hold this branch's project",
+        "instructions, report, and conversation from earlier in this session — they",
+        "have not been repeated below.",
+        "",
+        f"Branch: {branch_id}",
+        "",
+    ]
+    current_attachments = current_turn_attachment_section(store, branch_id, resource_paths)
+    if current_attachments and current_attachments != "(none)":
+        parts.extend(
+            [
+                "Files attached to this turn:",
+                "<attachments>",
+                current_attachments,
+                "</attachments>",
+                "",
+            ]
+        )
+    parts.extend(
+        [
+            "User message:",
+            "<user_message>",
+            user_message,
+            "</user_message>",
+            "",
+            *guiding_enforcement_parts(guiding_context),
+            *record_voice_parts(),
+            "Return JSON only. The JSON must have:",
+            "- assistant: the written answer recorded in this branch's timeline.",
+            "- artifacts: array of zero or more artifacts (markdown by default; use another format when asked).",
+            "- approvalRequests: array of zero or more outside-workspace write requests.",
+        ]
+    )
+    return "\n".join(parts)
 
 
 def build_chat_prompt(
@@ -6682,8 +7440,10 @@ def build_chat_prompt(
             user_message,
             "</user_message>",
             "",
+            *guiding_enforcement_parts(context["guiding"]),
+            *record_voice_parts(),
             "Return JSON only. The JSON must have:",
-            "- assistant: string conversational answer to show in the chat timeline.",
+            "- assistant: the written answer recorded in this branch's timeline.",
             "- artifacts: array of zero or more artifacts (markdown by default; use another format when asked).",
             "- approvalRequests: array of zero or more outside-workspace write requests.",
             "",
@@ -6701,11 +7461,95 @@ def build_chat_prompt(
             "- reason: concise reason this cannot stay inside the opened project workspace.",
             "",
             "Do not create an artifact unless it is useful. A turn may create zero artifacts or many artifacts.",
-            "Keep the chat answer concise. Put long structured material in artifacts when useful,",
-            "and mention any files you changed directly.",
+            "Keep the chat answer free of padding and restatement. Put long structured material",
+            "in artifacts when useful, and mention any files you changed directly.",
         ]
     )
     return "\n".join(parts)
+
+
+#: Turn kinds a side question should not report as "the running turn": itself, and
+#: the other lookups people fire off while waiting.
+ASIDE_TURN_MODES = {"btw", "info-chat", "context-chat"}
+
+
+def running_turn_context(store: ContextStore, branch_id: str, *, event_limit: int = 8) -> str:
+    """What is under way on this branch right now, for a turn asked alongside it.
+
+    A side question is asked *while* a real turn works, and it was answering as if
+    it were the only thing alive — told "지금 뭐하고 있냐", it replied that the only
+    thing running was itself. It had no way to know better: the request in flight
+    has no answer in history yet, and what the turn is doing lives in the job
+    record, which no prompt ever read.
+
+    Read from `contexts/jobs/` rather than the in-memory registry so this works
+    from whichever process builds the prompt.
+    """
+    jobs_dir = store.root / "contexts" / "jobs"
+    if not jobs_dir.is_dir():
+        return ""
+    # Job ids are timestamps, so the newest are last; nothing older matters here.
+    paths = sorted(jobs_dir.glob("*.json"))[-40:]
+    live: list[dict[str, Any]] = []
+    for path in paths:
+        job = load_json(path)
+        if not isinstance(job, dict) or job.get("status") != "running":
+            continue
+        if str(job.get("branch") or "") != branch_id:
+            continue
+        if str(job.get("mode") or job.get("kind") or "") in ASIDE_TURN_MODES:
+            continue
+        live.append(job)
+    if not live:
+        return ""
+
+    answered = {
+        str(record.get("turnId") or "")
+        for record in store.iter_history(branch_id)
+        if record.get("role") == "assistant" and record.get("turnId")
+    }
+    pending = [
+        record
+        for record in store.iter_history(branch_id)
+        if record.get("role") == "user"
+        and not record.get("aside")
+        and str(record.get("turnId") or "") not in answered
+    ]
+    request = str(pending[-1].get("text") or "").strip() if pending else ""
+
+    lines = []
+    for job in live:
+        started = str(job.get("createdAt") or "")
+        lines.append(f"- mode: {job.get('mode') or job.get('kind') or 'turn'}")
+        if started:
+            lines.append(f"- started: {started}")
+        if request:
+            lines.append("- it was asked to do this:")
+            lines.append(f"  {truncate_middle(request, 1200)}")
+        events = [
+            str(event.get("message") or "").strip()
+            for event in (job.get("events") or [])
+            if isinstance(event, dict) and str(event.get("message") or "").strip()
+        ]
+        if events:
+            lines.append(f"- most recent activity (last {min(event_limit, len(events))} of {len(events)}):")
+            lines.extend(f"  - {compact_progress_text(item, 160)}" for item in events[-event_limit:])
+    return "\n".join(lines)
+
+
+def running_turn_parts(running: str) -> list[str]:
+    if not running:
+        return []
+    return [
+        "A turn on this branch is running right now, and you are a question asked",
+        "alongside it. It cannot hear you and it is not finished. Answer about it",
+        "from what is below rather than assuming nothing is under way, and do not",
+        "report its work as done.",
+        "<running_turn>",
+        running,
+        "</running_turn>",
+        "",
+    ]
 
 
 def build_history_chat_prompt(
@@ -6729,10 +7573,8 @@ def build_history_chat_prompt(
     )
     history_record_limit = history_record_limit_from_config(codex_config)
     project_context = "\n\n".join(project_context_sections(store, project_budget)).strip()
-    guiding_context = guiding_context_sections(
-        store, branch_id, min(DEFAULT_GUIDING_BUDGET_CHARS, max(4000, budget // 4))
-    )
-    branch_context = truncate_middle(store.context_excerpt(branch_id), branch_budget).strip()
+    guiding_context = info_chat_guiding_context(store, branch_id)
+    branch_context = truncate_middle(branch_report_for_prompt(store, branch_id), branch_budget).strip()
     resource_context = resource_context_sections(store, branch_id, resource_budget)
     compaction_context = compaction_context_sections(store, branch_id, max(8000, budget // 4))
     current_attachments = current_turn_attachment_section(store, branch_id, resource_paths)
@@ -6757,7 +7599,7 @@ def build_history_chat_prompt(
         "",
         "You may read additional project files when needed, including source, research,",
         "artifact, resource, archive, and branch context files inside the opened project.",
-        "Do not edit files. Do not create artifacts. Answer directly and concisely.",
+        "Do not edit files. Do not create artifacts. Answer directly, without padding.",
         "If the history is insufficient, say what is missing instead of guessing.",
         "Reply in the user's language unless the user asks otherwise.",
         "When the user refers to photos or files they just sent, use the current turn",
@@ -6765,6 +7607,7 @@ def build_history_chat_prompt(
         "",
         f"Branch: {branch_id}",
         "",
+        *running_turn_parts(running_turn_context(store, branch_id)),
         "Project memory and standing instructions:",
         "<project_context>",
         project_context or "(none)",
@@ -6814,8 +7657,10 @@ def build_history_chat_prompt(
             user_message,
             "</user_message>",
             "",
+            *guiding_enforcement_parts(guiding_context),
+            *record_voice_parts(),
             "Return JSON only. The JSON must have:",
-            "- assistant: string conversational answer to show in the chat timeline.",
+            "- assistant: the written answer recorded in this branch's timeline.",
             "- artifacts: empty array.",
             "- approvalRequests: empty array.",
         ]
@@ -6945,8 +7790,9 @@ def build_context_chat_prompt(store: ContextStore, user_message: str) -> str:
         user_message,
         "</user_message>",
         "",
+        *record_voice_parts(),
         "Return JSON only. The JSON must have:",
-        "- assistant: string conversational answer to show in the chat timeline.",
+        "- assistant: the written answer recorded in this contexts chat.",
         "- artifacts: empty array.",
         "- approvalRequests: empty array.",
     ]
@@ -7039,6 +7885,64 @@ def sequence_evaluator_output_schema() -> dict[str, Any]:
     return schema
 
 
+#: A fenced block anywhere in a reply, not just one wrapping the whole thing.
+_FENCED_JSON_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
+
+
+def _balanced_object_spans(text: str) -> Iterable[str]:
+    """Every `{...}` span in `text`, brace-counted so nesting survives.
+
+    Braces inside JSON strings are skipped; a reply that talks about `{"a": "}"}`
+    would otherwise cut the span short.
+    """
+    depth = 0
+    start = -1
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}":
+            if depth:
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    yield text[start : index + 1]
+
+
+def embedded_chat_envelope(text: str) -> dict[str, Any] | None:
+    """Dig the chat envelope out of a reply that wrapped it in something else.
+
+    The contract is "return JSON only", and most of the time that is what arrives.
+    When it does not — a line of preamble, the object inside a fenced block — the
+    whole reply used to be stored verbatim, so the chat showed raw JSON with
+    literal `\\n` in it instead of an answer.
+
+    A reply may legitimately contain other JSON (dev chat quotes config, API
+    responses, this very envelope). Only an object carrying a string `assistant`
+    is taken, which is the shape nothing else has.
+    """
+    for candidate in (*_FENCED_JSON_RE.findall(text), *_balanced_object_spans(text)):
+        try:
+            parsed = json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(parsed, dict) and isinstance(parsed.get("assistant"), str):
+            return parsed
+    return None
+
+
 def parse_chat_result(raw: str) -> dict[str, Any]:
     text = raw.strip()
     if text.startswith("```"):
@@ -7047,9 +7951,14 @@ def parse_chat_result(raw: str) -> dict[str, Any]:
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError:
-        return {"assistant": raw.strip(), "artifacts": [], "approvalRequests": []}
+        parsed = embedded_chat_envelope(text)
+        if parsed is None:
+            return {"assistant": raw.strip(), "artifacts": [], "approvalRequests": []}
     if not isinstance(parsed, dict):
-        return {"assistant": raw.strip(), "artifacts": [], "approvalRequests": []}
+        recovered = embedded_chat_envelope(text)
+        if recovered is None:
+            return {"assistant": raw.strip(), "artifacts": [], "approvalRequests": []}
+        parsed = recovered
     assistant = parsed.get("assistant")
     artifacts = parsed.get("artifacts")
     approval_requests = parsed.get("approvalRequests")
@@ -7141,8 +8050,9 @@ def emit_progress(progress: ProgressCallback | None, message: str) -> None:
         progress(localize_progress_message(message.strip()))
 
 
-def localize_progress_message(message: str) -> str:
-    exact = {
+#: ctxgit's own step labels. They are progress, not the agent talking, so they
+#: are both localized for display and kept out of a turn's stored narration.
+PROGRESS_STEP_LABELS = {
         "Checking Codex login": "Codex 로그인 상태 확인 중",
         "Building context prompt": "컨텍스트 프롬프트 구성 중",
         "Codex is working": "Codex 작업 중",
@@ -7159,7 +8069,11 @@ def localize_progress_message(message: str) -> str:
         "Calling Brave LLM Context": "Brave LLM Context 호출 중",
         "Running OpenCode research agent": "OpenCode 리서치 에이전트 실행 중",
         "Saving research note": "리서치 노트 저장 중",
-    }
+}
+
+
+def localize_progress_message(message: str) -> str:
+    exact = PROGRESS_STEP_LABELS
     if message in exact:
         return exact[message]
     collected = re.match(r"Collected (\d+) sources from (\d+) providers", message)
@@ -7277,6 +8191,20 @@ def _claude_tool_detail(tool_input: Any) -> str:
     return ""
 
 
+def looks_like_chat_envelope(text: str) -> bool:
+    """Whether a line is the turn's structured answer rather than the agent talking.
+
+    Claude streams its final reply as ordinary assistant text, so the JSON envelope
+    arrived on the same channel as the commentary and was shown as though the agent
+    had said it — a wall of `{"assistant": ...}` in the progress panel, right where
+    the answer was about to appear anyway.
+    """
+    head = str(text or "").strip().lstrip("`").lstrip()
+    if head.lower().startswith("json"):
+        head = head[4:].lstrip()
+    return head.startswith("{") and '"assistant"' in head[:400]
+
+
 def claude_stream_progress(line: str) -> str:
     """Turn a Claude Code `stream-json` event line into a progress message."""
     line = line.strip()
@@ -7318,9 +8246,115 @@ def claude_stream_progress(line: str) -> str:
             return f"Using tool: {name}{_claude_tool_detail(part.get('input'))}"
         if part_type == "text":
             text = str(part.get("text") or "").strip()
-            if text:
+            if text and not looks_like_chat_envelope(text):
                 return compact_progress_text(text, 140)
     return ""
+
+
+class StreamedStdin:
+    """Holds a `-p` session's stdin open so a running turn can still be spoken to.
+
+    Claude Code accepts further user messages on stdin under `--input-format
+    stream-json`. What happens to one depends on what the turn is doing when it
+    lands: inside the tool loop it is folded into that same turn at the next tool
+    boundary (the turn changes course and still ends in one result), while a turn
+    that is only writing text finishes first and the message becomes a follow-up
+    turn. Both are useful and neither is announced in advance.
+
+    That ambiguity is why stdin cannot simply be closed when the first result
+    arrives — doing so would drop a message that was about to become a follow-up
+    turn. `--replay-user-messages` settles it: the CLI echoes each stdin message
+    back on stdout at the moment it takes it, so a result with nothing outstanding
+    means the session is genuinely finished.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._queued: list[str] = []
+        self._outstanding: list[str] = []
+
+    @staticmethod
+    def encode(text: str) -> str:
+        message = {
+            "type": "user",
+            "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+        }
+        return json.dumps(message, ensure_ascii=False) + "\n"
+
+    def queue(self, text: str) -> None:
+        text = str(text or "").strip()
+        if not text:
+            return
+        with self._lock:
+            self._queued.append(text)
+            self._outstanding.append(text)
+
+    def drain(self) -> list[str]:
+        """Lines to write into stdin now."""
+        with self._lock:
+            pending, self._queued = self._queued, []
+        return [self.encode(text) for text in pending]
+
+    def observe(self, line: str) -> bool:
+        """Feed one stdout line. True once stdin can be closed.
+
+        A replayed message is echoed as a `user` event carrying text blocks; tool
+        results come back on the same event type, so only text blocks count.
+        """
+        stripped = line.strip()
+        if not stripped:
+            return False
+        try:
+            event = json.loads(stripped)
+        except (ValueError, TypeError):
+            return False
+        if not isinstance(event, dict):
+            return False
+        if event.get("type") == "user":
+            content = (event.get("message") or {}).get("content")
+            if isinstance(content, list):
+                echoed = [
+                    str(part.get("text") or "")
+                    for part in content
+                    if isinstance(part, dict) and part.get("type") == "text"
+                ]
+                with self._lock:
+                    for text in echoed:
+                        if text in self._outstanding:
+                            self._outstanding.remove(text)
+            return False
+        if event.get("type") == "result":
+            with self._lock:
+                return not self._outstanding
+        return False
+
+
+def terminate_process_tree(process: "subprocess.Popen[str]") -> None:
+    """Stop a provider process and everything it started.
+
+    A CLI turn is a tree, not one process: the agent spawns shells, builds, test
+    runners, dev servers. Killing only the direct child left all of that running —
+    Stop returned immediately and looked like it worked while `npm test` and a
+    render job carried on in the background, writing into the workspace after the
+    turn was supposedly over.
+
+    The child is started in its own process group (see `start_new_session` at each
+    Popen), so the group id is the child's pid and one signal reaches the whole
+    tree. Falls back to the plain kill if the group is already gone.
+    """
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return
+    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        return
+    with contextlib.suppress(OSError):
+        process.kill()
 
 
 def run_process_with_progress(
@@ -7330,6 +8364,7 @@ def run_process_with_progress(
     progress: ProgressCallback,
     stdin_text: str | None = None,
     event_formatter: Callable[[str], str] = codex_event_progress,
+    stdin_channel: "StreamedStdin | None" = None,
 ) -> subprocess.CompletedProcess[str]:
     # A turn can attach a raw-event sink to the progress callback to reconstruct the
     # subagent timeline; keeping it on `progress` avoids threading a param through
@@ -7347,6 +8382,8 @@ def run_process_with_progress(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         bufsize=1,
+        # Its own process group, so cancelling can reach the whole tree.
+        start_new_session=os.name != "nt",
     )
     events: queue.Queue[tuple[str, str | None]] = queue.Queue()
 
@@ -7369,8 +8406,28 @@ def run_process_with_progress(
                 process.kill()
             return
         finally:
-            with contextlib.suppress(OSError):
-                process.stdin.close()
+            # A streamed session keeps stdin open: the main loop writes later
+            # messages into it and closes it once the channel says the turn is done.
+            if stdin_channel is None:
+                with contextlib.suppress(OSError):
+                    process.stdin.close()
+
+    def write_interjections() -> None:
+        if process.stdin is None or stdin_channel is None:
+            return
+        for line in stdin_channel.drain():
+            try:
+                process.stdin.write(line)
+                process.stdin.flush()
+            except Exception as exc:  # noqa: BLE001 - a dead pipe must not kill the turn
+                events.put(("stderr", f"ctxgit interjection write failed: {exc}\n"))
+                return
+
+    def close_streamed_stdin() -> None:
+        if process.stdin is None:
+            return
+        with contextlib.suppress(OSError):
+            process.stdin.close()
 
     threads = [
         threading.Thread(target=reader, args=("stdout", process.stdout), daemon=True),
@@ -7387,21 +8444,22 @@ def run_process_with_progress(
     deadline = time.monotonic() + timeout_seconds
     last_progress = ""
     startup_warnings_seen: set[str] = set()
+    stdin_open = stdin_channel is not None
     while len(closed) < 2:
+        if stdin_open:
+            # Same shape as cancellation: the turn owns no socket, it just polls a
+            # callable the job runner attached, so nothing has to reach the Popen.
+            take = getattr(progress, "take_interjections", None)
+            if callable(take):
+                for text in take() or []:
+                    stdin_channel.queue(text)
+            write_interjections()
         cancelled = getattr(progress, "cancelled", None)
         if callable(cancelled) and cancelled():
-            if os.name == "nt":
-                subprocess.run(
-                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                    check=False,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            else:
-                process.kill()
+            terminate_process_tree(process)
             raise JobCancelledError("Job canceled by user.")
         if time.monotonic() > deadline:
-            process.kill()
+            terminate_process_tree(process)
             raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout_seconds)
         try:
             name, line = events.get(timeout=0.1)
@@ -7412,6 +8470,9 @@ def run_process_with_progress(
             continue
         if name == "stdout":
             stdout_lines.append(line)
+            if stdin_open and stdin_channel.observe(line):
+                close_streamed_stdin()
+                stdin_open = False
             if event_sink is not None:
                 stripped = line.strip()
                 if stripped:
@@ -7445,6 +8506,11 @@ def run_process_with_progress(
                     emit_progress(progress, message)
                     last_progress = message
 
+    if stdin_open:
+        # Both pipes closed without a clean result (a crash, or output we could not
+        # parse). Nothing more is coming, so let the process exit.
+        close_streamed_stdin()
+        stdin_open = False
     returncode = process.wait(timeout=5)
     emit_progress(progress, f"Process exited with code {returncode}")
     for thread in threads:
@@ -7461,6 +8527,367 @@ def run_process_with_progress(
     )
 
 
+def codex_app_server_progress(message: dict[str, Any]) -> str:
+    """Compact progress text for one app-server notification."""
+    method = str(message.get("method") or "")
+    params = message.get("params") if isinstance(message.get("params"), dict) else {}
+    item = params.get("item") if isinstance(params.get("item"), dict) else {}
+    if method == "item/started":
+        kind = str(item.get("type") or "")
+        if kind == "commandExecution":
+            return f"Running command: {compact_progress_text(item.get('command'), 160)}"
+        if kind == "mcpToolCall":
+            return f"Using MCP tool: {item.get('tool') or item.get('name') or 'tool'}"
+        if kind == "collabAgentToolCall":
+            return f"Delegating: {item.get('tool') or 'subagent'}"
+    if method == "item/completed" and item.get("type") == "agentMessage":
+        # What the agent says between tool calls. Codex marks these `commentary`;
+        # the turn's actual answer comes back through the structured output, so
+        # matching on the phase is what keeps the answer from being narrated twice.
+        if str(item.get("phase") or "") != "commentary":
+            return ""
+        return compact_progress_text(item.get("text"), 400)
+    if method == "item/completed" and item.get("type") == "commandExecution":
+        return "Command finished"
+    if method == "turn/started":
+        return "Codex turn started"
+    return ""
+
+
+def codex_session_path(root: Path) -> Path:
+    return root / ".ctxgit" / "codex-sessions.json"
+
+
+#: Where a branch's live provider sessions are remembered. Keyed so that anything
+#: which would make a resumed session wrong starts a new one instead.
+SESSION_STORE_RELPATH = (".ctxgit", "sessions.json")
+
+
+def session_key(
+    branch_id: str, mode: str, provider: str, model: str, guiding: str
+) -> str:
+    """Identity of a resumable session.
+
+    Model and provider are in the key because a session belongs to the model that
+    built it. Guiding is in it because standing rules are sent once, at the start:
+    if they change, the session is holding instructions the user has since replaced,
+    and continuing it would keep the old ones in force. Hashed rather than stored so
+    the file stays small and carries no branch text.
+    """
+    digest = hashlib.sha256(str(guiding or "").encode("utf-8")).hexdigest()[:12]
+    return f"{branch_id}:{mode}:{provider}:{model}:{digest}"
+
+
+def read_session_store(root: Path) -> dict[str, Any]:
+    # No file is the normal state for a branch that has never resumed anything, so
+    # this reads it directly rather than through load_json, which treats a missing
+    # file as a broken project.
+    path = root.joinpath(*SESSION_STORE_RELPATH)
+    if not path.exists():
+        return {}
+    try:
+        store = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return store if isinstance(store, dict) else {}
+
+
+def remembered_session(root: Path, key: str) -> str:
+    entry = read_session_store(root).get(key)
+    return str(entry or "") if isinstance(entry, str) else ""
+
+
+def remember_session(root: Path, key: str, session_id: str) -> None:
+    if not key or not session_id:
+        return
+    path = root.joinpath(*SESSION_STORE_RELPATH)
+    store = read_session_store(root)
+    store[key] = session_id
+    # Unbounded growth would keep every session a branch ever had; the recent ones
+    # are the only resumable ones anyway.
+    if len(store) > 200:
+        store = dict(list(store.items())[-200:])
+    dump_json(path, store)
+
+
+def forget_session(root: Path, key: str) -> None:
+    path = root.joinpath(*SESSION_STORE_RELPATH)
+    store = read_session_store(root)
+    if store.pop(key, None) is not None:
+        dump_json(path, store)
+
+
+def session_continuity_enabled(config: dict[str, Any]) -> bool:
+    """Whether turns on this provider resume the branch's previous session.
+
+    On by default. It is a setting because the first attempt at this shipped
+    without one: sessions resumed *and* the whole rebuilt context was re-sent every
+    turn, so history stacked N deep and standing instructions stopped being obeyed.
+    That is fixed by sending only the new turn into a resumed session, but the
+    switch stays so the behaviour can be turned off without editing code.
+    """
+    return config.get("sessionContinuity") is not False
+
+
+def codex_steerable_progress(progress: ProgressCallback | None) -> ProgressCallback | None:
+    """The channel to run a steerable Codex turn on, or None to take `codex exec`.
+
+    The app-server transport costs a JSON-RPC handshake, and what it buys is a turn
+    someone can watch and talk to: it streams events as they happen and takes a BTW
+    message mid-flight. Both arrive on the progress object a job attaches
+    (`take_interjections`, `cancelled`), so a run with no progress channel — a bare
+    CLI invocation — has nothing to steer and is better served by `codex exec`.
+
+    This mirrors the Claude side, where streamed stdin is opened under the same
+    condition for the same reason.
+    """
+    if progress is None or not callable(progress):
+        return None
+    return progress
+
+
+def run_codex_app_server_turn(
+    root: Path,
+    prompt: str,
+    *,
+    workdir: Path,
+    sandbox: str,
+    model: str,
+    output_schema: dict[str, Any],
+    timeout_seconds: int,
+    progress: ProgressCallback,
+    developer_extra: str = "",
+    writable_roots: list[Path] | None = None,
+    resume_thread_id: str = "",
+    on_thread: Callable[[str], None] | None = None,
+) -> str:
+    """Run a steerable Codex turn over the native app-server JSON-RPC API.
+
+    `resume_thread_id` continues a thread this branch already has, in which case the
+    caller must send only the new turn — the thread still holds everything earlier,
+    and re-sending the rebuilt context is what stacked the branch history one copy
+    deeper per turn. `on_thread` receives the thread id so it can be remembered.
+    """
+    cmd = resolve_codex_command(root)
+    apply_codex_extension_mcps(cmd, root)
+    apply_codex_output_depth(cmd, read_llm_config(root).get("codex", {}))
+    cmd.extend(["app-server", "--listen", "stdio://"])
+    process = subprocess.Popen(
+        cmd,
+        cwd=workdir,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=1,
+        start_new_session=os.name != "nt",
+    )
+    events: queue.Queue[tuple[str, str | None]] = queue.Queue()
+
+    def reader(name: str, pipe: Any) -> None:
+        try:
+            for line in pipe:
+                events.put((name, line))
+        finally:
+            events.put((name, None))
+
+    for name, pipe in (("stdout", process.stdout), ("stderr", process.stderr)):
+        threading.Thread(target=reader, args=(name, pipe), daemon=True).start()
+
+    next_id = 1
+
+    def send(method: str, params: dict[str, Any]) -> int:
+        nonlocal next_id
+        request_id = next_id
+        next_id += 1
+        if process.stdin is None:
+            raise RuntimeError("Codex app-server stdin is unavailable")
+        process.stdin.write(
+            json.dumps({"id": request_id, "method": method, "params": params}, ensure_ascii=False)
+            + "\n"
+        )
+        process.stdin.flush()
+        return request_id
+
+    system_prompt = (
+        ctxgit_runtime_directive(writable=sandbox != "read-only")
+        + RECORD_VOICE_SYSTEM_DIRECTIVE
+        + developer_extra
+    )
+    active_exts = active_extensions()
+    if active_exts:
+        names = ", ".join(f"{ext.NAME} (MCP server {ext.ID})" for ext in active_exts)
+        system_prompt += f" Available ctxgit integrations: {names}. Use them when relevant."
+    initialize_id = send(
+        "initialize",
+        {"clientInfo": {"name": "ctxgit", "title": "ctxgit", "version": "1"}},
+    )
+    thread_request_id: int | None = None
+    turn_request_id: int | None = None
+    thread_id = ""
+    turn_id = ""
+    final_text = ""
+    closed: set[str] = set()
+    deadline = time.monotonic() + timeout_seconds
+    last_progress = ""
+    # No thread resume. ctxgit rebuilds the entire context every turn — project
+    # instructions, guiding knowledge, branch report, budgeted history — so a
+    # resumed thread would hold all of that again from every previous turn. By
+    # turn N the branch history is nested N deep and guiding has N copies, the
+    # newest buried among superseded ones, which is what standing instructions
+    # stop surviving. Claude runs `--no-session-persistence` for the same reason;
+    # this keeps the two providers on one model of where context lives.
+    resume_thread_id = ""
+    thread_start_params: dict[str, Any] = {}
+    try:
+        while len(closed) < 2:
+            cancelled = getattr(progress, "cancelled", None)
+            if callable(cancelled) and cancelled():
+                terminate_process_tree(process)
+                raise JobCancelledError("Job canceled by user.")
+            if time.monotonic() > deadline:
+                terminate_process_tree(process)
+                raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout_seconds)
+            take = getattr(progress, "take_interjections", None)
+            if thread_id and turn_id and callable(take):
+                for text in take() or []:
+                    send(
+                        "turn/steer",
+                        {
+                            "threadId": thread_id,
+                            "expectedTurnId": turn_id,
+                            "input": [{"type": "text", "text": str(text)}],
+                        },
+                    )
+                    emit_progress(progress, "BTW delivered to the active Codex turn")
+            try:
+                source, line = events.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if line is None:
+                closed.add(source)
+                continue
+            if source == "stderr":
+                if line.strip():
+                    emit_progress(progress, f"stderr: {compact_progress_text(line, 220)}")
+                continue
+            try:
+                message = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            if (
+                message.get("error")
+                and message.get("id") == thread_request_id
+                and resume_thread_id
+            ):
+                # The saved thread is gone (expired, or from another machine).
+                # Start a fresh one rather than failing the turn; the caller's
+                # prompt was written for a resume, which is thinner than a cold
+                # start but still answerable.
+                resume_thread_id = ""
+                thread_start_params.pop("threadId", None)
+                thread_start_params["ephemeral"] = False
+                thread_request_id = send("thread/start", thread_start_params)
+                emit_progress(progress, "이어갈 Codex 세션이 없어 새로 시작합니다")
+                continue
+            if message.get("error") and message.get("id") in {
+                initialize_id,
+                thread_request_id,
+                turn_request_id,
+            }:
+                error = message.get("error")
+                detail = error.get("message") if isinstance(error, dict) else error
+                raise RuntimeError(f"Codex app-server request failed: {detail}")
+            if message.get("id") == initialize_id:
+                thread_config: dict[str, Any] = {}
+                if read_llm_config(root).get("codex", {}).get("webSearch") is not False:
+                    thread_config["web_search"] = "live"
+                thread_start_params = {
+                        "cwd": str(workdir),
+                        "model": model or None,
+                        "approvalPolicy": "never",
+                        "sandbox": sandbox,
+                        "developerInstructions": system_prompt,
+                        "config": thread_config,
+                    }
+                if resume_thread_id:
+                    resume_params = dict(thread_start_params)
+                    resume_params["threadId"] = resume_thread_id
+                    thread_request_id = send("thread/resume", resume_params)
+                else:
+                    thread_start_params["ephemeral"] = False
+                    thread_request_id = send("thread/start", thread_start_params)
+                continue
+            if thread_request_id is not None and message.get("id") == thread_request_id:
+                result = message.get("result") if isinstance(message.get("result"), dict) else {}
+                thread = result.get("thread") if isinstance(result.get("thread"), dict) else {}
+                thread_id = str(thread.get("id") or "")
+                if not thread_id:
+                    raise RuntimeError("Codex app-server returned no thread id")
+                if on_thread:
+                    on_thread(thread_id)
+                sandbox_policy: dict[str, Any]
+                if sandbox == "danger-full-access":
+                    sandbox_policy = {"type": "dangerFullAccess"}
+                elif sandbox == "read-only":
+                    sandbox_policy = {"type": "readOnly", "networkAccess": False}
+                else:
+                    sandbox_policy = {
+                        "type": "workspaceWrite",
+                        "writableRoots": [str(path) for path in (writable_roots or [])],
+                        "networkAccess": False,
+                    }
+                turn_request_id = send(
+                    "turn/start",
+                    {
+                        "threadId": thread_id,
+                        "input": [{"type": "text", "text": prompt}],
+                        "outputSchema": output_schema,
+                        "sandboxPolicy": sandbox_policy,
+                    },
+                )
+                continue
+            if turn_request_id is not None and message.get("id") == turn_request_id:
+                result = message.get("result") if isinstance(message.get("result"), dict) else {}
+                turn = result.get("turn") if isinstance(result.get("turn"), dict) else {}
+                turn_id = str(turn.get("id") or "")
+                continue
+            method = str(message.get("method") or "")
+            params = message.get("params") if isinstance(message.get("params"), dict) else {}
+            if method == "turn/started":
+                turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
+                turn_id = str(turn.get("id") or turn_id)
+            elif method == "item/completed":
+                item = params.get("item") if isinstance(params.get("item"), dict) else {}
+                if (
+                    str(params.get("threadId") or "") == thread_id
+                    and item.get("type") == "agentMessage"
+                    and item.get("phase") == "final_answer"
+                ):
+                    final_text = str(item.get("text") or final_text)
+            elif method == "turn/completed":
+                turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
+                if turn.get("status") != "completed":
+                    raise RuntimeError(str(turn.get("error") or "Codex turn did not complete"))
+                return final_text
+            message_text = codex_app_server_progress(message)
+            if message_text and message_text != last_progress:
+                emit_progress(progress, message_text)
+                last_progress = message_text
+        raise RuntimeError("Codex app-server closed before the turn completed")
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        with contextlib.suppress(Exception):
+            process.wait(timeout=5)
+        for pipe in (process.stdin, process.stdout, process.stderr):
+            if pipe is not None:
+                with contextlib.suppress(OSError):
+                    pipe.close()
+
+
 def call_codex_chat(
     root: Path,
     store: ContextStore,
@@ -7475,18 +8902,64 @@ def call_codex_chat(
     status = codex_login_status(root)
     if not status["ok"]:
         raise RuntimeError(status["message"])
-    llm = read_llm_config(root)
+    llm = read_llm_config(root, branch_id)
     codex_config = llm.get("codex") if isinstance(llm.get("codex"), dict) else {}
     timeout_seconds = coerce_positive_int(codex_config.get("timeoutSeconds"), 900)
     emit_progress(progress, "Building context prompt")
-    prompt = build_chat_prompt(
-        store,
-        branch_id,
-        user_message,
-        approved_external_paths=approved_external_paths,
-        resource_paths=resource_paths,
-    )
+    guiding = chat_guiding_context(store, branch_id)
     writable_dirs = external_writable_dirs(root, approved_external_paths or [])
+    live_progress = codex_steerable_progress(progress)
+    if live_progress and not codex_app_server_supported(root):
+        live_progress = None
+    # Only the app-server transport can resume; `codex exec` reads stdin once and
+    # forgets, so that path always gets the full prompt.
+    key = session_key(
+        branch_id, "chat", "codex", str(codex_config.get("model") or ""), guiding
+    )
+    resuming = (
+        remembered_session(root, key)
+        if live_progress and session_continuity_enabled(codex_config)
+        else ""
+    )
+    if resuming:
+        prompt = build_continuation_prompt(
+            store, branch_id, user_message,
+            guiding_context=guiding, resource_paths=resource_paths,
+        )
+    else:
+        prompt = build_chat_prompt(
+            store,
+            branch_id,
+            user_message,
+            approved_external_paths=approved_external_paths,
+            resource_paths=resource_paths,
+        )
+    if live_progress:
+        try:
+            raw = run_codex_app_server_turn(
+                root,
+                prompt,
+                workdir=root.resolve(),
+                sandbox=codex_sandbox_mode(codex_config),
+                model=str(codex_config.get("model") or "gpt-5.6-sol"),
+                output_schema=output_schema or chat_output_schema(),
+                timeout_seconds=timeout_seconds,
+                progress=live_progress,
+                developer_extra=guiding_system_directive(guiding),
+                writable_roots=writable_dirs,
+                resume_thread_id=resuming,
+                on_thread=(
+                    (lambda thread_id: remember_session(root, key, thread_id))
+                    if session_continuity_enabled(codex_config)
+                    else None
+                ),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise codex_timeout_error("Codex", timeout_seconds) from exc
+        parsed = parse_chat_result(raw)
+        parsed["provider"] = "codex"
+        parsed["transport"] = "app-server"
+        return parsed
     with tempfile.TemporaryDirectory(prefix="ctxgit-codex-") as tmp:
         tmp_path = Path(tmp)
         schema_path = tmp_path / "chat-output.schema.json"
@@ -7494,6 +8967,12 @@ def call_codex_chat(
         write_text(schema_path, json.dumps(output_schema or chat_output_schema(), indent=2))
         cmd = resolve_codex_command(root)
         apply_codex_extension_mcps(cmd, root)
+        apply_codex_session_config(
+            cmd,
+            root,
+            developer_extra=guiding_system_directive(chat_guiding_context(store, branch_id)),
+            writable=codex_sandbox_mode(codex_config) != "read-only",
+        )
         if codex_config.get("webSearch") is not False:
             cmd.append("--search")
         cmd.extend([
@@ -7563,11 +9042,33 @@ def call_codex_history_chat(
     status = codex_login_status(root)
     if not status["ok"]:
         raise RuntimeError(status["message"])
-    llm = read_llm_config(root)
+    llm = read_llm_config(root, branch_id)
     codex_config = llm.get("codex") if isinstance(llm.get("codex"), dict) else {}
     timeout_seconds = coerce_positive_int(codex_config.get("timeoutSeconds"), 900)
     emit_progress(progress, "Building context prompt")
     prompt = build_history_chat_prompt(store, branch_id, user_message, resource_paths=resource_paths)
+    live_progress = codex_steerable_progress(progress)
+    if live_progress and not codex_app_server_supported(root):
+        live_progress = None
+    if live_progress:
+        try:
+            raw = run_codex_app_server_turn(
+                root,
+                prompt,
+                workdir=root.resolve(),
+                sandbox="read-only",
+                model=str(codex_config.get("model") or "gpt-5.6-sol"),
+                output_schema=output_schema or chat_output_schema(),
+                timeout_seconds=timeout_seconds,
+                progress=live_progress,
+                developer_extra=guiding_system_directive(info_chat_guiding_context(store, branch_id)),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise codex_timeout_error("Codex history chat", timeout_seconds) from exc
+        parsed = parse_chat_result(raw)
+        parsed["provider"] = "codex"
+        parsed["transport"] = "app-server"
+        return parsed
     with tempfile.TemporaryDirectory(prefix="ctxgit-history-chat-") as tmp:
         tmp_path = Path(tmp)
         schema_path = tmp_path / "chat-output.schema.json"
@@ -7575,6 +9076,12 @@ def call_codex_history_chat(
         write_text(schema_path, json.dumps(output_schema or chat_output_schema(), indent=2))
         cmd = resolve_codex_command(root)
         apply_codex_extension_mcps(cmd, root)
+        apply_codex_session_config(
+            cmd,
+            root,
+            developer_extra=guiding_system_directive(info_chat_guiding_context(store, branch_id)),
+            writable=False,
+        )
         if codex_config.get("webSearch") is not False:
             cmd.append("--search")
         cmd.extend(
@@ -7646,6 +9153,27 @@ def call_codex_context_chat(
     timeout_seconds = coerce_positive_int(codex_config.get("timeoutSeconds"), 900)
     emit_progress(progress, "Building context prompt")
     prompt = build_context_chat_prompt(store, user_message)
+    live_progress = codex_steerable_progress(progress)
+    if live_progress and not codex_app_server_supported(root):
+        live_progress = None
+    if live_progress:
+        try:
+            raw = run_codex_app_server_turn(
+                root,
+                prompt,
+                workdir=store.contexts.resolve(),
+                sandbox="read-only",
+                model=str(codex_config.get("model") or "gpt-5.6-sol"),
+                output_schema=chat_output_schema(),
+                timeout_seconds=timeout_seconds,
+                progress=live_progress,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise codex_timeout_error("Codex contexts chat", timeout_seconds) from exc
+        parsed = parse_chat_result(raw)
+        parsed["provider"] = "codex"
+        parsed["transport"] = "app-server"
+        return parsed
     with tempfile.TemporaryDirectory(prefix="ctxgit-context-chat-") as tmp:
         tmp_path = Path(tmp)
         schema_path = tmp_path / "chat-output.schema.json"
@@ -7653,6 +9181,7 @@ def call_codex_context_chat(
         write_text(schema_path, json.dumps(chat_output_schema(), indent=2))
         cmd = resolve_codex_command(root)
         apply_codex_extension_mcps(cmd, root)
+        apply_codex_session_config(cmd, root, writable=False)
         if codex_config.get("webSearch") is not False:
             cmd.append("--search")
         cmd.extend(
@@ -7717,6 +9246,8 @@ def call_codex_prompt(
     cwd: Path | None = None,
     progress: ProgressCallback | None = None,
     output_schema: dict[str, Any] | None = None,
+    system_extra: str = "",
+    model_override: str = "",
 ) -> dict[str, Any]:
     emit_progress(progress, "Checking Codex login")
     status = codex_login_status(root)
@@ -7725,6 +9256,29 @@ def call_codex_prompt(
     config = read_llm_config(root).get("codex", {})
     timeout_seconds = coerce_positive_int(config.get("timeoutSeconds"), 900)
     workdir = (cwd or root).resolve()
+    live_progress = codex_steerable_progress(progress)
+    if live_progress and not codex_app_server_supported(root):
+        live_progress = None
+    if live_progress:
+        sandbox = codex_sandbox_mode(config) if writable else "read-only"
+        try:
+            raw = run_codex_app_server_turn(
+                root,
+                prompt,
+                workdir=workdir,
+                sandbox=sandbox,
+                model=model_override or str(config.get("model") or "gpt-5.6-sol"),
+                output_schema=output_schema or chat_output_schema(),
+                timeout_seconds=timeout_seconds,
+                progress=live_progress,
+                developer_extra=system_extra,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise codex_timeout_error("Codex", timeout_seconds) from exc
+        parsed = parse_chat_result(raw)
+        parsed["provider"] = "codex"
+        parsed["transport"] = "app-server"
+        return parsed
     with tempfile.TemporaryDirectory(prefix="ctxgit-codex-raw-") as tmp:
         tmp_path = Path(tmp)
         schema_path = tmp_path / "output.schema.json"
@@ -7732,21 +9286,20 @@ def call_codex_prompt(
         write_text(schema_path, json.dumps(output_schema or chat_output_schema(), indent=2))
         cmd = resolve_codex_command(root)
         apply_codex_extension_mcps(cmd, root)
+        apply_codex_session_config(cmd, root, developer_extra=system_extra, writable=writable)
         if config.get("webSearch") is not False:
             cmd.append("--search")
         cmd.extend(["--ask-for-approval", "never", "exec"])
         if progress:
             cmd.append("--json")
         sandbox = codex_sandbox_mode(config) if writable else "read-only"
-        if writable and workdir != root.resolve():
-            sandbox = "workspace-write"
         cmd.extend([
             "--cd", str(workdir),
             "--sandbox", sandbox,
             "--output-schema", str(schema_path),
             "--output-last-message", str(output_path),
         ])
-        model = str(config.get("model") or "gpt-5.6-sol").strip()
+        model = model_override or str(config.get("model") or "gpt-5.6-sol").strip()
         if model:
             cmd.extend(["--model", model])
         cmd.append("-")
@@ -7924,7 +9477,12 @@ def call_claude_prompt(
     approved_external_paths: list[str] | None = None,
     progress: ProgressCallback | None = None,
     output_schema: dict[str, Any] | None = None,
+    system_extra: str = "",
+    model_override: str = "",
+    session: tuple[str, str] | None = None,
 ) -> dict[str, Any]:
+    """`session` is (session_id, "new"|"resume") when the caller wants this turn to
+    join a branch's running session instead of starting from nothing."""
     emit_progress(progress, "Checking Claude Code login")
     status = claude_login_status(root)
     if not status["ok"]:
@@ -7949,9 +9507,7 @@ def call_claude_prompt(
     allowed_names = active_extension_mcp_tool_names()
     allowed_tools = ",".join([tools, *allowed_names]) if allowed_names else tools
     system_prompt = (
-        "You are running inside ctxgit. Do not push, publish, deploy, or modify files outside "
-        "the current working directory and explicitly added directories. Respect the requested "
-        "read-only or writable mode. Return the required structured output."
+        ctxgit_runtime_directive(writable=writable) + RECORD_VOICE_SYSTEM_DIRECTIVE
     )
     if active_exts:
         names = ", ".join(f"{ext.NAME} (mcp__{ext.ID}__*)" for ext in active_exts)
@@ -7961,6 +9517,11 @@ def call_claude_prompt(
         )
     if subagents_enabled:
         system_prompt += LEAD_ORCHESTRATION_PROTOCOL
+    # Guiding knowledge arrives here as well as in the prompt body: inside the body
+    # it is one section of a very long user message, which is not where a rule
+    # belongs.
+    if system_extra:
+        system_prompt += system_extra
 
     def build_cmd(*, strict_schema: bool) -> list[str]:
         command = resolve_claude_command(root)
@@ -7972,6 +9533,12 @@ def call_claude_prompt(
             "--output-format", "stream-json",
             "--verbose",
         ])
+        if progress:
+            # Streamed stdin is what lets a running turn still be spoken to; the
+            # replay echo is how we know when a message has been taken (see
+            # StreamedStdin). Only a turn with a progress channel has a job behind
+            # it, so a bare CLI run keeps the plain one-shot stdin.
+            command.extend(["--input-format", "stream-json", "--replay-user-messages"])
         if strict_schema:
             command.extend([
                 "--json-schema", json.dumps(schema, ensure_ascii=False, separators=(",", ":")),
@@ -7979,9 +9546,15 @@ def call_claude_prompt(
         mcp_servers = active_extension_mcp_config()
         if mcp_servers:
             command.extend(["--mcp-config", json.dumps({"mcpServers": mcp_servers})])
+        if session:
+            session_id, session_mode = session
+            # Resuming keeps the branch's context inside the session, so the turn
+            # only carries what is new (see build_continuation_prompt).
+            command.extend(["--resume", session_id] if session_mode == "resume" else ["--session-id", session_id])
+        else:
+            command.append("--no-session-persistence")
         command.extend([
-            "--no-session-persistence",
-            "--permission-mode", "auto" if writable else "bypassPermissions",
+            "--permission-mode", claude_permission_mode(config, writable=writable),
             "--allowedTools", allowed_tools,
             "--append-system-prompt",
             system_prompt,
@@ -8002,7 +9575,7 @@ def call_claude_prompt(
                     mcp_tools=active_extension_mcp_tool_names(),
                 ),
             ])
-        model = str(config.get("model") or "opus").strip()
+        model = model_override or str(config.get("model") or "opus").strip()
         if model:
             command.extend(["--model", model])
         for path in external_writable_dirs(root, approved_external_paths or []):
@@ -8011,9 +9584,18 @@ def call_claude_prompt(
 
     def run_claude(command: list[str], stdin_text: str) -> subprocess.CompletedProcess[str]:
         if progress:
+            # Streamed stdin is only reachable from a turn that has a progress
+            # channel, which is the same condition under which a job exists for the
+            # user to speak into. A plain CLI run keeps the old one-shot stdin.
+            channel = StreamedStdin()
             return run_process_with_progress(
-                command, cwd, timeout_seconds, progress, stdin_text=stdin_text,
+                command,
+                cwd,
+                timeout_seconds,
+                progress,
+                stdin_text=StreamedStdin.encode(stdin_text),
                 event_formatter=claude_stream_progress,
+                stdin_channel=channel,
             )
         return subprocess.run(
             command, cwd=cwd, check=False, text=True, encoding="utf-8", errors="replace",
@@ -8118,6 +9700,12 @@ def stream_capturing_progress(
             progress(message)
 
     wrapped.event_sink = stream.ingest  # type: ignore[attr-defined]
+    # A sequence room is one job running a chain of agent processes, so the job's
+    # interjection queue has to reach whichever agent is speaking right now. A
+    # message queued between two replies is simply picked up by the next one.
+    take_interjections = getattr(progress, "take_interjections", None)
+    if take_interjections is not None:
+        wrapped.take_interjections = take_interjections  # type: ignore[attr-defined]
     cancelled = getattr(progress, "cancelled", None)
     if cancelled is not None:
         wrapped.cancelled = cancelled  # type: ignore[attr-defined]
@@ -8130,6 +9718,7 @@ def call_claude_agent(
     *,
     cwd: Path,
     progress: ProgressCallback | None = None,
+    system_extra: str = "",
 ) -> AgentReply:
     """Run one team-pipeline stage as the given role.
 
@@ -8160,10 +9749,10 @@ def call_claude_agent(
         "--output-format", "stream-json",
         "--verbose",
         "--no-session-persistence",
-        "--permission-mode", "auto" if writable else "bypassPermissions",
+        "--permission-mode", claude_permission_mode(config, writable=writable),
         "--allowedTools", tools,
         "--append-system-prompt",
-        f"{agent['prompt']}\n\n{WORKER_RUNTIME_OVERRIDE}",
+        f"{agent['prompt']}\n\n{WORKER_RUNTIME_OVERRIDE}{system_extra}",
     ])
     # The role's restriction is expressed as a denylist, not `--tools`. `--tools`
     # is a built-in allowlist that silently drops MCP servers' tools from the
@@ -8181,7 +9770,7 @@ def call_claude_agent(
             "--json-schema",
             json.dumps(request.schema, ensure_ascii=False, separators=(",", ":")),
         ])
-    model = str(agent.get("model") or config.get("model") or "").strip()
+    model = claude_stage_model(agent.get("model"), config.get("model"))
     if model:
         command.extend(["--model", model])
 
@@ -8219,11 +9808,11 @@ def call_claude_agent(
 #: Claude's vocabulary because that is where the roles came from; running the same
 #: role on Codex means picking the matching tier rather than dropping the intent.
 CLAUDE_TO_CODEX_TIER = {
+    "fable": "gpt-5.6-sol",
     "opus": "gpt-5.6-sol",
     "sonnet": "gpt-5.6-terra",
     "haiku": "gpt-5.6-luna",
 }
-
 
 def call_codex_agent(
     root: Path,
@@ -8359,7 +9948,7 @@ def run_team_pipeline_turn(
     progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     """Run a deterministic team pipeline for one branch turn."""
-    if str(read_llm_config(root).get("provider") or "codex") != "claude":
+    if str(read_llm_config(root, branch_id).get("provider") or "codex") != "claude":
         raise ValueError("team pipeline requires the claude provider")
     turn_id = new_turn_id()
     emit_progress(progress, "Recording user message")
@@ -8469,18 +10058,35 @@ def call_claude_chat(
     progress: ProgressCallback | None = None,
     output_schema: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    prompt = build_chat_prompt(
-        store, branch_id, user_message,
-        approved_external_paths=approved_external_paths,
-        resource_paths=resource_paths,
-    )
-    config = read_llm_config(root).get("claude", {})
+    config = read_llm_config(root, branch_id).get("claude", {})
+    guiding = chat_guiding_context(store, branch_id)
+    key = session_key(branch_id, "chat", "claude", str(config.get("model") or ""), guiding)
+    resuming = remembered_session(root, key) if session_continuity_enabled(config) else ""
+    if resuming:
+        # The session already holds the branch; send only what is new.
+        prompt = build_continuation_prompt(
+            store, branch_id, user_message,
+            guiding_context=guiding, resource_paths=resource_paths,
+        )
+        session = (resuming, "resume")
+    else:
+        prompt = build_chat_prompt(
+            store, branch_id, user_message,
+            approved_external_paths=approved_external_paths,
+            resource_paths=resource_paths,
+        )
+        session = (str(uuid.uuid4()), "new") if session_continuity_enabled(config) else None
     writable = str(config.get("sandbox") or DEFAULT_CODEX_SANDBOX) != "read-only"
-    return call_claude_prompt(
+    result = call_claude_prompt(
         root, prompt, cwd=root, writable=writable,
         approved_external_paths=approved_external_paths,
         progress=progress, output_schema=output_schema,
+        system_extra=guiding_system_directive(guiding),
+        session=session,
     )
+    if session:
+        remember_session(root, key, session[0])
+    return result
 
 
 def call_claude_history_chat(
@@ -8496,6 +10102,7 @@ def call_claude_history_chat(
     return call_claude_prompt(
         root, prompt, cwd=root, writable=False,
         progress=progress, output_schema=output_schema,
+        system_extra=guiding_system_directive(info_chat_guiding_context(store, branch_id)),
     )
 
 
@@ -8536,19 +10143,75 @@ def call_provider_prompt(
     cwd: Path | None = None,
     progress: ProgressCallback | None = None,
     output_schema: dict[str, Any] | None = None,
+    system_extra: str = "",
+    model_override: str = "",
 ) -> dict[str, Any]:
     workdir = (cwd or root).resolve()
     if provider == "claude":
         return call_claude_prompt(
             root, prompt, cwd=workdir, writable=writable,
             progress=progress, output_schema=output_schema,
+            system_extra=system_extra, model_override=model_override,
         )
     if provider == "codex":
         return call_codex_prompt(
             root, prompt, writable=writable, cwd=workdir,
             progress=progress, output_schema=output_schema,
+            system_extra=system_extra, model_override=model_override,
         )
     raise RuntimeError(f"Unsupported chat provider: {provider}")
+
+
+#: Progress lines that are machinery rather than the agent talking. Kept in step
+#: with the same split the live panel makes, so what you read while waiting and
+#: what stays on the turn are the same thing.
+_PROGRESS_MACHINERY_RE = re.compile(
+    r"^(Using tool:|Running command:|Command finished|stderr:|Codex event:|Codex turn started"
+    r"|Sequence reply \d+ saved|Sequence evaluation \d+:|Process exited with code"
+    r"|프로세스 종료 코드:|시작됨$|완료됨$|대기 중$|실패:|Claude Code is working$"
+    r"|Checking Claude Code login$)"
+)
+
+
+def is_progress_narration(message: str) -> bool:
+    text = str(message or "").strip()
+    if not text:
+        return False
+    if _PROGRESS_MACHINERY_RE.search(text):
+        return False
+    if looks_like_chat_envelope(text):
+        return False
+    # ctxgit's own step labels, in either the English they are emitted in or the
+    # Korean they are displayed in.
+    if text in PROGRESS_STEP_LABELS or text in PROGRESS_STEP_LABELS.values():
+        return False
+    return not text.endswith("중")
+
+
+def narration_collecting_progress(
+    progress: ProgressCallback | None, sink: list[str]
+) -> ProgressCallback | None:
+    """Wrap a progress callback so the agent's own lines are kept for the record.
+
+    What the agent says while it works is the only account of how it got there, and
+    it used to live solely in the job's event list — which is a separate file, is
+    not shown in the branch, and is gone from view the moment the turn ends. This
+    keeps those lines so they can be stored on the turn.
+    """
+
+    def wrapped(message: str) -> None:
+        if is_progress_narration(message):
+            text = str(message).strip()
+            if not sink or sink[-1] != text:
+                sink.append(text)
+        if progress:
+            progress(message)
+
+    for attribute in ("cancelled", "take_interjections", "event_sink", "job_id"):
+        value = getattr(progress, attribute, None)
+        if value is not None:
+            setattr(wrapped, attribute, value)
+    return wrapped
 
 
 def run_chat_turn(
@@ -8562,8 +10225,12 @@ def run_chat_turn(
     resource_paths: list[str] | None = None,
     progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
-    selected_provider = provider or str(read_llm_config(root).get("provider") or "codex")
+    selected_provider = provider or str(read_llm_config(root, branch_id).get("provider") or "codex")
     turn_id = new_turn_id()
+    # What the agent says while it works is kept and stored on the turn, so the
+    # account of how it got there survives the turn ending.
+    narration: list[str] = []
+    progress = narration_collecting_progress(progress, narration)
     emit_progress(progress, "Preparing branch context")
     store.auto_ingest_branch_sources(branch_id)
     store.maybe_compact_history(branch_id)
@@ -8575,7 +10242,7 @@ def run_chat_turn(
         if normalized_resources:
             user_extra["resources"] = normalized_resources
         store.append_history(branch_id, "user", user_message, extra=user_extra)
-    markdown_before = markdown_file_snapshot(root)
+    markdown_before = tracked_file_snapshot(root)
     stream = StreamTranscript()
     result = call_provider_chat(
         selected_provider,
@@ -8602,7 +10269,7 @@ def run_chat_turn(
                 "timeline": stream.timeline(),
             },
         )
-    direct_markdown_refs = changed_markdown_file_refs(root, markdown_before, markdown_file_snapshot(root))
+    direct_markdown_refs = changed_tracked_file_refs(root, markdown_before, tracked_file_snapshot(root))
     artifact_refs = []
     emit_progress(progress, "Saving assistant output")
     for artifact in result.get("artifacts", []):
@@ -8637,6 +10304,10 @@ def run_chat_turn(
             "artifacts": artifact_refs,
             "approvalRequests": approval_requests,
             **({"orchestrationLog": orchestration_log} if orchestration_log else {}),
+            # Stored on the record, not in its text: the chat can show it, and the
+            # prompt builder — which reads only role and text — never sees it, so a
+            # turn's working notes do not become context for every later turn.
+            **({"progress": narration[-40:]} if narration else {}),
         },
     )
     turn_commit = internal_git_commit_turn(
@@ -8668,13 +10339,25 @@ def run_history_chat_turn(
     provider: str | None = None,
     resource_paths: list[str] | None = None,
     progress: ProgressCallback | None = None,
+    aside: bool = False,
 ) -> dict[str, Any]:
-    selected_provider = provider or str(read_llm_config(root).get("provider") or "codex")
+    """One info-chat turn on a branch.
+
+    `aside` marks it as a BTW lookup: something asked on the side while a real turn
+    was running. It is still written to `history.jsonl`, because the branch is a
+    record and dropping it would leave an answer nobody can trace, but it is kept
+    out of the chat timeline and out of every later prompt. A side question is not
+    part of the conversation the branch is having, and letting it into the prompt
+    would put a throwaway lookup in front of the model on every turn that follows.
+    """
+    selected_provider = provider or str(read_llm_config(root, branch_id).get("provider") or "codex")
     turn_id = new_turn_id()
     emit_progress(progress, "Preparing branch context")
     normalized_resources = normalize_branch_resource_paths(store, branch_id, resource_paths)
     emit_progress(progress, "Recording user message")
     user_extra: dict[str, Any] = {"turnId": turn_id, "mode": "info-chat"}
+    if aside:
+        user_extra["aside"] = True
     if normalized_resources:
         user_extra["resources"] = normalized_resources
     store.append_history(branch_id, "user", user_message, extra=user_extra)
@@ -8700,6 +10383,7 @@ def run_history_chat_turn(
             "turnId": turn_id,
             "artifacts": [],
             "approvalRequests": [],
+            **({"aside": True} if aside else {}),
         },
     )
     turn_commit = internal_git_commit_turn(
@@ -8714,6 +10398,10 @@ def run_history_chat_turn(
     emit_progress(progress, "Refreshing branch view")
     payload = branch_payload(store, branch_id)
     payload["turnCommit"] = turn_commit
+    if aside:
+        # The answer is filtered out of `history`, so hand it back directly —
+        # otherwise the panel that asked has no way to read its own reply.
+        payload["asideAnswer"] = assistant
     return payload
 
 
@@ -8799,7 +10487,7 @@ def run_knowledging_turn(
     if not instruction:
         die("knowledging instruction is required")
     document = store.knowledge_document(doc_id)
-    selected_provider = provider or str(read_llm_config(root).get("provider") or "codex")
+    selected_provider = provider or str(read_llm_config(root, branch_id).get("provider") or "codex")
     emit_progress(progress, f"Distilling knowledge for {document['path']}")
     prompt = build_knowledging_prompt(store, document, instruction, source_text, branch_id)
     result = call_provider_prompt(
@@ -9310,6 +10998,9 @@ def build_sequence_agent_prompt(
         if stop_decider is not None
         else "Respond with your contribution. This room has no evaluator and will run for one cycle."
     )
+    room_guiding_context = guiding_context_sections(
+        store, branch_id, min(DEFAULT_GUIDING_BUDGET_CHARS, max(4000, int(total_budget * 0.15)))
+    )
     return "\n".join([
         "You are one participant in a ctxgit sequence room.",
         f"You are Agent {order}. Speak only as Agent {order}; do not write another agent's response.",
@@ -9325,9 +11016,7 @@ def build_sequence_agent_prompt(
         "",
         # Guiding knowledge belongs to the branch you are in, so in a room every
         # agent shares the room's guiding documents as a common briefing.
-        *guiding_prompt_parts(
-            guiding_context_sections(store, branch_id, min(DEFAULT_GUIDING_BUDGET_CHARS, max(4000, int(total_budget * 0.15))))
-        ),
+        *guiding_prompt_parts(room_guiding_context),
         "Your private source-branch snapshot context:",
         "<source_context>",
         truncate_middle(read_text(archive_root / "context.md"), source_context_budget),
@@ -9365,6 +11054,8 @@ def build_sequence_agent_prompt(
         "",
         f"Current reply number: {reply_index + 1} of at most {maximum}.",
         evaluator_instruction if stop_decider is not None and order == stop_decider else participant_instruction,
+        "",
+        *guiding_enforcement_parts(room_guiding_context),
     ])
 
 
@@ -9378,15 +11069,43 @@ def run_sequence_room_turn(
     progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     config = store.sequence_room_config(branch_id)
-    selected_provider = str(read_llm_config(root).get("provider") or "codex")
+    selected_provider = str(read_llm_config(root, branch_id).get("provider") or "codex")
     participants = config.get("participants") if isinstance(config.get("participants"), list) else []
     if len(participants) < 2:
         raise ValueError("sequence room must have at least two participants")
-    participants_by_order = {
-        int(item.get("order") or 0): item
-        for item in participants
-        if isinstance(item, dict) and int(item.get("order") or 0) > 0
-    }
+    # The count check above passes on the raw list, but what the room actually
+    # speaks from is this mapping — and building it can silently lose people. An
+    # entry with no usable order is dropped, and two entries sharing an order
+    # collapse into one. A room that loses everyone but its evaluator still runs:
+    # observed on 2026-08-23, where a save mid-edit left one order and the
+    # evaluator then answered and graded itself for all six replies, burning the
+    # run without writing a single reply anyone wanted. Fail here instead.
+    participants_by_order: dict[int, dict[str, Any]] = {}
+    collisions: list[int] = []
+    unordered = 0
+    for item in participants:
+        if not isinstance(item, dict):
+            continue
+        order = int(item.get("order") or 0)
+        if order <= 0:
+            unordered += 1
+            continue
+        if order in participants_by_order:
+            collisions.append(order)
+            continue
+        participants_by_order[order] = item
+    if collisions or unordered:
+        detail = []
+        if collisions:
+            detail.append(f"duplicate order {', '.join(str(item) for item in sorted(set(collisions)))}")
+        if unordered:
+            detail.append(f"{unordered} participant(s) with no speaking order")
+        raise ValueError(
+            "sequence room participants are inconsistent (" + "; ".join(detail) + "). "
+            "Reopen the participant panel and save the order again."
+        )
+    if len(participants_by_order) < 2:
+        raise ValueError("sequence room must have at least two participants with a speaking order")
     configured_speaking_order = (
         config.get("speakingOrder") if isinstance(config.get("speakingOrder"), list) else []
     )
@@ -9403,6 +11122,16 @@ def run_sequence_room_turn(
         if raw_stop_decider is not None and int(raw_stop_decider) in speaking_order
         else None
     )
+    # One speaker is a real setup: name a single participant, get one reply, done.
+    # What is not a setup is one speaker who is also the evaluator — that agent
+    # answers and then grades its own answer, round after round, which is how a
+    # room whose participants had collapsed burned six replies of self-marking.
+    if len(speaking_order) == 1 and stop_decider is not None:
+        raise ValueError(
+            "the only speaker in this room is also its evaluator, so it would grade "
+            "its own replies. Add another speaker, or clear the evaluator to take a "
+            "single reply and stop."
+        )
     maximum = max_agent_replies or coerce_positive_int(config.get("defaultMaxAgentReplies"), 6)
     maximum = max(2, min(40, maximum))
     if stop_decider is None:
@@ -9430,6 +11159,14 @@ def run_sequence_room_turn(
     )
     # Deterministic from run_id, so each reply can point at the log written below.
     orchestration_log = relpath(root, orchestration_log_path(store, branch_id, run_id))
+    # Room agents used to get guiding only inside the prompt body, which is the
+    # weakest of the three placements — one section of a very long user message,
+    # tens of thousands of characters before the reply is written, with the room's
+    # own transcript in between. Chat turns have carried it in the provider's
+    # standing-instruction channel for a while; rooms now do too, on both providers.
+    room_guiding = guiding_system_directive(
+        guiding_context_sections(store, branch_id, DEFAULT_GUIDING_BUDGET_CHARS)
+    )
     stopped = False
     stop_reason = ""
     evaluator_rounds = 0
@@ -9459,22 +11196,31 @@ def run_sequence_room_turn(
             if stop_decider is not None and order == stop_decider
             else None
         )
-        markdown_before = markdown_file_snapshot(root)
+        markdown_before = tracked_file_snapshot(root)
         reply_stream = StreamTranscript()
+        # Each seat may name its own provider and model. A room where the writer
+        # and the evaluator run on the same model is one model grading itself, so
+        # the seats are resolved separately and only fall back to the room's when
+        # they say nothing.
+        seat_llm = participant.get("llm") if isinstance(participant.get("llm"), dict) else {}
+        seat_provider = str(seat_llm.get("provider") or "").strip().lower() or selected_provider
+        seat_model = str(seat_llm.get("model") or "").strip()
         result = call_provider_prompt(
-            selected_provider,
+            seat_provider,
             root,
             prompt,
             writable=effective_access == "send",
             cwd=workspace,
             progress=stream_capturing_progress(reply_stream, progress),
             output_schema=output_schema,
+            system_extra=room_guiding,
+            model_override=seat_model,
         )
         workspace_rel = relpath(root, workspace)
         workspace_prefix = workspace_rel.rstrip("/") + "/"
         workspace_markdown_refs = [
             item
-            for item in changed_markdown_file_refs(root, markdown_before, markdown_file_snapshot(root))
+            for item in changed_tracked_file_refs(root, markdown_before, tracked_file_snapshot(root))
             if str(item.get("path") or "").startswith(workspace_prefix)
         ]
         text = str(result.get("assistant") or "").strip()
@@ -9510,7 +11256,8 @@ def run_sequence_room_turn(
                 },
                 "sequenceReply": reply_index + 1,
                 "sequenceAccessMode": effective_access,
-                "provider": selected_provider,
+                "provider": seat_provider,
+                **({"model": seat_model} if seat_model else {}),
                 "artifacts": workspace_markdown_refs,
                 "orchestrationLog": orchestration_log,
                 **(
@@ -9726,6 +11473,8 @@ def build_research_prompt(store: ContextStore, branch_id: str, query: str) -> st
             "Check section that distinguishes directly supported, weakly supported,",
             "and unsupported claims.",
             "Do not edit files.",
+            "",
+            *record_voice_parts(),
         ]
     )
 
@@ -10006,6 +11755,824 @@ def run_snapshot(root: Path, message: str, include_tools: bool = False) -> None:
     subprocess.run(["git", "commit", "-m", message], cwd=root, check=True)
 
 
+#: Boss chat: one desk to hand out work from, with a fixed set of branches as the
+#: only possible recipients.
+#:
+#: Distinct from the contexts chat, which reads every branch and answers itself.
+#: This one answers nothing on its own. It drafts what each chosen branch should be
+#: told, the user reviews that wording — edits it, argues with it, drops it — and
+#: only an approved draft becomes a real turn on that branch, in the mode the user
+#: picked for that one turn. When the branch answers, the next message is drafted
+#: and waits for the same review. The loop is the feature: it is meant to feel like
+#: reading a colleague's prompt before they send it.
+#:
+#: On disk, under contexts/boss/:
+#:   config.json    which branches the desk may talk to
+#:   history.jsonl  what the user asked for, the feedback given, what was sent
+#:   draft.json     the desk: `items` (one reviewable draft per branch) and
+#:                  `threads` (what each branch was last told, so a follow-up can
+#:                  be written against it)
+BOSS_CHAT_KEY = "__boss__"
+BOSS_DIR_NAME = "boss"
+#: The two ways an approved draft can be sent. Chosen by the user per branch, per
+#: turn — never stored as a standing setting and never decided by the model.
+BOSS_SEND_MODES = ("info-chat", "send")
+
+
+def boss_dir(store: ContextStore) -> Path:
+    return store.contexts / BOSS_DIR_NAME
+
+
+def boss_history_path(store: ContextStore) -> Path:
+    return boss_dir(store) / "history.jsonl"
+
+
+def boss_config_path(store: ContextStore) -> Path:
+    return boss_dir(store) / "config.json"
+
+
+def boss_draft_path(store: ContextStore) -> Path:
+    return boss_dir(store) / "draft.json"
+
+
+def boss_followup_job_key(branch_id: str) -> str:
+    """The job-branch key a follow-up draft runs under.
+
+    Not BOSS_CHAT_KEY itself: the UI tracks one job per key, and a follow-up being
+    written in the background must not make the desk's composer look busy.
+    """
+    return f"{BOSS_CHAT_KEY}:{branch_id}"
+
+
+def read_boss_config(store: ContextStore) -> dict[str, Any]:
+    data = load_json(boss_config_path(store)) if boss_config_path(store).exists() else {}
+    if not isinstance(data, dict):
+        data = {}
+    raw = data.get("branches")
+    branches = [str(item) for item in raw if str(item or "").strip()] if isinstance(raw, list) else []
+    # A branch can be renamed or archived between sessions; a stale id would send
+    # work nowhere and say nothing about it.
+    known = {str(item.get("id") or "") for item in store.list_branches()}
+    return {"branches": [b for b in dict.fromkeys(branches) if b in known]}
+
+
+def write_boss_config(store: ContextStore, branches: list[str]) -> dict[str, Any]:
+    known = {str(item.get("id") or "") for item in store.list_branches()}
+    unknown = [b for b in branches if b not in known]
+    if unknown:
+        raise ValueError(f"unknown branch: {', '.join(unknown)}")
+    boss_dir(store).mkdir(parents=True, exist_ok=True)
+    dump_json(boss_config_path(store), {"branches": list(dict.fromkeys(branches))})
+    # A draft addressed to a branch that just left the desk can no longer be sent.
+    drop_boss_items(store, keep=set(branches))
+    return read_boss_config(store)
+
+
+def iter_boss_history(store: ContextStore) -> list[dict[str, Any]]:
+    return store.read_history_file(boss_history_path(store))
+
+
+def append_boss_history(store: ContextStore, role: str, text: str, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    boss_dir(store).mkdir(parents=True, exist_ok=True)
+    path = boss_history_path(store)
+    record = {
+        "schemaVersion": 1,
+        "id": new_history_record_id(),
+        "branch": BOSS_CHAT_KEY,
+        "role": role,
+        "text": text,
+        "createdAt": utc_now(),
+    }
+    if extra:
+        record.update(extra)
+    with file_write_lock(path):
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+    return record
+
+
+# --- the desk -----------------------------------------------------------------
+
+
+def read_boss_draft(store: ContextStore) -> dict[str, Any]:
+    path = boss_draft_path(store)
+    if not path.exists():
+        return {}
+    data = load_json(path)
+    return data if isinstance(data, dict) else {}
+
+
+def mutate_boss_draft(store: ContextStore, change: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
+    """Read-modify-write the desk under one lock.
+
+    Drafting, follow-ups landing from finished turns and the user's own edits all
+    write here from different threads; without the lock the last writer silently
+    drops what the others just put on the board.
+    """
+    path = boss_draft_path(store)
+    with file_write_lock(path):
+        desk = read_boss_draft(store)
+        change(desk)
+        boss_dir(store).mkdir(parents=True, exist_ok=True)
+        dump_json(path, desk)
+        return desk
+
+
+def clear_boss_draft(store: ContextStore) -> None:
+    with file_write_lock(boss_draft_path(store)):
+        with contextlib.suppress(OSError):
+            boss_draft_path(store).unlink()
+
+
+def boss_pending_items(store: ContextStore) -> list[dict[str, Any]]:
+    """Everything waiting for review, at most one item per branch.
+
+    The first round and every follow-up land in the same list: from the desk's
+    point of view there is no difference between "what should we tell sales" and
+    "sales just answered — what now". Both are a sentence waiting to be approved.
+    """
+    raw = read_boss_draft(store).get("items")
+    return [item for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
+
+
+def boss_threads(store: ContextStore) -> dict[str, dict[str, Any]]:
+    raw = read_boss_draft(store).get("threads")
+    return {str(k): v for k, v in raw.items() if isinstance(v, dict)} if isinstance(raw, dict) else {}
+
+
+def _desk_items(desk: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = desk.get("items")
+    return [item for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
+
+
+def upsert_boss_items(store: ContextStore, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Add or replace review items, newest wording winning per branch."""
+
+    def change(desk: dict[str, Any]) -> None:
+        by_branch = {str(item.get("branch")): item for item in _desk_items(desk)}
+        for item in items:
+            by_branch[str(item.get("branch"))] = item
+        desk["items"] = list(by_branch.values())
+
+    return _desk_items(mutate_boss_draft(store, change))
+
+
+def drop_boss_items(
+    store: ContextStore, branches: set[str] | None = None, *, keep: set[str] | None = None
+) -> None:
+    """Take items off the board: the named branches, or everything not in `keep`."""
+    if not boss_draft_path(store).exists():
+        return
+
+    def change(desk: dict[str, Any]) -> None:
+        def stays(item: dict[str, Any]) -> bool:
+            branch_id = str(item.get("branch"))
+            if keep is not None:
+                return branch_id in keep
+            return branches is not None and branch_id not in branches
+
+        desk["items"] = [item for item in _desk_items(desk) if stays(item)]
+
+    mutate_boss_draft(store, change)
+
+
+def save_boss_edits(store: ContextStore, edits: Any) -> None:
+    """Persist wording the user typed over a draft.
+
+    Hand edits are kept on the item rather than only in the page, so a re-render,
+    a reload or a rewrite-from-feedback all start from what the user actually
+    wrote instead of from the model's last version.
+    """
+    wanted = {
+        str(item.get("branch") or ""): str(item.get("instruction") or "").strip()
+        for item in (edits if isinstance(edits, list) else [])
+        if isinstance(item, dict)
+    }
+    wanted = {branch: text for branch, text in wanted.items() if branch and text}
+    if not wanted or not boss_draft_path(store).exists():
+        return
+
+    def change(desk: dict[str, Any]) -> None:
+        for item in _desk_items(desk):
+            text = wanted.get(str(item.get("branch")))
+            if text and text != item.get("instruction"):
+                item["instruction"] = text
+                item["edited"] = True
+                item["editedAt"] = utc_now()
+
+    mutate_boss_draft(store, change)
+
+
+def new_boss_item(branch_id: str, instruction: str, **fields: Any) -> dict[str, Any]:
+    return {
+        # A new id per model-written version: the page uses it to tell "the same
+        # draft I am editing" from "a rewrite that replaces my edit".
+        "id": new_turn_id(),
+        "branch": branch_id,
+        "instruction": instruction,
+        "createdAt": utc_now(),
+        **fields,
+    }
+
+
+def last_branch_answer(store: ContextStore, branch_id: str) -> dict[str, Any]:
+    for record in reversed(list(store.iter_history(branch_id))):
+        if str(record.get("role")) == "assistant" and str(record.get("text") or "").strip():
+            return record
+    return {}
+
+
+# --- prompts --------------------------------------------------------------------
+
+
+BOSS_ROUTING_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["assignments", "summary"],
+    "properties": {
+        "summary": {"type": "string"},
+        "assignments": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["branch", "instruction", "suggestedMode"],
+                "properties": {
+                    "branch": {"type": "string"},
+                    "instruction": {"type": "string"},
+                    "suggestedMode": {"type": "string", "enum": list(BOSS_SEND_MODES)},
+                },
+            },
+        },
+    },
+}
+
+_BOSS_MODE_GUIDE = [
+    "For each instruction also give `suggestedMode` — only a hint, the user decides:",
+    "- `info-chat`: the branch only needs to read, think and answer.",
+    "- `send`: the branch has to change files or otherwise do work.",
+]
+
+
+def _boss_branch_rows(store: ContextStore, branches: list[str]) -> list[str]:
+    rows = []
+    for branch_id in branches:
+        meta = load_json(store.branch_paths_for_read(branch_id).meta)
+        title = str(meta.get("title") or branch_id)
+        report = truncate_middle(branch_report_for_prompt(store, branch_id), 2000)
+        rows.append(f"### {branch_id}\ntitle: {title}\n{report}")
+    return rows
+
+
+def build_boss_routing_prompt(store: ContextStore, message: str, branches: list[str]) -> str:
+    """Ask which of these branches each piece of the request belongs to.
+
+    Only the chosen branches are offered, and only their own description is given:
+    the decision is "who does this", not "how", and the branch itself already holds
+    everything needed to answer once the work arrives.
+    """
+    return "\n".join(
+        [
+            "You are splitting one request across a fixed set of ctxgit branches.",
+            "",
+            "Each branch is an ongoing piece of work with its own history and rules.",
+            "Decide which branch each part of the request belongs to, and write the",
+            "instruction that branch should receive. Write it as the user would say it",
+            "to that branch directly — it will be sent verbatim as their message, after",
+            "the user has reviewed and possibly edited it.",
+            "",
+            "Rules:",
+            "- Use only the branches listed below. Never invent one.",
+            "- A branch that has nothing to do gets no assignment; do not pad.",
+            "- One branch may receive at most one instruction; combine if needed.",
+            "- Keep each instruction self-contained: that branch cannot see this request.",
+            "- Write in the language the request is written in.",
+            *_BOSS_MODE_GUIDE,
+            "",
+            "Branches:",
+            *_boss_branch_rows(store, branches),
+            "",
+            "Request:",
+            "<request>",
+            message,
+            "</request>",
+            "",
+            "Return JSON only, with `assignments` and a short `summary` of how you",
+            "split it, written in the user's language. These are drafts awaiting the",
+            "user's review — the summary must not claim anything was sent.",
+        ]
+    )
+
+
+def build_boss_revision_prompt(
+    store: ContextStore, targets: list[dict[str, Any]], feedback: str
+) -> str:
+    """Ask for the drafts to be rewritten against the user's comment on them."""
+    drafts = []
+    for item in targets:
+        branch_id = str(item.get("branch"))
+        block = [f"### {branch_id}"]
+        if item.get("request"):
+            block += ["what the user originally asked for:", f"<request>{item['request']}</request>"]
+        if item.get("origin") == "followup":
+            answer = str(last_branch_answer(store, branch_id).get("text") or "")
+            if answer:
+                block += ["the branch's latest answer:", f"<answer>{truncate_middle(answer, 3000)}</answer>"]
+        if item.get("edited"):
+            block.append("(the user edited this wording by hand — respect those edits)")
+        block += ["current draft:", f"<draft>{item.get('instruction') or ''}</draft>"]
+        drafts.append("\n".join(block))
+    return "\n".join(
+        [
+            "You drafted messages for ctxgit branches on the user's behalf. The user",
+            "read the drafts and gave feedback. Rewrite them.",
+            "",
+            "Rules:",
+            "- Return one assignment for every branch listed under Drafts, and no other.",
+            "- Change what the feedback asks for; keep what it did not question.",
+            "- Each instruction is sent verbatim as the user's message to that branch,",
+            "  which cannot see this conversation — keep it self-contained.",
+            "- Write in the language the drafts are written in.",
+            *_BOSS_MODE_GUIDE,
+            "",
+            "Branches:",
+            *_boss_branch_rows(store, [str(item.get("branch")) for item in targets]),
+            "",
+            "Drafts:",
+            *drafts,
+            "",
+            "Feedback:",
+            "<feedback>",
+            feedback,
+            "</feedback>",
+            "",
+            "Return JSON only, with `assignments` and a short `summary` of what you",
+            "changed, written in the user's language.",
+        ]
+    )
+
+
+def normalize_boss_assignments(raw: Any, allowed: Iterable[str]) -> list[dict[str, Any]]:
+    """Keep only assignments aimed at branches the user actually chose.
+
+    The model proposes; this is the gate. A branch outside the selection is the
+    one thing boss chat must never reach, whether the name came from the model or
+    from the page.
+    """
+    allowed_set = set(allowed)
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, dict):
+            continue
+        branch_id = str(item.get("branch") or "").strip()
+        instruction = str(item.get("instruction") or "").strip()
+        if branch_id not in allowed_set or branch_id in seen or not instruction:
+            continue
+        seen.add(branch_id)
+        entry: dict[str, Any] = {"branch": branch_id, "instruction": instruction}
+        for key in ("mode", "suggestedMode"):
+            if str(item.get(key) or "") in BOSS_SEND_MODES:
+                entry[key] = str(item[key])
+        out.append(entry)
+    return out
+
+
+def _boss_provider(root: Path) -> str:
+    return str(read_llm_config(root).get("provider") or "codex")
+
+
+def boss_structured_reply(result: Any, key: str) -> dict[str, Any]:
+    """Dig the JSON object the desk asked for out of a provider reply.
+
+    `call_provider_prompt` hands every reply back as a chat envelope, whatever
+    schema was requested: the object the model wrote arrives as text in
+    `assistant`, often inside a ```json fence. Reading `assignments` straight off
+    the envelope therefore always came back empty — drafting "succeeded" and the
+    board stayed blank. A reply that cannot be read is an error, not zero drafts.
+    """
+    if isinstance(result, dict) and key in result:
+        return result
+    text = str(result.get("assistant") or "") if isinstance(result, dict) else str(result or "")
+    candidates = [text.strip()]
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
+    if fenced:
+        candidates.insert(0, fenced.group(1).strip())
+    start, end = text.find("{"), text.rfind("}")
+    if 0 <= start < end:
+        candidates.append(text[start : end + 1])
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict) and key in parsed:
+            return parsed
+    raise RuntimeError(
+        "The model did not return the JSON the desk asked for: "
+        + compact_progress_text(text or "(empty reply)", 200)
+    )
+
+
+# --- drafting -------------------------------------------------------------------
+
+
+def draft_boss_assignments(
+    root: Path,
+    store: ContextStore,
+    message: str,
+    *,
+    record_request: bool = True,
+    progress: ProgressCallback | None = None,
+) -> list[dict[str, Any]]:
+    """Write what each branch would be told, and stop there.
+
+    Nothing is dispatched. The point of boss chat is that the wording going to each
+    branch is reviewed first — the same way you would read an employee's prompt
+    before they send it — so this produces drafts the user edits, redirects with
+    feedback, or approves.
+    """
+    branches = read_boss_config(store)["branches"]
+    if not branches:
+        raise ValueError("Boss chat has no branches selected yet.")
+    if record_request:
+        # The HTTP path records the request itself, before the job starts, so it
+        # is on screen from the first moment even if drafting then fails.
+        append_boss_history(store, "user", message)
+    emit_progress(progress, "Drafting what each branch should be told")
+    routing = boss_structured_reply(
+        call_provider_prompt(
+            _boss_provider(root), root, build_boss_routing_prompt(store, message, branches),
+            writable=False, cwd=root, progress=progress, output_schema=BOSS_ROUTING_SCHEMA,
+        ),
+        "assignments",
+    )
+    assignments = normalize_boss_assignments(routing.get("assignments"), branches)
+    summary = str(routing.get("summary") or "").strip()
+    items = [
+        new_boss_item(
+            item["branch"], item["instruction"],
+            suggestedMode=item.get("suggestedMode") or "info-chat",
+            origin="initial", request=message, reason="",
+        )
+        for item in assignments
+    ]
+    if items:
+        upsert_boss_items(store, items)
+    # The desk's own voice in the log: how the request was split, or that it was
+    # not. A request that produced no draft and no explanation looks like a bug.
+    lines = [summary] if summary else []
+    lines += [f"- **{item['branch']}** 초안 준비됨" for item in items]
+    if not items:
+        lines.append("_고른 브랜치 중 이 일을 맡을 곳을 찾지 못했습니다._")
+    append_boss_history(
+        store, "assistant", "\n".join(lines),
+        extra={"kind": "draft", "branches": [item["branch"] for item in items]},
+    )
+    return items
+
+
+def revise_boss_items(
+    root: Path,
+    store: ContextStore,
+    feedback: str,
+    *,
+    only: list[str] | None = None,
+    record_feedback: bool = True,
+    progress: ProgressCallback | None = None,
+) -> list[dict[str, Any]]:
+    """Rewrite the waiting drafts — all of them, or just `only` — from feedback."""
+    feedback = str(feedback or "").strip()
+    if not feedback:
+        raise ValueError("feedback is required")
+    allowed = set(read_boss_config(store)["branches"])
+    targets = [
+        item for item in boss_pending_items(store)
+        if str(item.get("branch")) in allowed and (not only or str(item.get("branch")) in only)
+    ]
+    if not targets:
+        raise ValueError("There is no draft to revise.")
+    target_ids = [str(item.get("branch")) for item in targets]
+    if record_feedback:
+        append_boss_history(store, "user", feedback, extra={"kind": "feedback", "branches": target_ids})
+    emit_progress(progress, "Rewriting the drafts from your feedback")
+    result = boss_structured_reply(
+        call_provider_prompt(
+            _boss_provider(root), root, build_boss_revision_prompt(store, targets, feedback),
+            writable=False, cwd=root, progress=progress, output_schema=BOSS_ROUTING_SCHEMA,
+        ),
+        "assignments",
+    )
+    rewritten = {
+        item["branch"]: item
+        for item in normalize_boss_assignments(result.get("assignments"), target_ids)
+    }
+    items = []
+    for old in targets:
+        new = rewritten.get(str(old.get("branch")))
+        if not new:
+            continue  # the model skipped it: the existing draft stays as it was
+        items.append(
+            new_boss_item(
+                new["branch"], new["instruction"],
+                suggestedMode=new.get("suggestedMode") or old.get("suggestedMode") or "info-chat",
+                origin=old.get("origin") or "initial",
+                request=old.get("request") or "",
+                reason=old.get("reason") or "",
+                done=old.get("done") is True,
+                revision=int(old.get("revision") or 0) + 1,
+                lastFeedback=feedback,
+            )
+        )
+    if items:
+        upsert_boss_items(store, items)
+    summary = str(result.get("summary") or "").strip()
+    append_boss_history(
+        store, "assistant",
+        summary or ("초안을 다시 썼습니다." if items else "_초안을 바꾸지 못했습니다._"),
+        extra={"kind": "revision", "branches": [item["branch"] for item in items]},
+    )
+    return items
+
+
+BOSS_FOLLOWUP_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["instruction", "reason", "done", "suggestedMode"],
+    "properties": {
+        "instruction": {"type": "string"},
+        "reason": {"type": "string"},
+        "done": {"type": "boolean"},
+        "suggestedMode": {"type": "string", "enum": list(BOSS_SEND_MODES)},
+    },
+}
+
+
+def draft_boss_followup(
+    root: Path,
+    store: ContextStore,
+    branch_id: str,
+    *,
+    progress: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    """Propose what to say to a branch next, now that it has answered.
+
+    A delegated task rarely finishes in one exchange, and the moment the answer
+    lands is exactly when the next instruction is obvious and cheapest to write.
+    Proposing it here keeps the desk one step ahead without sending anything: it
+    is still a draft, reviewed like every other.
+    """
+    if branch_id not in read_boss_config(store)["branches"]:
+        return {}
+    answer = str(last_branch_answer(store, branch_id).get("text") or "")
+    if not answer:
+        return {}
+    thread = boss_threads(store).get(branch_id, {})
+    sent_at = str(thread.get("sentAt") or "")
+    for item in boss_pending_items(store):
+        # The user already queued something newer for this branch while it was
+        # working; their request outranks a follow-up nobody asked for.
+        if str(item.get("branch")) == branch_id and str(item.get("createdAt") or "") > sent_at:
+            return {}
+    emit_progress(progress, f"Drafting the next message for {branch_id}")
+    prompt = "\n".join(
+        [
+            "A branch you delegated to has answered. Write the next thing to say to",
+            "it, as the user would say it — it will be sent verbatim as their message,",
+            "after the user has reviewed it.",
+            "",
+            "Rules:",
+            "- If the work is genuinely finished, set done true and keep the",
+            "  instruction to a short acknowledgement or a final check.",
+            "- Otherwise write the single most useful next step: what is unresolved,",
+            "  what needs verifying, what was promised but not shown.",
+            "- Do not restate the answer back to it. It has its own history.",
+            "- Write in the language of the original request.",
+            *_BOSS_MODE_GUIDE,
+            "",
+            f"Branch: {branch_id}",
+            "",
+            "What the user originally asked the desk for:",
+            "<original_request>",
+            str(thread.get("request") or "(unknown)"),
+            "</original_request>",
+            "",
+            "What this branch was last told:",
+            "<last_instruction>",
+            str(thread.get("lastInstruction") or "(unknown)"),
+            "</last_instruction>",
+            "",
+            "Its latest answer:",
+            "<answer>",
+            truncate_middle(answer, 6000),
+            "</answer>",
+            "",
+            "Return JSON only: `instruction`, a short `reason` in the user's language",
+            "explaining why this is the next step, `done`, and `suggestedMode`.",
+        ]
+    )
+    result = boss_structured_reply(
+        call_provider_prompt(
+            _boss_provider(root), root, prompt,
+            writable=False, cwd=root, progress=progress, output_schema=BOSS_FOLLOWUP_SCHEMA,
+        ),
+        "instruction",
+    )
+    instruction = str(result.get("instruction") or "").strip()
+    if not instruction:
+        return {}
+    mode = str(result.get("suggestedMode") or "")
+    item = new_boss_item(
+        branch_id, instruction,
+        suggestedMode=mode if mode in BOSS_SEND_MODES else "info-chat",
+        origin="followup",
+        request=str(thread.get("request") or ""),
+        reason=str(result.get("reason") or "").strip(),
+        done=result.get("done") is True,
+    )
+    upsert_boss_items(store, [item])
+    return item
+
+
+# --- dispatch -------------------------------------------------------------------
+
+
+def dispatch_boss_items(
+    root: Path,
+    store: ContextStore,
+    jobs: "JobStore",
+    approved: Any,
+) -> dict[str, Any]:
+    """Send approved wording, each branch in the mode chosen for that one turn.
+
+    `approved` is what the page holds at the moment of approval — the text as the
+    user left it and the mode they clicked — not what is stored on the desk.
+    """
+    allowed = read_boss_config(store)["branches"]
+    items = normalize_boss_assignments(approved, allowed)
+    missing_mode = [item["branch"] for item in items if "mode" not in item]
+    if missing_mode:
+        raise ValueError(f"mode is required (send or info-chat): {', '.join(missing_mode)}")
+    if not items:
+        raise ValueError("Nothing to send.")
+    pending = {str(item.get("branch")): item for item in boss_pending_items(store)}
+
+    started: list[dict[str, Any]] = []
+    for item in items:
+        branch_id = item["branch"]
+        busy = [j for j in jobs.running_jobs(root=root) if str(j.get("branch")) == branch_id]
+        if busy:
+            # Mid-turn branches are spoken to rather than queued behind themselves,
+            # which is what the composer and the Telegram remote already do.
+            jobs.interject(str(busy[0].get("id")), item["instruction"], root=root)
+            started.append({**item, "delivery": "interjected", "jobId": str(busy[0].get("id") or "")})
+            continue
+        job = start_branch_turn(
+            root, store, jobs, branch_id, item["instruction"],
+            writable=item["mode"] == "send",
+            # The next instruction is written the moment the answer lands, while
+            # the desk still has somewhere to go rather than an idle branch.
+            on_complete=lambda b=branch_id: start_boss_followup(root, store, jobs, b),
+        )
+        started.append({
+            **item, "delivery": "started",
+            "jobId": str(job.get("id") or ""), "jobMode": str(job.get("mode") or ""),
+        })
+
+    now = utc_now()
+
+    def change(desk: dict[str, Any]) -> None:
+        threads = desk.get("threads") if isinstance(desk.get("threads"), dict) else {}
+        for item in started:
+            previous = threads.get(item["branch"]) if isinstance(threads.get(item["branch"]), dict) else {}
+            source = pending.get(item["branch"], {})
+            threads[item["branch"]] = {
+                "request": str(source.get("request") or previous.get("request") or item["instruction"]),
+                "lastInstruction": item["instruction"],
+                "lastMode": item["mode"],
+                "delivery": item["delivery"],
+                "sentAt": now,
+                "turns": int(previous.get("turns") or 0) + 1,
+            }
+        desk["threads"] = threads
+        # Only what was acted on leaves the board; anything untouched stays.
+        sent = {item["branch"] for item in started}
+        desk["items"] = [i for i in _desk_items(desk) if str(i.get("branch")) not in sent]
+
+    mutate_boss_draft(store, change)
+
+    lines = []
+    for item in started:
+        verb = "끼어들기" if item["delivery"] == "interjected" else ("Send" if item["mode"] == "send" else "Info chat")
+        lines.append(f"- **{item['branch']}** ({verb}): {compact_progress_text(item['instruction'], 200)}")
+    append_boss_history(
+        store, "assistant", "\n".join(lines),
+        extra={"kind": "dispatch", "assignments": started},
+    )
+    payload = boss_chat_payload(store, jobs)
+    payload["started"] = started
+    return payload
+
+
+def start_boss_followup(root: Path, store: ContextStore, jobs: "JobStore", branch_id: str) -> dict[str, Any]:
+    def work(progress: ProgressCallback) -> dict[str, Any]:
+        draft_boss_followup(root, store, branch_id, progress=progress)
+        return boss_chat_payload(store, jobs)
+
+    return jobs.create(
+        "boss-followup", work, root=root,
+        branch=boss_followup_job_key(branch_id), mode="boss-followup",
+    )
+
+
+def start_branch_turn(
+    root: Path,
+    store: ContextStore,
+    jobs: "JobStore",
+    branch_id: str,
+    text: str,
+    *,
+    writable: bool,
+    on_complete: Callable[[], Any] | None = None,
+) -> dict[str, Any]:
+    """Start one branch's turn the same way every other entry point does."""
+    provider = branch_provider_authority(root, branch_id, None)
+    room = branch_is_sequence_room(store, branch_id)
+
+    def work(progress: ProgressCallback) -> dict[str, Any]:
+        if room:
+            result = run_sequence_room_turn(
+                root, store, branch_id, text,
+                run_mode="send" if writable else "info-chat", progress=progress,
+            )
+        elif writable:
+            result = run_chat_turn(root, store, branch_id, text, provider=provider, progress=progress)
+        else:
+            result = run_history_chat_turn(root, store, branch_id, text, provider=provider, progress=progress)
+        if on_complete is not None:
+            # Best-effort: a failed follow-up draft must not fail the turn that
+            # actually did the work.
+            with contextlib.suppress(Exception):
+                on_complete()
+        return result
+
+    kind = "sequence-room" if room else ("chat" if writable else "info-chat")
+    return jobs.create(kind, work, root=root, branch=branch_id, mode=kind)
+
+
+def boss_chat_payload(store: ContextStore, jobs: "JobStore | None" = None) -> dict[str, Any]:
+    store.require_initialized()
+    config = read_boss_config(store)
+    selected = set(config["branches"])
+    running_keys = (
+        {str(job.get("branch") or "") for job in jobs.running_jobs(root=store.root)}
+        if jobs is not None
+        else set()
+    )
+    threads = boss_threads(store)
+    pending = [item for item in boss_pending_items(store) if str(item.get("branch")) in selected]
+
+    def row(item: dict[str, Any]) -> dict[str, Any]:
+        branch_id = str(item.get("id") or "")
+        out = {
+            "id": branch_id,
+            "title": str(item.get("title") or branch_id),
+            "folder": str(item.get("folder") or ""),
+            "historyCount": item.get("historyCount") or 0,
+            "running": branch_id in running_keys,
+            "selected": branch_id in selected,
+            "fromBossChat": item.get("fromBossChat") is True,
+            "lastMessageAt": item.get("lastMessageAt") or "",
+        }
+        if branch_id in selected:
+            # What this branch last said and was last told, so the board shows the
+            # state of the work rather than only its name.
+            answer = last_branch_answer(store, branch_id)
+            out["lastAnswer"] = truncate_middle(str(answer.get("text") or ""), 4000)
+            out["lastAnswerAt"] = str(answer.get("createdAt") or "")
+            out["thread"] = threads.get(branch_id, {})
+            out["draftingFollowup"] = boss_followup_job_key(branch_id) in running_keys
+        return out
+
+    return {
+        "meta": {"id": BOSS_CHAT_KEY, "title": "Boss", "scope": "boss"},
+        "archived": False,
+        "topLevel": True,
+        "boss": True,
+        "config": config,
+        # The same shape the sidebar groups by, so the picker can look identical
+        # instead of being a flat list nobody can find a branch in.
+        "folders": store.list_branch_folders(),
+        "branches": [row(item) for item in store.list_branches()],
+        "history": iter_boss_history(store),
+        "pending": pending,
+        "paths": {"history": relpath(store.root, boss_history_path(store))},
+        "approvalStatuses": {},
+        "notes": [], "research": [], "artifacts": [], "sources": [],
+        "resources": [], "compactions": [], "archives": [],
+    }
+
+
 def context_chat_payload(store: ContextStore) -> dict[str, Any]:
     store.require_initialized()
     history_path = store.context_history_path()
@@ -10084,7 +12651,9 @@ def branch_payload(store: ContextStore, branch_id: str) -> dict[str, Any]:
             "meta": relpath(store.root, paths.meta),
         },
         "context": read_text(paths.context),
-        "history": list(store.iter_history(branch_id)),
+        "history": visible_history_records(store.iter_history(branch_id)),
+        "llmOverride": branch_llm_override(store.root, branch_id),
+        "llmEffective": read_llm_config(store.root, branch_id),
         "approvalStatuses": approval_statuses(store, branch_id),
         "notes": store.list_branch_documents(branch_id, "notes"),
         "research": store.list_branch_documents(branch_id, "research"),
@@ -10243,44 +12812,82 @@ def project_file_entry(root: Path, path: Path) -> dict[str, Any]:
     }
 
 
-def markdown_file_digest(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+#: Formats whose changes are worth naming under a turn's reply.
+#:
+#: Markdown is deliberately absent. A turn rewrites markdown constantly — branch
+#: context, notes, ledgers, indexes, workspace scratch — and listing all of it
+#: buried the answer under dozens of paths that told the reader nothing they did
+#: not already assume. A rebuilt PDF is the opposite: rare, deliberate, and the
+#: thing you actually want to know landed.
+TRACKED_OUTPUT_SUFFIXES = (".pdf",)
 
 
-def markdown_file_snapshot(root: Path) -> dict[str, str]:
+def tracked_file_signature(path: Path) -> str:
+    """What counts as "this file changed".
+
+    Size and modification time, not a content hash: a project can hold hundreds of
+    megabytes of these and a turn snapshots twice, so reading every byte to notice
+    a rebuild costs far more than it tells us.
+    """
+    stat = path.stat()
+    return f"{stat.st_size}:{stat.st_mtime_ns}"
+
+
+def tracked_file_snapshot(root: Path) -> dict[str, str]:
+    """Signatures for the output files a turn might have rebuilt.
+
+    Walks with pruning rather than `rglob`: `rglob` descends into every directory
+    and the skip rules only discard what it has already visited, so a workspace
+    with a few hundred thousand files under `node_modules` and browser profiles
+    cost seconds per call. This runs twice a turn — once before the model and once
+    after — so that time landed directly on the wait before an answer appears.
+    """
     root = root.resolve()
     snapshot: dict[str, str] = {}
-    for path in sorted(root.rglob("*.md")):
+    suffixes = tuple(TRACKED_OUTPUT_SUFFIXES)
+    for current, dirnames, filenames in os.walk(root):
+        here = Path(current)
         try:
-            rel = path.relative_to(root)
+            rel_dir = here.relative_to(root)
         except ValueError:
             continue
-        if should_skip_project_sync_path(rel):
-            continue
-        if not path.is_file():
-            continue
-        try:
-            snapshot[rel.as_posix()] = markdown_file_digest(path)
-        except OSError:
-            continue
+        # Prune in place so the walk never enters what would be discarded anyway.
+        dirnames[:] = [
+            name
+            for name in dirnames
+            if name not in PROJECT_SYNC_SKIP_DIRS
+            # Hidden directories hold no turn output, and this workspace keeps
+            # several browser profiles and a multi-gigabyte internal git store in
+            # them — all of it walked on every turn for nothing.
+            and not name.startswith(".")
+            and not should_skip_project_sync_path(rel_dir / name)
+        ]
+        for name in filenames:
+            if not name.endswith(suffixes):
+                continue
+            rel = rel_dir / name
+            if should_skip_project_sync_path(rel):
+                continue
+            path = here / name
+            try:
+                snapshot[rel.as_posix()] = tracked_file_signature(path)
+            except OSError:
+                continue
     return snapshot
 
 
-def changed_markdown_file_refs(root: Path, before: dict[str, str], after: dict[str, str]) -> list[dict[str, str]]:
+def changed_tracked_file_refs(root: Path, before: dict[str, str], after: dict[str, str]) -> list[dict[str, str]]:
     refs: list[dict[str, str]] = []
     for path in sorted(after):
-        before_digest = before.get(path)
-        if before_digest is None:
-            kind = "created-md"
-        elif before_digest != after[path]:
-            kind = "modified-md"
+        before_signature = before.get(path)
+        if before_signature is None:
+            action = "created"
+        elif before_signature != after[path]:
+            action = "modified"
         else:
             continue
-        refs.append({"kind": kind, "title": Path(path).name, "path": path})
+        suffix = Path(path).suffix.lower().lstrip(".") or "file"
+        refs.append({"kind": f"{action}-{suffix}", "title": Path(path).name, "path": path})
     return refs
 
 
@@ -11136,6 +13743,7 @@ class JobStore:
         def progress(message: str) -> None:
             self.add_event(job_id, message)
         progress.cancelled = lambda: job.get("cancelRequested") is True  # type: ignore[attr-defined]
+        progress.take_interjections = lambda: self.take_interjections(job_id)  # type: ignore[attr-defined]
 
         def target() -> None:
             try:
@@ -11162,17 +13770,103 @@ class JobStore:
         threading.Thread(target=target, daemon=True).start()
         return self.snapshot(job_id)
 
+    #: How long a job file may go unwritten before it stops counting as alive. A
+    #: running turn touches its record on every event; one that stopped being
+    #: updated belongs to a process that is gone.
+    FOREIGN_JOB_STALE_SECONDS = 180
+
     def running_jobs(self, root: Path | None = None) -> list[dict[str, Any]]:
-        """Currently-running jobs for this project, so a reloaded UI can re-attach."""
+        """Currently-running jobs for this project, so a reloaded UI can re-attach.
+
+        Includes turns started by another process — the Telegram remote, or a
+        second server — by reading the job files they write. Without that, a turn
+        driven from chat is invisible in the browser: no running marker, no live
+        progress, and the answer appears only after a reload.
+
+        Foreign records are trusted only while they are still being written to, so
+        a job whose process died drops out on its own rather than showing as
+        running forever.
+        """
         with self._lock:
             result = []
+            seen: set[str] = set()
             for job in self._jobs.values():
                 if job.get("status") != "running":
                     continue
                 if root and Path(str(job.get("projectPath") or "")).expanduser().resolve() != root.resolve():
                     continue
+                seen.add(str(job.get("id") or ""))
                 result.append(self.public_job(job))
-            return result
+        for job in self._foreign_running_jobs(root, seen):
+            result.append(job)
+        return result
+
+    def _foreign_running_jobs(self, root: Path | None, seen: set[str]) -> list[dict[str, Any]]:
+        if root is None:
+            return []
+        jobs_dir = root / "contexts" / "jobs"
+        if not jobs_dir.is_dir():
+            return []
+        cutoff = datetime.now(timezone.utc).timestamp() - self.FOREIGN_JOB_STALE_SECONDS
+        found: list[dict[str, Any]] = []
+        # Job ids are timestamps, so the newest sort last; nothing older is live.
+        for path in sorted(jobs_dir.glob("*.json"))[-40:]:
+            try:
+                job = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(job, dict) or job.get("status") != "running":
+                continue
+            if str(job.get("id") or "") in seen:
+                continue
+            try:
+                if path.stat().st_mtime < cutoff:
+                    continue
+            except OSError:
+                continue
+            found.append(job)
+        return found
+
+    def interject(self, job_id: str, text: str, root: Path | None = None) -> dict[str, Any]:
+        """Hand a message to a turn that is already running.
+
+        Queued here rather than written straight to the process: the turn owns the
+        pipe and polls for these on its own loop, the same way it polls for
+        cancellation, so no HTTP thread ever touches a Popen.
+        """
+        text = str(text or "").strip()
+        if not text:
+            return {"error": "interjection_empty", "message": "message is required"}
+        with self._lock:
+            job = self._jobs.get(job_id) or self.load_locked(job_id, root=root)
+            if not job:
+                return {"error": "job_not_found", "message": f"job not found: {job_id}"}
+            if root and Path(str(job.get("projectPath") or "")).expanduser().resolve() != root.resolve():
+                return {"error": "job_not_found", "message": f"job not found: {job_id}"}
+            if job.get("status") != "running":
+                return {
+                    "error": "job_not_running",
+                    "message": "the turn already finished; send it as a new message",
+                }
+            job.setdefault("pendingInterjections", []).append(text)
+            job.setdefault("events", []).append(
+                {"message": f"끼어들기: {compact_progress_text(text, 80)}", "createdAt": utc_now()}
+            )
+            job["updatedAt"] = utc_now()
+            self._jobs[job_id] = job
+            self.persist_locked(job)
+        return self.snapshot(job_id, root=root)
+
+    def take_interjections(self, job_id: str) -> list[str]:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                return []
+            pending = job.get("pendingInterjections") or []
+            if not pending:
+                return []
+            job["pendingInterjections"] = []
+            return list(pending)
 
     def cancel(self, job_id: str, root: Path | None = None) -> dict[str, Any]:
         with self._lock:
@@ -11734,6 +14428,19 @@ def make_handler(
                 self.send_json(snapshot, status=404 if snapshot.get("error") == "job_not_found" else 200)
                 return True
             # Extensions are machine-level add-ons (no project context required).
+            if parsed.path == "/api/app-version":
+                # The page is long-lived: people leave a branch open for hours while
+                # turns run. `Cache-Control: no-store` stops a stale *fetch*, but it
+                # cannot touch a tab that loaded the old script and never reloaded —
+                # which is how a UI change kept looking like it had not been made.
+                # The client compares this and reloads itself once when it moves.
+                stamp = 0.0
+                for name in ("app.js", "index.html", "styles.css"):
+                    target = WEB_DIR / name
+                    if target.exists():
+                        stamp = max(stamp, target.stat().st_mtime)
+                self.send_json({"version": f"{stamp:.0f}"})
+                return True
             if parsed.path == "/api/extensions":
                 # Extension modules are imported once per process, so an edit on
                 # disk only takes effect after a restart. Surface that, with the
@@ -11781,6 +14488,12 @@ def make_handler(
             except ValueError as exc:
                 self.send_json({"error": "project_invalid", "message": str(exc)}, status=400)
                 return True
+            if parsed.path == "/api/boss":
+                try:
+                    self.send_json(boss_chat_payload(store, jobs))
+                except SystemExit as exc:
+                    self.send_json(die_payload("boss_failed", exc), status=http_status_from_exit(exc, 400))
+                return True
             if parsed.path == "/api/context-chat":
                 self.send_json(context_chat_payload(store))
                 return True
@@ -11792,6 +14505,10 @@ def make_handler(
                         "archived": store.list_archived_branches(),
                         "views": store.list_views(),
                         "globalized": store.list_globalized_archives(),
+                        # The sidebar lists the desk's branches under the Boss chat
+                        # button without having to open it first.
+                        "bossBranches": read_boss_config(store)["branches"],
+                        "bossPending": len(boss_pending_items(store)),
                     }
                 )
                 return True
@@ -12178,6 +14895,37 @@ def make_handler(
                 payload = jobs.cancel(job_id, root=project_root)
                 self.send_json(payload, status=404 if payload.get("error") == "job_not_found" else 200)
                 return
+            if parsed.path == "/api/job/interject":
+                job_id = str(body.get("id") or "")
+                text = str(body.get("text") or "").strip()
+                if not job_id:
+                    self.send_json({"error": "job_id_required"}, status=400)
+                    return
+                try:
+                    project_root = self.request_project_root()
+                except ValueError:
+                    project_root = None
+                payload = jobs.interject(job_id, text, root=project_root)
+                error = payload.get("error")
+                if not error:
+                    # The turn hears it live; the branch has to keep it too, or the
+                    # reply answers a message the transcript never recorded.
+                    branch_id = str(payload.get("branch") or body.get("branch") or "").strip()
+                    if branch_id and project_root:
+                        with contextlib.suppress(Exception):
+                            ContextStore(project_root).append_history(
+                                branch_id,
+                                "user",
+                                text,
+                                extra={"interjection": True, "jobId": job_id},
+                            )
+                status = 200
+                if error == "job_not_found":
+                    status = 404
+                elif error:
+                    status = 409 if error == "job_not_running" else 400
+                self.send_json(payload, status=status)
+                return
             # Extensions are machine-level add-ons (no project context required).
             if parsed.path == "/api/extensions/toggle":
                 ext_id = str(body.get("id") or "").strip()
@@ -12563,8 +15311,15 @@ def make_handler(
                         status=400,
                     )
                     return
+                # Recording it was all this used to do, which meant the speaking
+                # agent never heard it — only the one after it, by reading history.
+                # Now it also goes to the process that is speaking right now.
+                delivered = False
+                if job_id:
+                    delivered = not jobs.interject(job_id, text, root=root).get("error")
                 payload = branch_payload(store, branch_id)
                 payload["interjection"] = record
+                payload["interjectionDelivered"] = delivered
                 self.send_json(payload)
                 return
             if parsed.path == "/api/sequence-room/order":
@@ -12617,6 +15372,7 @@ def make_handler(
                         update_snapshot=bool(body.get("updateSnapshot")),
                         system_prompt=str(body.get("systemPrompt")) if "systemPrompt" in body else None,
                         access_mode=str(body.get("accessMode")) if "accessMode" in body else None,
+                        llm=body.get("llm") if isinstance(body.get("llm"), dict) else None,
                         acceptance_criteria=(
                             [str(item) for item in body.get("acceptanceCriteria", [])]
                             if "acceptanceCriteria" in body
@@ -12703,6 +15459,52 @@ def make_handler(
                     }
                 )
                 return
+            if parsed.path == "/api/branch/new":
+                # An empty sibling of the branch you pointed at.
+                #
+                # Branches here fork off `initial` into folders like Sales, and
+                # starting the next one by forking a Sales branch dragged that
+                # branch's whole conversation — and its artifacts, resources and
+                # workspace — along with it. So nothing is copied: a blank branch is
+                # created, its parent is set to the pointed-at branch's parent so it
+                # sits beside it rather than under it, and it is filed in the folder
+                # you were standing in.
+                target_id = str(body.get("target") or "")
+                title = str(body.get("title") or "") or None
+                beside = str(body.get("beside") or "")
+                try:
+                    folder = ""
+                    parent_id = ""
+                    if beside:
+                        beside_meta = load_json(store.branch_paths_for_read(beside).meta)
+                        folder = str(beside_meta.get("folder") or "")
+                        parent_id = str(
+                            beside_meta.get("parent") or beside_meta.get("forkedFrom") or ""
+                        ).strip()
+                    store.create_branch(target_id, title=title, parent=parent_id or None)
+                    store.set_branch_folder(target_id, folder)
+                    payload = branch_payload(store, target_id)
+                    payload["siblingOf"] = beside
+                    payload["turnCommit"] = internal_git_commit_turn(
+                        store,
+                        kind="branch-new",
+                        actor="user",
+                        summary=f"Add empty branch {target_id} beside {beside}",
+                        branch_id=target_id,
+                        metadata={
+                            "target": target_id,
+                            "title": title,
+                            "folder": folder,
+                            "beside": beside,
+                            "parent": parent_id,
+                        },
+                    )
+                    self.send_json(payload)
+                except ValueError as exc:
+                    self.send_json({"error": "branch_new_failed", "message": str(exc)}, status=400)
+                except SystemExit as exc:
+                    self.send_json(die_payload("branch_new_failed", exc), status=http_status_from_exit(exc, 400))
+                return
             if parsed.path == "/api/branch/clone":
                 source_id = str(body.get("source") or "")
                 target_id = str(body.get("target") or "")
@@ -12758,6 +15560,25 @@ def make_handler(
                 except SystemExit as exc:
                     self.send_json(die_payload("rename_failed", exc), status=http_status_from_exit(exc, 400))
                 return
+            if parsed.path == "/api/branch/provider":
+                branch_id = str(body.get("branch") or "")
+                updates = body.get("llm") if isinstance(body.get("llm"), dict) else {}
+                try:
+                    override = store.set_branch_llm(branch_id, updates)
+                    payload = branch_payload(store, branch_id)
+                    payload["llmOverride"] = override
+                    payload["llmEffective"] = read_llm_config(root, branch_id)
+                    self.send_json(payload)
+                except ValueError as exc:
+                    self.send_json(
+                        {"error": "invalid_branch_provider", "message": str(exc)}, status=400
+                    )
+                except SystemExit as exc:
+                    self.send_json(
+                        die_payload("branch_provider_failed", exc),
+                        status=http_status_from_exit(exc, 400),
+                    )
+                return
             if parsed.path == "/api/branch/guiding":
                 branch_id = str(body.get("branch") or "")
                 requested = body.get("docs")
@@ -12811,6 +15632,7 @@ def make_handler(
                 instruction = str(body.get("instruction") or "").strip()
                 source_text = str(body.get("source") or "")
                 provider = str(body.get("provider") or "") or None
+                provider = branch_provider_authority(root, branch_id, provider)
                 if not instruction:
                     self.send_json({"error": "instruction_required"}, status=400)
                     return
@@ -13041,6 +15863,7 @@ def make_handler(
                 branch_id = str(body.get("branch") or "")
                 try:
                     index = int(body.get("index"))
+                    index = raw_history_index(store, branch_id, index)
                 except (TypeError, ValueError):
                     self.send_json({"error": "invalid_history_index", "message": "history index is required"}, status=400)
                     return
@@ -13083,6 +15906,7 @@ def make_handler(
                 text = str(body.get("text") or "")
                 try:
                     index = int(body.get("index"))
+                    index = raw_history_index(store, branch_id, index)
                 except (TypeError, ValueError):
                     self.send_json({"error": "invalid_history_index", "message": "history index is required"}, status=400)
                     return
@@ -13117,6 +15941,7 @@ def make_handler(
                 branch_id = str(body.get("branch") or "")
                 try:
                     index = int(body.get("index"))
+                    index = raw_history_index(store, branch_id, index)
                 except (TypeError, ValueError):
                     self.send_json({"error": "invalid_history_index", "message": "history index is required"}, status=400)
                     return
@@ -13143,6 +15968,7 @@ def make_handler(
                 title = str(body.get("title") or "") or None
                 try:
                     index = int(body.get("index"))
+                    index = raw_history_index(store, branch_id, index)
                 except (TypeError, ValueError):
                     self.send_json({"error": "invalid_history_index", "message": "history index is required"}, status=400)
                     return
@@ -13178,6 +16004,7 @@ def make_handler(
                 title = str(body.get("title") or "") or None
                 try:
                     index = int(body.get("index"))
+                    index = raw_history_index(store, branch_id, index)
                 except (TypeError, ValueError):
                     self.send_json({"error": "invalid_history_index", "message": "history index is required"}, status=400)
                     return
@@ -13292,6 +16119,7 @@ def make_handler(
                 branch_id = str(body.get("branch") or "")
                 text = str(body.get("text") or "").strip()
                 provider = str(body.get("provider") or "") or None
+                provider = branch_provider_authority(root, branch_id, provider)
                 resources = request_resource_paths(body)
                 if not text:
                     self.send_json({"error": "message_required"}, status=400)
@@ -13347,6 +16175,10 @@ def make_handler(
                 branch_id = str(body.get("branch") or "")
                 text = str(body.get("text") or "").strip()
                 provider = str(body.get("provider") or "") or None
+                provider = branch_provider_authority(root, branch_id, provider)
+                # A BTW lookup is recorded but kept out of the timeline and out of
+                # later prompts; see run_history_chat_turn.
+                aside = body.get("aside") is True
                 resources = request_resource_paths(body)
                 if not text:
                     self.send_json({"error": "message_required"}, status=400)
@@ -13394,9 +16226,122 @@ def make_handler(
                         provider=provider,
                         resource_paths=resources,
                         progress=progress,
+                        aside=aside,
                     )
 
-                self.send_json(jobs.create("info-chat", work, root=root, branch=branch_id, mode="info-chat"), status=202)
+                self.send_json(
+                    jobs.create(
+                        "info-chat", work, root=root, branch=branch_id,
+                        mode="btw" if aside else "info-chat",
+                    ),
+                    status=202,
+                )
+                return
+            if parsed.path == "/api/boss/config":
+                raw = body.get("branches")
+                branches = [str(item) for item in raw] if isinstance(raw, list) else []
+                try:
+                    write_boss_config(store, branches)
+                    self.send_json(boss_chat_payload(store, jobs))
+                except ValueError as exc:
+                    self.send_json({"error": "invalid_boss_config", "message": str(exc)}, status=400)
+                except SystemExit as exc:
+                    self.send_json(die_payload("boss_failed", exc), status=http_status_from_exit(exc, 400))
+                return
+            if parsed.path == "/api/boss/draft":
+                text = str(body.get("text") or "").strip()
+                if not text:
+                    self.send_json({"error": "message_required"}, status=400)
+                    return
+                if not read_boss_config(store)["branches"]:
+                    self.send_json(
+                        {"error": "no_boss_branches", "message": "Branches 탭에서 브랜치를 먼저 고르세요."},
+                        status=400,
+                    )
+                    return
+                # Recorded before the job exists: what the user typed is on the
+                # desk from the first moment, whatever happens to the drafting.
+                # A re-run drafts again from a request that is already on the log.
+                if body.get("rerun") is not True:
+                    append_boss_history(store, "user", text)
+
+                def draft_work(progress: ProgressCallback) -> dict[str, Any]:
+                    draft_boss_assignments(root, store, text, record_request=False, progress=progress)
+                    return boss_chat_payload(store, jobs)
+
+                self.send_json(
+                    jobs.create("boss-draft", draft_work, root=root, branch=BOSS_CHAT_KEY, mode="boss"),
+                    status=202,
+                )
+                return
+            if parsed.path == "/api/boss/draft/revise":
+                feedback = str(body.get("feedback") or "").strip()
+                if not feedback:
+                    self.send_json({"error": "feedback_required"}, status=400)
+                    return
+                # Hand edits made on the page travel with the feedback, so the
+                # rewrite builds on the user's wording instead of discarding it.
+                save_boss_edits(store, body.get("items"))
+                only_branch = str(body.get("branch") or "").strip()
+                only = [only_branch] if only_branch else None
+                pending = {str(item.get("branch")) for item in boss_pending_items(store)}
+                if not pending or (only and only_branch not in pending):
+                    self.send_json({"error": "no_draft", "message": "There is no draft to revise."}, status=409)
+                    return
+                append_boss_history(
+                    store, "user", feedback,
+                    extra={"kind": "feedback", "branches": only or sorted(pending)},
+                )
+
+                def revise_work(progress: ProgressCallback) -> dict[str, Any]:
+                    revise_boss_items(
+                        root, store, feedback, only=only, record_feedback=False, progress=progress
+                    )
+                    return boss_chat_payload(store, jobs)
+
+                self.send_json(
+                    jobs.create("boss-draft", revise_work, root=root, branch=BOSS_CHAT_KEY, mode="boss"),
+                    status=202,
+                )
+                return
+            if parsed.path == "/api/boss/draft/update":
+                save_boss_edits(store, body.get("items"))
+                self.send_json(boss_chat_payload(store, jobs))
+                return
+            if parsed.path == "/api/boss/draft/discard":
+                only_branch = str(body.get("branch") or "").strip()
+                drop_boss_items(store, {only_branch} if only_branch else None)
+                self.send_json(boss_chat_payload(store, jobs))
+                return
+            if parsed.path == "/api/boss/dispatch":
+                try:
+                    self.send_json(dispatch_boss_items(root, store, jobs, body.get("items")))
+                except ValueError as exc:
+                    self.send_json({"error": "invalid_boss_dispatch", "message": str(exc)}, status=400)
+                except SystemExit as exc:
+                    self.send_json(die_payload("boss_failed", exc), status=http_status_from_exit(exc, 400))
+                return
+            if parsed.path == "/api/boss/reset":
+                store.reset_boss_chat()
+                self.send_json(boss_chat_payload(store, jobs))
+                return
+            if parsed.path == "/api/boss/branch":
+                target_id = str(body.get("target") or "")
+                title = str(body.get("title") or "") or None
+                try:
+                    store.create_branch_from_boss_chat(target_id, title=title)
+                    payload = branch_payload(store, target_id)
+                    payload["turnCommit"] = internal_git_commit_turn(
+                        store,
+                        kind="branch-from-boss-chat",
+                        actor="user",
+                        summary=f"Create branch {target_id} from boss chat",
+                        branch_id=target_id,
+                        metadata={"target": target_id, "title": title},
+                    )
+                    self.send_json(payload)
+                except SystemExit as exc:
+                    self.send_json(die_payload("branch_create_failed", exc), status=http_status_from_exit(exc, 400))
                 return
             if parsed.path == "/api/context-chat/start":
                 text = str(body.get("text") or "").strip()
@@ -13438,6 +16383,7 @@ def make_handler(
                 branch_id = str(body.get("branch") or "")
                 text = str(body.get("text") or "").strip()
                 provider = str(body.get("provider") or "") or None
+                provider = branch_provider_authority(root, branch_id, provider)
                 resources = request_resource_paths(body)
                 if not text:
                     self.send_json({"error": "message_required"}, status=400)
@@ -13468,6 +16414,7 @@ def make_handler(
                 branch_id = str(body.get("branch") or "")
                 text = str(body.get("text") or "").strip()
                 provider = str(body.get("provider") or "") or None
+                provider = branch_provider_authority(root, branch_id, provider)
                 resources = request_resource_paths(body)
                 if not text:
                     self.send_json({"error": "message_required"}, status=400)
@@ -13532,6 +16479,9 @@ def make_handler(
                 return
             self.send_json({"error": "not_found"}, status=404)
 
+    # The server needs the same registry the handlers use — the Telegram remote
+    # must see, and be seen by, the jobs the browser starts.
+    CtxgitHandler.job_store = jobs
     return CtxgitHandler
 
 
@@ -13775,6 +16725,274 @@ def run_worker(
             return
 
 
+TELEGRAM_REMOTE_HELP = "\n".join(
+    [
+        "ctxgit remote",
+        "",
+        "/branches — 브랜치 목록과 지금 도는 것",
+        "/use <브랜치> — 이후 메시지를 보낼 대상 고정",
+        "/send <내용> — 작업 턴 (파일을 고칠 수 있음)",
+        "/btw <내용> — 도는 턴에 곁말",
+        "/stop — 도는 턴 중단",
+        "/status — 현재 대상과 진행 상황",
+        "/projects, /project <이름> — 프로젝트 전환",
+        "",
+        "그냥 텍스트는 info-chat(읽기 전용)으로 갑니다.",
+        "알림에 답장하면 그 브랜치로 갑니다.",
+    ]
+)
+
+
+class TelegramRemote:
+    """Drive ctxgit from a Telegram chat.
+
+    Long polling rather than a webhook: ctxgit binds to localhost, and giving
+    Telegram a public URL to reach it would open the machine to the internet for a
+    convenience feature. `getUpdates` also queues on Telegram's side, so messages
+    sent while the server is restarting are delivered afterwards rather than lost.
+
+    Everything runs through the same job registry and turn functions the web UI
+    uses, so a branch behaves identically whether it was driven from the browser
+    or from a phone.
+
+    A plain message is an info-chat, which cannot write; `/send` is the one command
+    that opens a writable turn. That split matters more here than in the browser:
+    the workspace runs with full file access, so anyone able to message the bot
+    could otherwise run arbitrary commands on this machine.
+    """
+
+    def __init__(self, project_state: "ProjectState", registry: "ServerProjectRegistry", jobs: "JobStore") -> None:
+        self._project_state = project_state
+        self._registry = registry
+        self._jobs = jobs
+        self._offset = 0
+        self._targets: dict[str, str] = {}
+        self._roots: dict[str, Path] = {}
+
+    # --- plumbing ---------------------------------------------------------
+
+    def _api(self, token: str, method: str, params: dict[str, Any], timeout: int = 70) -> dict[str, Any]:
+        url = f"https://api.telegram.org/bot{token}/{method}"
+        data = urllib.parse.urlencode(params).encode("utf-8")
+        request = urllib.request.Request(url, data=data, method="POST")
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8") or "{}")
+
+    def _say(self, token: str, chat_id: str, text: str, reply_to: int | None = None) -> int:
+        with contextlib.suppress(Exception):
+            return send_telegram_message(token, chat_id, text[:3500], reply_to=reply_to)
+        return 0
+
+    def _root_for(self, chat_id: str) -> Path:
+        return self._roots.get(chat_id) or self._project_state.root()
+
+    def _branches(self, root: Path) -> list[str]:
+        with contextlib.suppress(Exception):
+            store = ContextStore(root)
+            return [str(item.get("id") or "") for item in store.list_branches() if item.get("id")]
+        return []
+
+    def _resolve_branch(self, root: Path, name: str) -> str:
+        """Exact id, else a unique prefix or substring — phone typing is imprecise."""
+        name = name.strip()
+        if not name:
+            return ""
+        known = self._branches(root)
+        if name in known:
+            return name
+        matches = [b for b in known if b.startswith(name)] or [b for b in known if name.lower() in b.lower()]
+        return matches[0] if len(matches) == 1 else ""
+
+    # --- the loop ---------------------------------------------------------
+
+    def run_forever(self) -> None:
+        failures = 0
+        while True:
+            try:
+                self._tick()
+                failures = 0
+            except Exception as exc:  # noqa: BLE001 - never take the server down
+                failures += 1
+                # Telegram allows one getUpdates at a time and answers a second
+                # caller with 409, so a stray probe (or a second ctxgit) shows up
+                # here as a repeating failure. Silence made that indistinguishable
+                # from a dead thread, so say it once and then every tenth time.
+                if failures == 1 or failures % 10 == 0:
+                    print(
+                        f"telegram remote: retrying after {type(exc).__name__}: {str(exc)[:120]}"
+                        + (f" ({failures} in a row)" if failures > 1 else ""),
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                time.sleep(5)
+
+    def _tick(self) -> None:
+        try:
+            root = self._project_state.root()
+        except Exception:  # noqa: BLE001 - no project open yet
+            time.sleep(5)
+            return
+        token, chat_id, _ = telegram_remote_config(root)
+        if not token or not chat_id:
+            time.sleep(15)
+            return
+        payload = self._api(
+            token, "getUpdates", {"offset": self._offset, "timeout": 50}, timeout=70
+        )
+        for update in payload.get("result") or []:
+            self._offset = max(self._offset, int(update.get("update_id") or 0) + 1)
+            with contextlib.suppress(Exception):
+                self._handle(update, token)
+
+    def _handle(self, update: dict[str, Any], token: str) -> None:
+        message = update.get("message") or update.get("edited_message") or {}
+        text = str(message.get("text") or "").strip()
+        if not text:
+            return
+        chat = str((message.get("chat") or {}).get("id") or "")
+        sender = int(((message.get("from") or {}).get("id")) or 0)
+        root = self._root_for(chat)
+        expected_token, expected_chat, allowed_users = telegram_remote_config(root)
+        # Wrong chat, or a member of the right chat who was never allowed: ignore
+        # in silence. Answering would confirm the bot drives something real.
+        if not expected_chat or chat != expected_chat:
+            return
+        if allowed_users and sender not in allowed_users:
+            return
+        reply_branch = branch_for_telegram_reply(
+            root, int(((message.get("reply_to_message") or {}).get("message_id")) or 0)
+        )
+        self._dispatch(token, chat, root, text, reply_branch, int(message.get("message_id") or 0))
+
+    # --- commands ---------------------------------------------------------
+
+    def _dispatch(
+        self, token: str, chat: str, root: Path, text: str, reply_branch: str, message_id: int
+    ) -> None:
+        command, _, rest = text.partition(" ")
+        command = command.lower().lstrip("/") if text.startswith("/") else ""
+        rest = rest.strip()
+
+        if command in {"help", "start"}:
+            self._say(token, chat, TELEGRAM_REMOTE_HELP)
+            return
+        if command == "projects":
+            rows = self._registry.list_projects(root)
+            names = "\n".join(f"· {Path(str(item.get('path'))).name}" for item in rows) or "(없음)"
+            self._say(token, chat, f"프로젝트:\n{names}\n\n현재: {root.name}")
+            return
+        if command == "project":
+            for item in self._registry.list_projects(root):
+                candidate = Path(str(item.get("path") or ""))
+                if candidate.name == rest or str(candidate) == rest:
+                    self._roots[chat] = candidate
+                    self._targets.pop(chat, None)
+                    self._say(token, chat, f"프로젝트: {candidate.name}")
+                    return
+            self._say(token, chat, f"그런 프로젝트가 없습니다: {rest}")
+            return
+        if command == "branches":
+            running = {str(j.get("branch") or "") for j in self._jobs.running_jobs(root=root)}
+            lines = [
+                ("▶ " if b in running else "· ") + b + (" (실행 중)" if b in running else "")
+                for b in self._branches(root)[:60]
+            ]
+            self._say(token, chat, "\n".join(lines) or "(브랜치 없음)")
+            return
+        if command == "use":
+            resolved = self._resolve_branch(root, rest)
+            if not resolved:
+                self._say(token, chat, f"브랜치를 찾지 못했습니다: {rest}")
+                return
+            self._targets[chat] = resolved
+            self._say(token, chat, f"대상: {resolved}")
+            return
+
+        branch = reply_branch or self._targets.get(chat, "")
+        if command == "b":
+            wanted, _, body = rest.partition(" ")
+            branch = self._resolve_branch(root, wanted)
+            rest = body.strip()
+            if not branch:
+                self._say(token, chat, f"브랜치를 찾지 못했습니다: {wanted}")
+                return
+        if not branch:
+            self._say(token, chat, "먼저 /use <브랜치> 로 대상을 정하거나 알림에 답장하세요.")
+            return
+
+        if command == "status":
+            running = [j for j in self._jobs.running_jobs(root=root) if str(j.get("branch")) == branch]
+            state = f"실행 중 ({running[0].get('mode')})" if running else "대기"
+            self._say(token, chat, f"{branch}: {state}")
+            return
+        if command == "stop":
+            for job in self._jobs.running_jobs(root=root):
+                if str(job.get("branch")) == branch:
+                    self._jobs.cancel(str(job.get("id")), root=root)
+                    self._say(token, chat, f"{branch}: 중단 요청")
+                    return
+            self._say(token, chat, f"{branch}: 도는 턴이 없습니다")
+            return
+
+        body = rest if command in {"send", "btw", "b"} else text
+        if not body.strip():
+            self._say(token, chat, "보낼 내용이 없습니다.")
+            return
+
+        running = [j for j in self._jobs.running_jobs(root=root) if str(j.get("branch")) == branch]
+        if running:
+            # Same rule as the composer: a branch that is busy gets spoken to
+            # rather than queued behind itself.
+            self._jobs.interject(str(running[0].get("id")), body, root=root)
+            self._say(token, chat, f"{branch}: 끼어들기 전달", reply_to=message_id)
+            return
+        if command == "btw":
+            self._say(token, chat, f"{branch}: 도는 턴이 없어 그냥 보냅니다")
+
+        self._start_turn(token, chat, root, branch, body, writable=command == "send", message_id=message_id)
+
+    def _start_turn(
+        self,
+        token: str,
+        chat: str,
+        root: Path,
+        branch: str,
+        body: str,
+        *,
+        writable: bool,
+        message_id: int,
+    ) -> None:
+        store = ContextStore(root)
+        provider = branch_provider_authority(root, branch, None)
+        # A sequence room is not a chat branch: it runs an ordered set of agents and
+        # has its own turn function. Sending it a plain chat turn produced nothing
+        # anyone could see, which is what made a room look unanswered from the phone.
+        room = branch_is_sequence_room(store, branch)
+
+        def work(progress: ProgressCallback) -> dict[str, Any]:
+            if room:
+                return run_sequence_room_turn(
+                    root,
+                    store,
+                    branch,
+                    body,
+                    run_mode="send" if writable else "info-chat",
+                    progress=progress,
+                )
+            if writable:
+                return run_chat_turn(root, store, branch, body, provider=provider, progress=progress)
+            return run_history_chat_turn(root, store, branch, body, provider=provider, progress=progress)
+
+        kind = "sequence-room" if room else ("chat" if writable else "info-chat")
+        job = self._jobs.create(kind, work, root=root, branch=branch, mode=kind)
+        label = "룸 실행" if room else ("작업" if writable else "질문")
+        sent = self._say(token, chat, f"{branch}: {label} 시작", reply_to=message_id)
+        # So a reply to this acknowledgement keeps addressing the same branch.
+        remember_telegram_reply(root, sent, branch)
+        remember_telegram_reply(root, message_id, branch)
+        _ = job
+
+
 def run_server(
     root: Path | None,
     host: str,
@@ -13808,6 +17026,18 @@ def run_server(
             print("codex execution: local worker", flush=True)
         if not auth_required:
             print("authentication: disabled", flush=True)
+        # Optional and self-disabling: with no bot token configured the loop idles
+        # instead of failing, so a project that never set one is unaffected.
+        remote = TelegramRemote(project_state, project_registry, handler.job_store)
+        threading.Thread(target=remote.run_forever, daemon=True).start()
+        with contextlib.suppress(Exception):
+            token, chat, users = telegram_remote_config(project_state.root())
+            if token and chat:
+                print(
+                    "telegram remote: on"
+                    + (f" (allowed users: {len(users)})" if users else " (chat-wide — use TELEGRAM_ALLOWED_USER_IDS)"),
+                    flush=True,
+                )
         print("Press Ctrl-C to stop.", flush=True)
         try:
             server.serve_forever()

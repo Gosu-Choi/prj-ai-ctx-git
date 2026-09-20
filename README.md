@@ -191,11 +191,34 @@ button lists every knowledge document and toggles each one on or off for the
 open branch. The selection is stored as `guiding` in that branch's `branch.json`.
 
 Every document a branch has switched on is inserted verbatim into that branch's
-prompts, in the same layer as `AGENTS.md`, for chat turns, info-chat turns, and
-sequence-room agent turns. It is prompt injection, not a tool call, so a guiding
-document is guaranteed to be in effect rather than merely available to read.
-Documents removed from disk drop out of a branch's selection silently instead of
-breaking its prompts.
+prompts for chat turns, info-chat turns, sequence-room agent turns, team-pipeline
+workers, and history compaction. It is prompt injection, not a tool call, so a
+guiding document is guaranteed to be in effect rather than merely available to
+read. Documents removed from disk drop out of a branch's selection silently
+instead of breaking its prompts.
+
+Being present in the prompt turned out not to be the same as being followed, so
+guiding reaches the model three ways rather than one:
+
+- as a **high-priority provider instruction** (Claude `--append-system-prompt` and
+  Codex `developer_instructions`). Inside the prompt body
+  guiding is one section of a 50,000-character user message, which reads as
+  material the user pasted rather than a rule the model is under.
+- **in the body**, ranked above the project instructions and above `<history>`,
+  and saying so: a branch's own earlier replies may predate the document, so they
+  are a record of what was said, not examples to imitate.
+- **after the user message**, as a short reminder to check the draft before
+  answering. The body copy sits near the top, tens of thousands of characters
+  before the answer gets written, with the branch's own prose in between.
+
+Compactions are covered because a compaction outlives the turn that wrote it: it
+is re-injected into every later prompt, so one written without the branch's
+guiding knowledge keeps contradicting it for the rest of that branch's life.
+
+Branch report sections still identical to the generated template are dropped
+before the report is injected. A fresh report is ~1,200 characters of
+placeholders; the headings are still named as empty so an untouched section stays
+visible as untouched rather than as missing.
 
 Nothing is captured automatically. To store something, open the `...` menu on a
 chat message and choose `Knowledging`. The modal asks which document to append
@@ -287,6 +310,13 @@ without asking for per-edit approval. If a turn needs to write outside the
 opened project, the assistant must request approval first; approving it reruns
 that turn with only the approved external directory added through Codex
 `--add-dir`.
+
+Interactive web jobs use Codex's app-server transport, which keeps the turn open
+for BTW messages (`turn/steer`). Non-web one-shot commands retain `codex exec` as
+a compatibility fallback. Codex app-server threads are persisted per ctxgit
+branch and conversation mode, then resumed on the next turn. Switching providers
+does not discard either provider's native session; the current ctxgit branch
+history in each prompt synchronizes turns produced by the other provider.
 
 On Windows, ctxgit first tries `codex` from PATH and then falls back to the
 Codex binary bundled with the VS Code/Cursor ChatGPT extension. If your setup is
