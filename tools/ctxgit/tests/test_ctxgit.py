@@ -5112,6 +5112,38 @@ class BossChatTest(unittest.TestCase):
             for branch in ("sales", "dev"):
                 self.assertEqual(list(store.iter_history(branch)), [], "no branch was spoken to")
 
+    # 🚨 The desk writes *to* branches. A draft composed from a two-line summary is
+    #    guesswork wearing the user's voice — it cannot pick up what the branch
+    #    already decided or the terms that conversation uses. Tone is a product of
+    #    that context, not of an instruction about tone.
+    def test_a_branch_is_offered_at_a_turns_depth_not_a_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            ctxgit.write_boss_config(store, ["sales"])
+            store.append_history("sales", "user", "단가는 월 단위로 끊어서 적어줘")
+            store.append_history("sales", "assistant", "월 단위로 고쳤습니다. 분기는 빼 두었습니다.")
+            model = _BossModel({"assignments": [], "summary": ""})
+            with model:
+                ctxgit.draft_boss_assignments(root, store, "견적 다시 봐줘")
+            prompt = model.prompts[0]
+            self.assertIn("recent history:", prompt)
+            self.assertIn("단가는 월 단위로 끊어서 적어줘", prompt)
+            self.assertIn("월 단위로 고쳤습니다", prompt)
+
+    # One branch gets what a turn with it would get; a wide desk thins evenly and
+    # never drops below the floor. Both ends matter: the old code gave every branch
+    # a flat 2000 characters no matter how few or how many there were.
+    def test_the_context_budget_is_split_across_the_chosen_branches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            full = ctxgit.boss_branch_context_budget(store, 1)
+            self.assertEqual(full, ctxgit.DEFAULT_CONTEXT_BUDGET_CHARS)
+            self.assertEqual(ctxgit.boss_branch_context_budget(store, 4), full // 4)
+            self.assertEqual(
+                ctxgit.boss_branch_context_budget(store, 1000),
+                ctxgit.BOSS_MIN_BRANCH_CONTEXT_CHARS,
+            )
+
     def test_the_http_path_can_record_the_request_itself(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, store = self._project(tmp)

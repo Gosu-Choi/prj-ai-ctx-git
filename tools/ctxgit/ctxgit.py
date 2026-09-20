@@ -12014,22 +12014,84 @@ _BOSS_MODE_GUIDE = [
 ]
 
 
+#: The least context worth giving a branch row. Below this the draft is guesswork
+#: dressed as an instruction, and a wide fan-out is exactly when that is hardest to
+#: notice — every card is filled in, none of them informed.
+BOSS_MIN_BRANCH_CONTEXT_CHARS = 6000
+
+
+def boss_branch_context_budget(store: ContextStore, branch_count: int) -> int:
+    """How much context one branch row may carry.
+
+    The desk writes *to* branches, so a draft composed without the branch's own
+    context is composed blind: it cannot match what that branch already knows, what
+    it already decided, or how it is spoken to. The tone the user reads back is a
+    product of that context, not of instructions about tone.
+
+    So the desk spends a branch turn's own budget — the same
+    `contextBudgetCharacters` knob `build_context_bundle` reads — and splits it
+    across the branches it is drafting for. One branch gets what a turn with it
+    would get; ten branches get a tenth each, never below the floor.
+    """
+    config = active_llm_provider_config(store.root)
+    budget = coerce_positive_int(
+        config.get("contextBudgetCharacters"), DEFAULT_CONTEXT_BUDGET_CHARS
+    )
+    return max(BOSS_MIN_BRANCH_CONTEXT_CHARS, budget // max(1, branch_count))
+
+
+def boss_branch_context_block(store: ContextStore, branch_id: str, budget: int) -> str:
+    """One branch as the drafter should see it.
+
+    The same kinds of context a turn with this branch carries, in the same order of
+    importance — report, the rules it works under, its long-history compactions,
+    what was actually said recently. Sub-budgets mirror `build_context_bundle`'s
+    proportions so that widening the desk thins every kind evenly instead of
+    dropping whole kinds.
+    """
+    meta = load_json(store.branch_paths_for_read(branch_id).meta)
+    title = str(meta.get("title") or branch_id)
+    report = truncate_middle(
+        branch_report_for_prompt(store, branch_id), max(1000, budget // 2)
+    )
+    guiding = guiding_context_sections(
+        store, branch_id, min(DEFAULT_GUIDING_BUDGET_CHARS, max(1000, budget // 8))
+    )
+    compactions = compaction_context_sections(store, branch_id, max(1000, budget // 8))
+    records, compacted_count, omitted_live = prompt_history_records(
+        store, branch_id, max(1000, budget // 4)
+    )
+    history_lines = [format_history_record(item) for item in records]
+    if omitted_live:
+        history_lines.insert(
+            0, f"- [ctxgit omitted {omitted_live} older raw history records to fit the prompt budget]"
+        )
+    if compacted_count:
+        history_lines.insert(
+            0, f"- [ctxgit replaced {compacted_count} older raw history records with the compactions above]"
+        )
+    parts = [f"### {branch_id}", f"title: {title}", "", "report:", report or "(none)"]
+    if guiding and guiding != "(none)":
+        parts += ["", "rules it works under:", guiding]
+    if compactions and compactions != "(none)":
+        parts += ["", "long-history compactions:", compactions]
+    parts += ["", "recent history:", "\n".join(history_lines) or "(none)"]
+    return "\n".join(parts)
+
+
 def _boss_branch_rows(store: ContextStore, branches: list[str]) -> list[str]:
-    rows = []
-    for branch_id in branches:
-        meta = load_json(store.branch_paths_for_read(branch_id).meta)
-        title = str(meta.get("title") or branch_id)
-        report = truncate_middle(branch_report_for_prompt(store, branch_id), 2000)
-        rows.append(f"### {branch_id}\ntitle: {title}\n{report}")
-    return rows
+    budget = boss_branch_context_budget(store, len(branches))
+    return [boss_branch_context_block(store, branch_id, budget) for branch_id in branches]
 
 
 def build_boss_routing_prompt(store: ContextStore, message: str, branches: list[str]) -> str:
     """Ask which of these branches each piece of the request belongs to.
 
-    Only the chosen branches are offered, and only their own description is given:
-    the decision is "who does this", not "how", and the branch itself already holds
-    everything needed to answer once the work arrives.
+    Only the chosen branches are offered — reaching one outside the selection is the
+    thing boss chat must never do. But each is offered at a branch turn's own depth
+    (`boss_branch_context_block`), because the decision is not only "who does this":
+    the instruction written here is sent verbatim as the user's message, so it has to
+    land in a conversation already underway, in the terms that conversation uses.
     """
     return "\n".join(
         [
@@ -12350,7 +12412,12 @@ def draft_boss_followup(
             "- Write in the language of the original request.",
             *_BOSS_MODE_GUIDE,
             "",
-            f"Branch: {branch_id}",
+            "Branch:",
+            # The next step is only obvious against what this branch already holds.
+            # One branch, so it gets a full turn's budget.
+            boss_branch_context_block(
+                store, branch_id, boss_branch_context_budget(store, 1)
+            ),
             "",
             "What the user originally asked the desk for:",
             "<original_request>",
