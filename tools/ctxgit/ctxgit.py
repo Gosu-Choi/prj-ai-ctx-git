@@ -12126,6 +12126,41 @@ def build_boss_routing_prompt(store: ContextStore, message: str, branches: list[
     )
 
 
+#: How many earlier rounds of feedback on one draft to carry. Enough to keep a
+#: wording that survived several passes from sliding back, short enough that the
+#: newest comment is still the loudest thing in the prompt.
+BOSS_FEEDBACK_TRAIL_ROUNDS = 5
+
+
+def boss_feedback_trail(
+    store: ContextStore, branch_id: str, *, current: str = ""
+) -> list[str]:
+    """What the user already said about this branch's draft, oldest first.
+
+    The second round of feedback is given on a wording the first round produced. A
+    rewrite that sees only the latest draft can undo what it was already told — and
+    the user, having to make the same correction twice, reads that as not being
+    listened to. So the earlier comments travel with the draft.
+
+    The comment being acted on now is dropped: it arrives under `Feedback` as the
+    thing to do, and the caller has already written it to the log by the time this
+    runs.
+    """
+    texts: list[str] = []
+    for record in iter_boss_history(store):
+        if str(record.get("kind")) != "feedback":
+            continue
+        branches = record.get("branches")
+        if isinstance(branches, list) and branch_id not in [str(name) for name in branches]:
+            continue
+        text = str(record.get("text") or "").strip()
+        if text:
+            texts.append(text)
+    if current and texts and texts[-1] == current.strip():
+        texts.pop()
+    return texts[-BOSS_FEEDBACK_TRAIL_ROUNDS:]
+
+
 def build_boss_revision_prompt(
     store: ContextStore, targets: list[dict[str, Any]], feedback: str
 ) -> str:
@@ -12140,6 +12175,10 @@ def build_boss_revision_prompt(
             answer = str(last_branch_answer(store, branch_id).get("text") or "")
             if answer:
                 block += ["the branch's latest answer:", f"<answer>{truncate_middle(answer, 3000)}</answer>"]
+        trail = boss_feedback_trail(store, branch_id, current=feedback)
+        if trail:
+            block.append("what you were already told about this draft, oldest first:")
+            block += [f"<earlier_feedback>{truncate_middle(text, 1500)}</earlier_feedback>" for text in trail]
         if item.get("edited"):
             block.append("(the user edited this wording by hand — respect those edits)")
         block += ["current draft:", f"<draft>{item.get('instruction') or ''}</draft>"]
@@ -12151,7 +12190,10 @@ def build_boss_revision_prompt(
             "",
             "Rules:",
             "- Return one assignment for every branch listed under Drafts, and no other.",
-            "- Change what the feedback asks for; keep what it did not question.",
+            "- Rewrite the draft you are given. Feedback like \"add this\" means the",
+            "  draft plus that, not a fresh instruction on the same subject.",
+            "- Change what the feedback asks for; keep what it did not question,",
+            "  including anything an earlier round already asked for.",
             "- Each instruction is sent verbatim as the user's message to that branch,",
             "  which cannot see this conversation — keep it self-contained.",
             "- Write in the language the drafts are written in.",

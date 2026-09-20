@@ -5308,6 +5308,24 @@ class BossChatTest(unittest.TestCase):
             self.assertIn("단가는 월 단위로 끊어서 적어줘", prompt)
             self.assertIn("월 단위로 고쳤습니다", prompt)
 
+    # 🚨 두 번째 피드백은 첫 번째가 만들어 낸 문장 위에서 나온다. 앞 라운드가 안 실리면
+    #    이미 고친 것을 되돌려 놓고, 사용자는 같은 지적을 두 번 하게 된다.
+    def test_a_rewrite_carries_what_it_was_already_told(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            ctxgit.write_boss_config(store, ["sales"])
+            self._draft(root, store, [{"branch": "sales", "instruction": "원래 문장"}])
+            with _BossModel({"assignments": [{"branch": "sales", "instruction": "존대로 고친 문장"}], "summary": ""}):
+                ctxgit.revise_boss_items(root, store, "존대로 써줘", only=["sales"])
+            model = _BossModel({"assignments": [{"branch": "sales", "instruction": "마감일까지 넣은 문장"}], "summary": ""})
+            with model:
+                ctxgit.revise_boss_items(root, store, "마감일도 넣어줘", only=["sales"])
+            prompt = model.prompts[0]
+            self.assertIn("존대로 써줘", prompt, "앞 라운드 피드백이 따라와야 한다")
+            self.assertIn("존대로 고친 문장", prompt, "고치는 대상은 지금 문장이다")
+            # 지금 처리할 피드백은 Feedback 절에 한 번만 온다.
+            self.assertNotIn("<earlier_feedback>마감일도 넣어줘</earlier_feedback>", prompt)
+
     def test_a_rewrite_cannot_add_a_branch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, store = self._project(tmp)
