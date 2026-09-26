@@ -5845,3 +5845,41 @@ class BossFollowUpTest(unittest.TestCase):
     def test_boss_jobs_do_not_notify_as_branch_completions(self) -> None:
         source = Path(ctxgit.__file__).read_text(encoding="utf-8")
         self.assertIn('str(job.get("mode") or "").startswith("boss")', source)
+
+
+class BossDisplayTextTest(unittest.TestCase):
+    """The desk never shows "[... truncated ...]".
+
+    That marker belongs in a prompt, where the model must know something was
+    removed. On the board the same string is the thing a person reads, and a
+    machine note in the middle of an answer is noise.
+    """
+
+    def test_clipping_leaves_no_marker(self) -> None:
+        long_text = "문장입니다. " * 200
+        clipped = ctxgit.clip_for_display(long_text, 200)
+        self.assertNotIn("truncated", clipped)
+        self.assertLessEqual(len(clipped), 200)
+
+    def test_short_text_is_untouched(self) -> None:
+        self.assertEqual(ctxgit.clip_for_display("짧은 답변", 200), "짧은 답변")
+
+    def test_an_unbroken_run_is_still_clipped(self) -> None:
+        # No word boundary to cut at; it must not return the whole string.
+        self.assertEqual(len(ctxgit.clip_for_display("x" * 900, 120)), 120)
+
+    def test_the_board_payload_carries_no_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ctxgit.ContextStore(root)
+            store.init(create_initial_branch=False)
+            store.create_branch("sales")
+            ctxgit.write_boss_config(store, ["sales"])
+            store.append_history("sales", "assistant", "아주 긴 답변입니다. " * 600)
+            payload = ctxgit.boss_chat_payload(store)
+            blob = json.dumps(payload, ensure_ascii=False)
+            self.assertNotIn("truncated", blob)
+
+    def test_prompts_keep_the_marker(self) -> None:
+        # The model still has to be told that content was cut.
+        self.assertIn("[... truncated ...]", ctxgit.truncate_middle("가" * 500, 100))

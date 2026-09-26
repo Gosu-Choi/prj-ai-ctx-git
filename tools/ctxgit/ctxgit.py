@@ -8058,6 +8058,27 @@ def localize_progress_message(message: str) -> str:
     return message
 
 
+def clip_for_display(text: str, max_chars: int) -> str:
+    """Shorten text for a screen without stamping a marker into it.
+
+    `truncate_middle` writes "[... truncated ...]" into the string, which is right
+    for a prompt — the model must know something was removed — and wrong for the
+    desk, where that line is the thing a person reads. Here the cut is taken at a
+    line or word boundary and left silent; the UI shows the rest on demand.
+    """
+    text = str(text or "").strip()
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    cut = text[:max_chars]
+    for boundary in ("\n", " "):
+        index = cut.rfind(boundary)
+        # Only honour a boundary that is not absurdly early, or a long unbroken
+        # token would collapse the whole excerpt to nothing.
+        if index > max_chars // 2:
+            return cut[:index].rstrip()
+    return cut.rstrip()
+
+
 def compact_progress_text(value: Any, limit: int = 180) -> str:
     text = str(value or "").strip()
     text = re.sub(r"\s+", " ", text)
@@ -12664,7 +12685,7 @@ def draft_boss_assignments(
             lines = [summary] if summary else []
             lines += [f"- **{item['branch']}** 초안 준비됨" for item in items]
             lines += [
-                f"- **{branch_id}** 초안 작성 실패: {compact_progress_text(reason, 160)}"
+                f"- **{branch_id}** 초안 작성 실패: {clip_for_display(reason, 160)}"
                 for branch_id, reason in failed.items() if branch_id in allowed
             ]
             if not items and not failed:
@@ -12742,7 +12763,7 @@ def revise_boss_items(
             note = str(reply.get("summary") or "").strip()
             if note:
                 notes.append(note if len(target_ids) == 1 else f"- **{branch_id}**: {note}")
-        notes += [f"- **{b}** 다시 쓰기 실패: {compact_progress_text(m, 160)}" for b, m in failed.items()]
+        notes += [f"- **{b}** 다시 쓰기 실패: {clip_for_display(m, 160)}" for b, m in failed.items()]
         summary = "\n".join(notes)
         delivered: list[dict[str, Any]] = []
         for holder in boss_inflight_desks(store, work_id) if work_id else [desk]:
@@ -12984,7 +13005,8 @@ def dispatch_boss_items(
     lines = []
     for item in started:
         verb = "끼어들기" if item["delivery"] == "interjected" else ("Send" if item["mode"] == "send" else "Info chat")
-        lines.append(f"- **{item['branch']}** ({verb}): {compact_progress_text(item['instruction'], 200)}")
+        instruction = re.sub(r"\s+", " ", str(item["instruction"]).strip())
+        lines.append(f"- **{item['branch']}** ({verb}): {clip_for_display(instruction, 200)}")
     append_boss_history(
         store, "assistant", "\n".join(lines),
         extra={"kind": "dispatch", "assignments": started},
@@ -13081,7 +13103,7 @@ def boss_chat_payload(store: ContextStore, jobs: "JobStore | None" = None, desk:
             # What this branch last said and was last told, so the board shows the
             # state of the work rather than only its name.
             answer = last_branch_answer(store, branch_id)
-            out["lastAnswer"] = truncate_middle(str(answer.get("text") or ""), 4000)
+            out["lastAnswer"] = clip_for_display(str(answer.get("text") or ""), 4000)
             out["lastAnswerAt"] = str(answer.get("createdAt") or "")
             out["thread"] = threads.get(branch_id, {})
             out["draftingFollowup"] = branch_id in following_up
