@@ -1,0 +1,31 @@
+{
+  "_comment": [
+    "Slack MCP server ctxgit hands to the chat agent (Claude and Codex alike).",
+    "",
+    "Tokens are browser session credentials and belong in this directory's .env",
+    "(git-ignored), never here:",
+    "",
+    "  SLACK_MCP_XOXC_TOKEN=xoxc-...   browser token",
+    "  SLACK_MCP_XOXD_TOKEN=xoxd-...   the `d` cookie",
+    "",
+    "`requires` keeps the server from being offered at all until both resolve, so",
+    "a half-configured Slack is absent rather than broken.",
+    "",
+    "Posting is deliberately not enabled. To allow it, add",
+    "SLACK_MCP_ADD_MESSAGE_TOOL to env below — `true` for every channel, or a",
+    "comma-separated list of channel IDs to limit it."
+  ],
+  "servers": [
+    {
+      "id": "slack",
+      "command": "npx",
+      "args": ["-y", "slack-mcp-server@latest", "--transport", "stdio"],
+      "env": {
+        "SLACK_MCP_XOXC_TOKEN": "${SLACK_MCP_XOXC_TOKEN}",
+        "SLACK_MCP_XOXD_TOKEN": "${SLACK_MCP_XOXD_TOKEN}"
+      },
+      "requires": ["SLACK_MCP_XOXC_TOKEN", "SLACK_MCP_XOXD_TOKEN"],
+      "enabled": true
+    }
+  ]
+}

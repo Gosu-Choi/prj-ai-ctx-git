@@ -15,7 +15,7 @@ import json
 import sys
 from typing import Any
 
-from . import adit, google, instagram
+from . import adit, slack, google, instagram
 
 # Ordered registry of available extensions (module objects). Most extensions are
 # a stdio MCP server ctxgit hosts itself; each keeps its own secrets in its own
@@ -25,6 +25,7 @@ _REGISTRY: dict[str, Any] = {
     instagram.ID: instagram,
     google.ID: google,
     adit.ID: adit,
+    slack.ID: slack,
 }
 
 
