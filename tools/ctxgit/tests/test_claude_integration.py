@@ -1461,12 +1461,13 @@ class ProviderStandingDirectiveParityTest(unittest.TestCase):
 
 
 class BtwAsideTest(unittest.TestCase):
-    """A BTW lookup is recorded but does not join the conversation.
+    """A BTW lookup leaves no trace on the branch.
 
-    It is asked on the side while a real turn runs. Keeping it in the timeline puts
-    a throwaway question in the middle of the thread being read, and keeping it in
-    the prompt puts that question in front of the model on every turn that follows.
-    The record itself stays in history.jsonl so an answer can still be traced.
+    It is a side question about the branch, asked whether or not a real turn is
+    running. It is answered from the branch's context and written nowhere: not to
+    history.jsonl, not to a compaction, not to the internal git. Asides recorded
+    before this (they used to be written and hidden) stay hidden from the timeline
+    and the prompt.
     """
 
     def _branch(self, tmp: str):
@@ -1476,7 +1477,186 @@ class BtwAsideTest(unittest.TestCase):
         store.create_branch("b1")
         return root, store
 
-    def test_an_aside_is_written_but_hidden_from_the_timeline_and_prompt(self) -> None:
+    def test_an_aside_turn_records_nothing_and_returns_its_answer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._branch(tmp)
+            store.append_history("b1", "user", "REAL_QUESTION", extra={"mode": "chat"})
+            store.append_history("b1", "assistant", "REAL_ANSWER", extra={"mode": "chat"})
+            before = list(store.iter_history("b1"))
+            turn_before = ctxgit.internal_git_commit_turn(
+                store, kind="test", actor="test", summary="baseline", branch_id="b1"
+            )
+            head_before = ctxgit.internal_git_rev_parse(root, ctxgit.ctxgit_branch_ref("b1"))
+
+            seen: dict[str, str] = {}
+
+            def fake_history_chat(provider, root_, store_, branch_id, user_message, **kwargs):
+                seen["prompt_branch"] = branch_id
+                seen["message"] = user_message
+                return {"assistant": "SIDE_ANSWER"}
+
+            original = ctxgit.call_provider_history_chat
+            ctxgit.call_provider_history_chat = fake_history_chat
+            try:
+                payload = ctxgit.run_history_chat_turn(root, store, "b1", "SIDE_QUESTION", aside=True)
+            finally:
+                ctxgit.call_provider_history_chat = original
+
+            self.assertEqual(payload["asideAnswer"], "SIDE_ANSWER")
+            self.assertNotIn("turnCommit", payload)
+            self.assertEqual(seen["message"], "SIDE_QUESTION")
+            # Nothing on disk changed: same records, same internal git head.
+            self.assertEqual(list(store.iter_history("b1")), before)
+            self.assertEqual(
+                ctxgit.internal_git_rev_parse(root, ctxgit.ctxgit_branch_ref("b1")), head_before
+            )
+            self.assertEqual(turn_before["commit"], head_before)
+            self.assertEqual(list(store.branch_paths("b1").compactions.glob("*.md")), [])
+
+    def test_an_aside_works_with_no_turn_running(self) -> None:
+        # Nothing about an aside depends on a job being in flight: the prompt it
+        # builds simply has no <running_turn> block.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._branch(tmp)
+            store.append_history("b1", "user", "REAL_QUESTION", extra={"mode": "chat"})
+            prompt = ctxgit.build_history_chat_prompt(store, "b1", "SIDE_QUESTION")
+            self.assertIn("SIDE_QUESTION", prompt)
+            self.assertIn("REAL_QUESTION", prompt)
+            self.assertNotIn("<running_turn>", prompt)
+
+    def test_the_api_runs_an_aside_as_its_own_job_that_no_page_adopts(self) -> None:
+        # /api/jobs/active is what a reloaded (or second) page uses to re-attach to
+        # running turns. A BTW job must not be in that list, or the page would show
+        # the branch as busy and turn the composer into Stop for a side question.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._branch(tmp)
+            store.append_history("b1", "user", "REAL_QUESTION", extra={"mode": "chat"})
+            before = list(store.iter_history("b1"))
+            release = threading.Event()
+
+            def slow_history_chat(provider, root_, store_, branch_id, user_message, **kwargs):
+                release.wait(timeout=10)
+                return {"assistant": "SIDE_ANSWER"}
+
+            original = ctxgit.call_provider_history_chat
+            ctxgit.call_provider_history_chat = slow_history_chat
+            handler = ctxgit.make_handler(ctxgit.ProjectState(root), auth_required=False)
+
+            def get(base_url, path):
+                with urllib.request.urlopen(f"{base_url}{path}", timeout=10) as response:
+                    return json.loads(response.read().decode("utf-8"))
+
+            def post(base_url, path, payload):
+                request = urllib.request.Request(
+                    f"{base_url}{path}",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    return json.loads(response.read().decode("utf-8"))
+
+            try:
+                with ctxgit.ReusableThreadingHTTPServer(("127.0.0.1", 0), handler) as server:
+                    thread = threading.Thread(target=server.serve_forever, daemon=True)
+                    thread.start()
+                    base_url = f"http://127.0.0.1:{server.server_port}"
+                    try:
+                        started = post(
+                            base_url,
+                            "/api/info-chat/start",
+                            {"branch": "b1", "text": "SIDE_QUESTION", "aside": True},
+                        )
+                        self.assertEqual(started["mode"], "btw")
+                        active = get(base_url, "/api/jobs/active")["jobs"]
+                        self.assertEqual([job["id"] for job in active], [])
+                        release.set()
+                        for _ in range(100):
+                            job = get(base_url, f"/api/job?id={started['id']}")
+                            if job["status"] != "running":
+                                break
+                            time.sleep(0.05)
+                    finally:
+                        server.shutdown()
+                        thread.join(timeout=5)
+            finally:
+                ctxgit.call_provider_history_chat = original
+
+            self.assertEqual(job["status"], "done")
+            self.assertEqual(job["payload"]["asideAnswer"], "SIDE_ANSWER")
+            self.assertEqual(list(store.iter_history("b1")), before)
+
+    def test_an_aside_on_a_sequence_room_asks_about_the_room_instead_of_running_it(self) -> None:
+        # Observed on tips_re-challenge: the BTW panel was shut on a sequence room
+        # because the API would have answered an aside there by running a round.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._branch(tmp)
+            store.create_branch("b2")
+            store.append_history("b1", "user", "SEAT_ONE_TOPIC", extra={"mode": "chat"})
+            store.create_sequence_room(["b1", "b2"], "room", "Room", ["", ""], ["info-chat", "info-chat"], 4)
+            self.assertTrue(ctxgit.branch_is_sequence_room(store, "room"))
+            before = list(store.iter_history("room"))
+            calls: dict[str, int] = {"room": 0, "history": 0}
+
+            def no_room_turn(*args, **kwargs):
+                calls["room"] += 1
+                raise AssertionError("an aside must not run the room")
+
+            def fake_history_chat(provider, root_, store_, branch_id, user_message, **kwargs):
+                calls["history"] += 1
+                self.assertEqual(branch_id, "room")
+                return {"assistant": "ABOUT_THE_ROOM"}
+
+            handler = ctxgit.make_handler(ctxgit.ProjectState(root), auth_required=False)
+
+            def get(base_url, path):
+                with urllib.request.urlopen(f"{base_url}{path}", timeout=10) as response:
+                    return json.loads(response.read().decode("utf-8"))
+
+            def post(base_url, path, payload):
+                request = urllib.request.Request(
+                    f"{base_url}{path}",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    return json.loads(response.read().decode("utf-8"))
+
+            original_room = ctxgit.run_sequence_room_turn
+            original_history = ctxgit.call_provider_history_chat
+            ctxgit.run_sequence_room_turn = no_room_turn
+            ctxgit.call_provider_history_chat = fake_history_chat
+            try:
+                with ctxgit.ReusableThreadingHTTPServer(("127.0.0.1", 0), handler) as server:
+                    thread = threading.Thread(target=server.serve_forever, daemon=True)
+                    thread.start()
+                    base_url = f"http://127.0.0.1:{server.server_port}"
+                    try:
+                        started = post(
+                            base_url,
+                            "/api/info-chat/start",
+                            {"branch": "room", "text": "WHAT_IS_THIS_ROOM_DOING", "aside": True},
+                        )
+                        self.assertEqual(started["mode"], "btw")
+                        for _ in range(100):
+                            job = get(base_url, f"/api/job?id={started['id']}")
+                            if job["status"] != "running":
+                                break
+                            time.sleep(0.05)
+                    finally:
+                        server.shutdown()
+                        thread.join(timeout=5)
+            finally:
+                ctxgit.run_sequence_room_turn = original_room
+                ctxgit.call_provider_history_chat = original_history
+
+            self.assertEqual(job["status"], "done", job.get("message"))
+            self.assertEqual(job["payload"]["asideAnswer"], "ABOUT_THE_ROOM")
+            self.assertEqual(calls, {"room": 0, "history": 1})
+            self.assertEqual(list(store.iter_history("room")), before)
+
+    def test_an_old_recorded_aside_stays_hidden_from_the_timeline_and_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, store = self._branch(tmp)
             store.append_history("b1", "user", "REAL_QUESTION", extra={"mode": "chat"})

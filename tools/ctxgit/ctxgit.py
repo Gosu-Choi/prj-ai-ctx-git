@@ -159,6 +159,17 @@ CONTEXT_CHAT_TEMP_DIR_NAME = "contexts-chat-temp"
 KNOWLEDGE_DIR_NAME = "knowledge"
 KNOWLEDGE_INDEX_FILE = "README.md"
 DEFAULT_GUIDING_BUDGET_CHARS = 24000
+# Templates: versioned asset packages (a deck system, a report skeleton) that a
+# branch switches on the way it switches on guiding knowledge. A template is a
+# directory, not a document, and is far too large to inject whole, so the prompt
+# carries its manifest, its entry document, and its path; the agent reads the
+# rest of the package from disk. Selection is per branch (`templates` in
+# branch.json) and independent of `guiding` — a branch may run either, both, or
+# neither.
+TEMPLATES_DIR_NAME = "templates"
+TEMPLATE_MANIFEST_FILE = "template.json"
+TEMPLATE_INDEX_FILE = "README.md"
+DEFAULT_TEMPLATE_BUDGET_CHARS = 16000
 WORKSPACE_IMPORT_DIR_NAMES = (
     "workspace",
     "openclaw-workspace",
@@ -483,6 +494,39 @@ def read_global_settings() -> dict[str, Any]:
 
 def write_global_settings(settings: dict[str, Any]) -> None:
     dump_json(global_settings_path(), settings)
+
+
+def remember_opened_project(root: Path) -> None:
+    """Record a project the user opened, so later sessions can find it again.
+
+    Nothing else remembers this. The web UI can open any directory, but the
+    selection lives only in the running process, so a restart forgets it and the
+    Telegram remote — which has no browser to be told in — could only ever reach
+    whatever happened to be open. Most recent first.
+    """
+    path = str(root.resolve())
+    settings = read_global_settings()
+    known = [p for p in settings.get("openedProjects") or [] if isinstance(p, str)]
+    known = [path] + [p for p in known if p != path]
+    settings["openedProjects"] = known[:20]
+    with contextlib.suppress(Exception):
+        write_global_settings(settings)
+
+
+def known_project_roots() -> list[Path]:
+    """Projects opened before that are still initialized ctxgit projects.
+
+    Entries that were moved or deleted drop out silently rather than showing up
+    as choices that fail when selected.
+    """
+    roots: list[Path] = []
+    for value in read_global_settings().get("openedProjects") or []:
+        if not isinstance(value, str):
+            continue
+        path = Path(value)
+        if (path / "contexts").is_dir() and path not in roots:
+            roots.append(path)
+    return roots
 
 
 def telegram_notify_enabled() -> bool:
@@ -1909,6 +1953,34 @@ class HistoryMergeResult:
     summary: str
 
 
+
+# --- ctxgit-apps: 상단 「Extensions」 메뉴에 뜨는 로컬 앱(.ctxgit/apps.json) ---------------------
+def apps_payload(root: Path) -> dict[str, Any]:
+    """작업공간 .ctxgit/apps.json 의 앱 목록. 이 기기에서 도는 앱(127.0.0.1/localhost)만 받는다."""
+    target = Path(root) / ".ctxgit" / "apps.json"
+    try:
+        raw = json.loads(target.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"apps": [], "source": str(target)}
+    except (OSError, ValueError) as exc:
+        return {"apps": [], "source": str(target), "error": f"apps.json 을 못 읽었다: {exc}"}
+    apps = []
+    for item in raw.get("apps", []) if isinstance(raw, dict) else []:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "")
+        if not url.startswith(("http://127.0.0.1:", "http://localhost:")):
+            continue
+        apps.append({
+            "id": str(item.get("id") or url),
+            "name": str(item.get("name") or item.get("id") or "App"),
+            "icon": str(item.get("icon") or "🧩"),
+            "description": str(item.get("description") or ""),
+            "url": url,
+        })
+    return {"apps": apps, "source": str(target)}
+
+
 class ContextStore:
     def __init__(self, root: Path):
         self.root = root.resolve()
@@ -1919,6 +1991,7 @@ class ContextStore:
         self.globalized = self.contexts / "globalized"
         self.agents = self.contexts / "agents"
         self.knowledge = self.contexts / KNOWLEDGE_DIR_NAME
+        self.templates = self.contexts / TEMPLATES_DIR_NAME
         self.config_dir = self.root / ".ctxgit"
         self.config = self.config_dir / "config.json"
 
@@ -1998,6 +2071,7 @@ class ContextStore:
             )
         self.ensure_agent_files()
         self.ensure_knowledge_index()
+        self.ensure_templates_index()
         if not (self.contexts / "README.md").exists():
             write_text(
                 self.contexts / "README.md",
@@ -2145,6 +2219,174 @@ class ContextStore:
                 continue
             documents.append(self.describe_knowledge_document(path))
         return documents
+
+    # --- Templates ---------------------------------------------------------
+    #
+    # A template is a directory of real assets — stylesheets, starter files,
+    # build scripts, its own documentation. Guiding knowledge is injected
+    # verbatim because a document is small; a template is not, so what reaches
+    # the prompt is the manifest, the entry document, and the path on disk. The
+    # agent opens the rest itself. Versions live side by side under `v<N>/` so
+    # switching a branch to v1 keeps working after v2 lands.
+
+    def ensure_templates_index(self) -> None:
+        self.templates.mkdir(parents=True, exist_ok=True)
+        index_path = self.templates / TEMPLATE_INDEX_FILE
+        if index_path.exists():
+            return
+        write_text(
+            index_path,
+            textwrap.dedent(
+                """\
+                # Templates
+
+                Each directory beside this one is a template package: assets a branch
+                builds *with*, as opposed to guiding knowledge, which is text a branch
+                is bound *by*.
+
+                - A branch switches templates on from the `Template` button in the topbar.
+                - Versions sit side by side as `v1/`, `v2/`. A branch pins the version it
+                  selected, so a new version never rewrites finished work.
+                - `template.json` names the package and points at the entry document. Only
+                  the manifest and that entry document reach the prompt; the package
+                  itself stays on disk for the agent to read.
+                - This `README.md` is documentation only and is never injected.
+                """
+            ),
+        )
+
+    def template_dir(self, template_id: str) -> Path:
+        return self.templates / validate_id(template_id, "template")
+
+    def template_version_dir(self, template_id: str, version: int) -> Path:
+        return self.template_dir(template_id) / f"v{int(version)}"
+
+    def template_manifest_path(self, template_id: str) -> Path:
+        return self.template_dir(template_id) / TEMPLATE_MANIFEST_FILE
+
+    def template_versions(self, template_id: str) -> list[int]:
+        root = self.template_dir(template_id)
+        if not root.exists():
+            return []
+        versions = []
+        for path in root.iterdir():
+            if not path.is_dir():
+                continue
+            match = re.fullmatch(r"v(\d+)", path.name)
+            if match:
+                versions.append(int(match.group(1)))
+        return sorted(versions)
+
+    def describe_template(self, template_id: str) -> dict[str, Any]:
+        manifest = load_json(self.template_manifest_path(template_id))
+        versions = self.template_versions(template_id)
+        # The manifest names the current version; a manifest that has drifted
+        # past what is actually on disk would silently select a missing folder.
+        declared = manifest.get("version")
+        current = int(declared) if isinstance(declared, int) and declared in versions else (
+            versions[-1] if versions else 0
+        )
+        files = 0
+        size = 0
+        version_root = self.template_version_dir(template_id, current) if current else None
+        if version_root and version_root.exists():
+            for path in version_root.rglob("*"):
+                if path.is_file():
+                    files += 1
+                    size += path.stat().st_size
+        return {
+            "id": template_id,
+            "name": str(manifest.get("name") or template_id),
+            "summary": str(manifest.get("summary") or ""),
+            "entry": str(manifest.get("entry") or ""),
+            "version": current,
+            "versions": versions,
+            "path": relpath(self.root, version_root) if version_root else "",
+            "files": files,
+            "bytes": size,
+        }
+
+    def list_templates(self) -> list[dict[str, Any]]:
+        if not self.templates.exists():
+            return []
+        items = []
+        for path in sorted(self.templates.iterdir()):
+            if not path.is_dir():
+                continue
+            if not (path / TEMPLATE_MANIFEST_FILE).exists():
+                continue
+            items.append(self.describe_template(path.name))
+        return items
+
+    def branch_template_ids(self, branch_id: str) -> list[str]:
+        paths = self.branch_paths_for_read(branch_id)
+        if not paths.meta.exists():
+            return []
+        raw = load_json(paths.meta).get("templates")
+        if not isinstance(raw, list):
+            return []
+        known = {item["id"] for item in self.list_templates()}
+        selected = []
+        for value in raw:
+            template_id = str(value or "").strip()
+            # A deleted template drops out silently rather than breaking the prompt.
+            if template_id and template_id in known and template_id not in selected:
+                selected.append(template_id)
+        return selected
+
+    def set_branch_templates(self, branch_id: str, template_ids: list[str]) -> list[str]:
+        self.require_initialized()
+        paths = self.branch_paths(branch_id)
+        if not paths.root.exists():
+            die(f"branch does not exist: {branch_id}")
+        known = {item["id"] for item in self.list_templates()}
+        selected: list[str] = []
+        for value in template_ids or []:
+            template_id = str(value or "").strip()
+            if not template_id or template_id in selected:
+                continue
+            if template_id not in known:
+                die(f"template does not exist: {template_id}")
+            selected.append(template_id)
+        meta = load_json(paths.meta)
+        if selected:
+            meta["templates"] = selected
+        else:
+            meta.pop("templates", None)
+        meta["updatedAt"] = utc_now()
+        dump_json(paths.meta, meta)
+        return selected
+
+    def register_template(
+        self,
+        template_id: str,
+        *,
+        name: str,
+        summary: str = "",
+        entry: str = "",
+        version: int = 1,
+    ) -> dict[str, Any]:
+        """Write (or update) a template manifest for a package already on disk."""
+        self.require_initialized()
+        self.ensure_templates_index()
+        template_id = validate_id(template_id, "template")
+        version_root = self.template_version_dir(template_id, version)
+        if not version_root.exists():
+            die(f"template version directory does not exist: {relpath(self.root, version_root)}")
+        if entry and not (version_root / entry).exists():
+            die(f"template entry document does not exist: {entry}")
+        dump_json(
+            self.template_manifest_path(template_id),
+            {
+                "id": template_id,
+                "name": name or template_id,
+                "summary": summary,
+                "entry": entry,
+                "version": int(version),
+                "updatedAt": utc_now(),
+            },
+        )
+        return self.describe_template(template_id)
 
     def unique_knowledge_id(self, title: str) -> str:
         """Derive a free file stem from a document title.
@@ -6561,7 +6803,7 @@ def call_codex_history_compaction(
             formatted_records,
             "</history_records>",
             "",
-            *guiding_enforcement_parts(guiding_context),
+            *guiding_enforcement_parts(guiding_context, inline=False),
         ]
     )
     with tempfile.TemporaryDirectory(prefix="ctxgit-compact-") as tmp:
@@ -6656,7 +6898,7 @@ def call_provider_history_compaction(
         *guiding_prompt_parts(guiding_context),
         "<history_records>", formatted, "</history_records>",
         "",
-        *guiding_enforcement_parts(guiding_context),
+        *guiding_enforcement_parts(guiding_context, inline=False),
     ])
     result = call_claude_prompt(
         root, prompt, cwd=root, writable=False,
@@ -6734,12 +6976,18 @@ def project_context_sections(store: ContextStore, budget_chars: int) -> list[str
     return sections
 
 
-def guiding_context_sections(store: ContextStore, branch_id: str, budget_chars: int) -> str:
+def guiding_context_sections(
+    store: ContextStore, branch_id: str, budget_chars: int, *, labelled: bool = True
+) -> str:
     """Render the knowledge documents this branch has switched on.
 
     These go into the prompt verbatim rather than being offered as files the
     agent may read, so a guiding document is guaranteed to be in effect instead
     of depending on the model choosing to open it.
+
+    `labelled` adds a per-document heading naming its file. That is right for a
+    standalone block and wrong where the text is attached to the user's own
+    message, which is what `guiding_inline_suffix` does.
     """
     doc_ids = store.branch_guiding_ids(branch_id)
     if not doc_ids or budget_chars <= 0:
@@ -6755,11 +7003,97 @@ def guiding_context_sections(store: ContextStore, branch_id: str, budget_chars: 
         if not chunk:
             break
         rel = relpath(store.root, path)
-        sections.append(f"## Guiding Document: `{rel}`\n\n{chunk}")
+        sections.append(f"## Guiding Document: `{rel}`\n\n{chunk}" if labelled else chunk)
         remaining -= len(chunk)
         if remaining <= 0:
             break
     return "\n\n".join(sections) or "(none)"
+
+
+def guiding_inline_suffix(guiding_context: str) -> str:
+    """Guiding text as it is attached to the user's own message.
+
+    It runs on from the message with nothing between them — no tag, no heading,
+    no "the following is guiding knowledge". A labelled block placed elsewhere
+    in the prompt reads as reference material the user happened to paste; the
+    same words continuing the user's sentence read as what the user is asking
+    for. Position is doing the work, so anything that marks a seam undoes it.
+    """
+    if not has_guiding_context(guiding_context):
+        return ""
+    # Callers should hand over the unlabelled rendering, but a labelled one must
+    # not be able to leave a "## Guiding Document: <path>" seam in the middle of
+    # the user's message. Drop those headings wherever the text came from.
+    body = "\n".join(
+        line for line in guiding_context.splitlines()
+        if not line.startswith("## Guiding Document:")
+    ).strip()
+    return f"\n\n{body}" if body else ""
+
+
+def template_context_sections(store: ContextStore, branch_id: str, budget_chars: int) -> str:
+    """Render the template packages this branch has switched on.
+
+    Unlike guiding knowledge this is not the package itself — a deck system runs
+    to megabytes of stylesheets and starter files. What goes in is the manifest,
+    the entry document, and the path, which is enough for the agent to know the
+    package exists, what it is for, and where to read the rest.
+    """
+    template_ids = store.branch_template_ids(branch_id)
+    if not template_ids or budget_chars <= 0:
+        return "(none)"
+    sections = []
+    remaining = budget_chars
+    for template_id in template_ids:
+        item = store.describe_template(template_id)
+        if not item["version"]:
+            continue
+        header = [
+            f"## Template: {item['name']} (`{item['id']}` v{item['version']})",
+            "",
+            f"Package root: `{item['path']}` — {item['files']} files.",
+        ]
+        if item["summary"]:
+            header.append(item["summary"])
+        entry_text = ""
+        if item["entry"]:
+            entry_path = store.template_version_dir(template_id, item["version"]) / item["entry"]
+            entry_text = read_text(entry_path).strip()
+            header.append(
+                f"Its own specification follows, from `{item['entry']}`. It is part of"
+                " the template and binding wherever the template is used."
+            )
+        chunk = "\n".join(header)
+        if entry_text:
+            chunk = f"{chunk}\n\n{truncate_middle(entry_text, max(0, remaining - len(chunk)))}"
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        sections.append(chunk)
+        remaining -= len(chunk)
+        if remaining <= 0:
+            break
+    return "\n\n".join(sections) or "(none)"
+
+
+def has_template_context(template_context: str) -> bool:
+    return bool(template_context) and template_context != "(none)"
+
+
+def template_prompt_parts(template_context: str) -> list[str]:
+    if not has_template_context(template_context):
+        return []
+    return [
+        "Templates switched on for this branch. Build with them rather than inventing",
+        "a format: open the package on disk and start from its starter files. Each",
+        "template carries its own rules below, which bind whatever you produce with it.",
+        "The version named here is the one this branch is pinned to; do not substitute",
+        "another.",
+        "<templates>",
+        template_context,
+        "</templates>",
+        "",
+    ]
 
 
 def has_guiding_context(guiding_context: str) -> bool:
@@ -6807,15 +7141,25 @@ def guiding_system_directive(guiding_context: str) -> str:
     ])
 
 
-def guiding_enforcement_parts(guiding_context: str) -> list[str]:
+def guiding_enforcement_parts(guiding_context: str, *, inline: bool = True) -> list[str]:
     """A last-position restatement, read immediately before the model answers.
 
-    Position carries this, not repetition. The guiding block sits near the top of
-    the prompt, tens of thousands of characters before the answer gets written,
-    with the branch's own earlier prose in between. This is the last thing read.
+    In a chat turn the guiding text is attached to the end of the user's own
+    message, so by here it has just been read; this adds the one thing position
+    alone cannot say, that it outranks the branch's own earlier prose. Prompts
+    with no user message to attach to — compaction, a sequence room — carry the
+    labelled block instead, and `inline=False` points at that.
     """
     if not has_guiding_context(guiding_context):
         return []
+    if inline:
+        return [
+            "The standing instructions at the end of the user message are binding for this",
+            "branch and outrank the style of anything in <history>. Earlier replies here may",
+            "predate them. Check your draft against them and rewrite whatever violates them.",
+            "Do not mention this check in your answer.",
+            "",
+        ]
     return [
         "Before answering, check your draft against <guiding_knowledge> above. It is",
         "binding for this branch and outranks the style of anything in <history>.",
@@ -6824,7 +7168,9 @@ def guiding_enforcement_parts(guiding_context: str) -> list[str]:
     ]
 
 
-def chat_guiding_context(store: ContextStore, branch_id: str) -> str:
+def chat_guiding_context(
+    store: ContextStore, branch_id: str, *, labelled: bool = True
+) -> str:
     """Guiding text at the chat-turn budget. Shared by the prompt body and the
     system prompt so both carry the same document set."""
     config = active_llm_provider_config(store.root)
@@ -6832,11 +7178,14 @@ def chat_guiding_context(store: ContextStore, branch_id: str) -> str:
         config.get("contextBudgetCharacters"), DEFAULT_CONTEXT_BUDGET_CHARS
     )
     return guiding_context_sections(
-        store, branch_id, min(DEFAULT_GUIDING_BUDGET_CHARS, max(4000, budget // 4))
+        store, branch_id, min(DEFAULT_GUIDING_BUDGET_CHARS, max(4000, budget // 4)),
+        labelled=labelled,
     )
 
 
-def info_chat_guiding_context(store: ContextStore, branch_id: str) -> str:
+def info_chat_guiding_context(
+    store: ContextStore, branch_id: str, *, labelled: bool = True
+) -> str:
     """Guiding text at the info-chat budget. See `chat_guiding_context`."""
     config = active_llm_provider_config(store.root)
     budget = coerce_positive_int(
@@ -6844,7 +7193,8 @@ def info_chat_guiding_context(store: ContextStore, branch_id: str) -> str:
         DEFAULT_INFO_CHAT_BUDGET_CHARS,
     )
     return guiding_context_sections(
-        store, branch_id, min(DEFAULT_GUIDING_BUDGET_CHARS, max(4000, budget // 4))
+        store, branch_id, min(DEFAULT_GUIDING_BUDGET_CHARS, max(4000, budget // 4)),
+        labelled=labelled,
     )
 
 
@@ -7216,6 +7566,12 @@ def build_context_bundle(store: ContextStore, branch_id: str) -> dict[str, str]:
     history_record_limit = history_record_limit_from_config(codex_config)
     project_context = "\n\n".join(project_context_sections(store, project_budget)).strip()
     guiding_context = chat_guiding_context(store, branch_id)
+    # The same documents twice: labelled for the system prompt, bare for the
+    # copy that runs on from the user's message. See `guiding_inline_suffix`.
+    guiding_inline = chat_guiding_context(store, branch_id, labelled=False)
+    template_context = template_context_sections(
+        store, branch_id, min(DEFAULT_TEMPLATE_BUDGET_CHARS, max(4000, budget // 4))
+    )
     branch_context = truncate_middle(branch_report_for_prompt(store, branch_id), branch_budget).strip()
     source_context = source_context_sections(store, branch_id, source_budget)
     resource_context = resource_context_sections(store, branch_id, resource_budget)
@@ -7231,6 +7587,8 @@ def build_context_bundle(store: ContextStore, branch_id: str) -> dict[str, str]:
     return {
         "project": project_context or "(none)",
         "guiding": guiding_context,
+        "guidingInline": guiding_inline,
+        "templates": template_context,
         "branch": branch_context or "(none)",
         "sources": source_context,
         "resources": resource_context,
@@ -7276,6 +7634,7 @@ def build_continuation_prompt(
     user_message: str,
     *,
     guiding_context: str = "",
+    guiding_inline: str = "",
     resource_paths: list[str] | None = None,
 ) -> str:
     """What a resumed session gets: the new turn, and nothing it already holds.
@@ -7288,7 +7647,8 @@ def build_continuation_prompt(
 
     Guiding is the exception and is restated every turn. It is the one thing that
     has to win against everything earlier in the session, and position is what
-    makes it win: last read, right before the answer.
+    makes it win: it runs on from the user's message, so it is read as part of
+    what is being asked rather than as something quoted alongside it.
     """
     parts = [
         "Continuing the same ctxgit branch. You already hold this branch's project",
@@ -7313,13 +7673,16 @@ def build_continuation_prompt(
         [
             "User message:",
             "<user_message>",
-            user_message,
+            user_message + guiding_inline_suffix(guiding_inline or guiding_context),
             "</user_message>",
             "",
             *guiding_enforcement_parts(guiding_context),
             *record_voice_parts(),
             "Return JSON only. The JSON must have:",
-            "- assistant: the written answer recorded in this branch's timeline.",
+            "- assistant: the written answer recorded in this branch's timeline. This field is\n"
+            "  the only thing the reader will see, so it must carry the answer itself. Do not\n"
+            "  write the answer elsewhere and refer to it from here — a value like \"as above\"\n"
+            "  or \"(same as the body)\" reaches the reader as those words and nothing else.",
             "- artifacts: array of zero or more artifacts (markdown by default; use another format when asked).",
             "- approvalRequests: array of zero or more outside-workspace write requests.",
         ]
@@ -7364,7 +7727,7 @@ def build_chat_prompt(
         context["project"],
         "</project_context>",
         "",
-        *guiding_prompt_parts(context["guiding"]),
+        *template_prompt_parts(context["templates"]),
         "Branch report:",
         "<branch_report>",
         context["branch"],
@@ -7410,13 +7773,16 @@ def build_chat_prompt(
             "",
             "User message:",
             "<user_message>",
-            user_message,
+            user_message + guiding_inline_suffix(context["guidingInline"]),
             "</user_message>",
             "",
             *guiding_enforcement_parts(context["guiding"]),
             *record_voice_parts(),
             "Return JSON only. The JSON must have:",
-            "- assistant: the written answer recorded in this branch's timeline.",
+            "- assistant: the written answer recorded in this branch's timeline. This field is\n"
+            "  the only thing the reader will see, so it must carry the answer itself. Do not\n"
+            "  write the answer elsewhere and refer to it from here — a value like \"as above\"\n"
+            "  or \"(same as the body)\" reaches the reader as those words and nothing else.",
             "- artifacts: array of zero or more artifacts (markdown by default; use another format when asked).",
             "- approvalRequests: array of zero or more outside-workspace write requests.",
             "",
@@ -7547,6 +7913,10 @@ def build_history_chat_prompt(
     history_record_limit = history_record_limit_from_config(codex_config)
     project_context = "\n\n".join(project_context_sections(store, project_budget)).strip()
     guiding_context = info_chat_guiding_context(store, branch_id)
+    guiding_inline = info_chat_guiding_context(store, branch_id, labelled=False)
+    template_context = template_context_sections(
+        store, branch_id, min(DEFAULT_TEMPLATE_BUDGET_CHARS, max(4000, budget // 4))
+    )
     branch_context = truncate_middle(branch_report_for_prompt(store, branch_id), branch_budget).strip()
     resource_context = resource_context_sections(store, branch_id, resource_budget)
     compaction_context = compaction_context_sections(store, branch_id, max(8000, budget // 4))
@@ -7586,7 +7956,7 @@ def build_history_chat_prompt(
         project_context or "(none)",
         "</project_context>",
         "",
-        *guiding_prompt_parts(guiding_context),
+        *template_prompt_parts(template_context),
         "Branch context:",
         "<branch_context>",
         branch_context or "(none)",
@@ -7627,13 +7997,16 @@ def build_history_chat_prompt(
             "",
             "Current user message:",
             "<user_message>",
-            user_message,
+            user_message + guiding_inline_suffix(guiding_inline),
             "</user_message>",
             "",
             *guiding_enforcement_parts(guiding_context),
             *record_voice_parts(),
             "Return JSON only. The JSON must have:",
-            "- assistant: the written answer recorded in this branch's timeline.",
+            "- assistant: the written answer recorded in this branch's timeline. This field is\n"
+            "  the only thing the reader will see, so it must carry the answer itself. Do not\n"
+            "  write the answer elsewhere and refer to it from here — a value like \"as above\"\n"
+            "  or \"(same as the body)\" reaches the reader as those words and nothing else.",
             "- artifacts: empty array.",
             "- approvalRequests: empty array.",
         ]
@@ -7916,22 +8289,82 @@ def embedded_chat_envelope(text: str) -> dict[str, Any] | None:
     return None
 
 
+#: An `assistant` value that points at the answer instead of being it.
+#:
+#: Asked for JSON, a model that has already written the answer as prose will
+#: sometimes append the envelope and fill this field with a back-reference. The
+#: envelope parser then keeps the reference and drops the prose, so the branch
+#: records "(위 본문과 같음)" and the answer is gone — while the model considers
+#: the turn answered. Short and referring, with no content of its own, is the
+#: whole shape; matching on particular wording would only cover the phrasings
+#: seen so far.
+_POINTER_ANSWER_RE = re.compile(
+    r"^[\s(\[]*(?:as above|same as above|see above|위|아래|상기|앞|본문|원문|동일|상동)"
+    r"[^\n]{0,40}$",
+    re.IGNORECASE,
+)
+
+
+def answer_is_a_pointer(value: str) -> bool:
+    """Whether a recorded answer refers to content rather than carrying it."""
+    text = str(value or "").strip()
+    if not text or len(text) > 60 or "\n" in text:
+        return False
+    return bool(_POINTER_ANSWER_RE.match(text))
+
+
+def prose_outside_envelope(text: str) -> str:
+    """Everything in `text` that is not the JSON envelope.
+
+    Used only to recover an answer the model wrote as prose before appending an
+    envelope that points back at it. Returns "" when what is left is too slight
+    to be an answer, so a stray line before the JSON never replaces a real one
+    inside it.
+    """
+    for candidate in (*_FENCED_JSON_RE.findall(text), *_balanced_object_spans(text)):
+        try:
+            parsed = json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not (isinstance(parsed, dict) and isinstance(parsed.get("assistant"), str)):
+            continue
+        index = text.find(candidate)
+        if index < 0:
+            continue
+        rest = (text[:index] + text[index + len(candidate):])
+        rest = re.sub(r"```(?:json)?\s*```", "", rest)
+        rest = rest.strip().strip("`").strip()
+        return rest if len(rest) >= 40 else ""
+    return ""
+
+
 def parse_chat_result(raw: str) -> dict[str, Any]:
     text = raw.strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
+    outside = ""
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError:
         parsed = embedded_chat_envelope(text)
         if parsed is None:
             return {"assistant": raw.strip(), "artifacts": [], "approvalRequests": []}
+        outside = prose_outside_envelope(text)
     if not isinstance(parsed, dict):
         recovered = embedded_chat_envelope(text)
         if recovered is None:
             return {"assistant": raw.strip(), "artifacts": [], "approvalRequests": []}
         parsed = recovered
+        outside = prose_outside_envelope(text)
+    # The model wrote the answer as prose and then pointed back at it from the
+    # envelope. Keep what it wrote rather than the reference to it.
+    if answer_is_a_pointer(parsed.get("assistant")):
+        # With nothing to point at, the turn produced no answer. Blanking it
+        # here routes it into each caller's existing empty-answer handling,
+        # which says so and leaves the turn resendable — better than recording
+        # a reference to text that was never written.
+        parsed = {**parsed, "assistant": outside}
     assistant = parsed.get("assistant")
     artifacts = parsed.get("artifacts")
     approval_requests = parsed.get("approvalRequests")
@@ -8901,6 +9334,7 @@ def call_codex_chat(
     timeout_seconds = coerce_positive_int(codex_config.get("timeoutSeconds"), 900)
     emit_progress(progress, "Building context prompt")
     guiding = chat_guiding_context(store, branch_id)
+    guiding_inline = chat_guiding_context(store, branch_id, labelled=False)
     writable_dirs = external_writable_dirs(root, approved_external_paths or [])
     live_progress = codex_steerable_progress(progress)
     if live_progress and not codex_app_server_supported(root):
@@ -8918,7 +9352,8 @@ def call_codex_chat(
     if resuming:
         prompt = build_continuation_prompt(
             store, branch_id, user_message,
-            guiding_context=guiding, resource_paths=resource_paths,
+            guiding_context=guiding, guiding_inline=guiding_inline,
+            resource_paths=resource_paths,
         )
     else:
         prompt = build_chat_prompt(
@@ -10054,13 +10489,15 @@ def call_claude_chat(
 ) -> dict[str, Any]:
     config = read_llm_config(root, branch_id).get("claude", {})
     guiding = chat_guiding_context(store, branch_id)
+    guiding_inline = chat_guiding_context(store, branch_id, labelled=False)
     key = session_key(branch_id, "chat", "claude", str(config.get("model") or ""), guiding)
     resuming = remembered_session(root, key) if session_continuity_enabled(config) else ""
     if resuming:
         # The session already holds the branch; send only what is new.
         prompt = build_continuation_prompt(
             store, branch_id, user_message,
-            guiding_context=guiding, resource_paths=resource_paths,
+            guiding_context=guiding, guiding_inline=guiding_inline,
+            resource_paths=resource_paths,
         )
         session = (resuming, "resume")
     else:
@@ -10337,21 +10774,34 @@ def run_history_chat_turn(
 ) -> dict[str, Any]:
     """One info-chat turn on a branch.
 
-    `aside` marks it as a BTW lookup: something asked on the side while a real turn
-    was running. It is still written to `history.jsonl`, because the branch is a
-    record and dropping it would leave an answer nobody can trace, but it is kept
-    out of the chat timeline and out of every later prompt. A side question is not
-    part of the conversation the branch is having, and letting it into the prompt
-    would put a throwaway lookup in front of the model on every turn that follows.
+    `aside` marks it as a BTW lookup: a side question about the branch, asked
+    whether or not a real turn is running. It leaves no trace — nothing goes into
+    `history.jsonl`, no compaction runs, and no turn is committed to the internal
+    git. A side question is not part of the conversation the branch is having; it
+    reads the branch and answers, and the answer travels back on `asideAnswer`
+    only. (Asides recorded before this change are still on disk; `visible_history_records`
+    keeps those out of the timeline and the prompt.)
     """
     selected_provider = provider or str(read_llm_config(root, branch_id).get("provider") or "codex")
     turn_id = new_turn_id()
     emit_progress(progress, "Preparing branch context")
     normalized_resources = normalize_branch_resource_paths(store, branch_id, resource_paths)
+    if aside:
+        result = call_provider_history_chat(
+            selected_provider,
+            root,
+            store,
+            branch_id,
+            user_message,
+            resource_paths=normalized_resources,
+            progress=progress,
+        )
+        assistant = str(result.get("assistant") or "").strip() or "(No assistant message returned.)"
+        payload = branch_payload(store, branch_id)
+        payload["asideAnswer"] = assistant
+        return payload
     emit_progress(progress, "Recording user message")
     user_extra: dict[str, Any] = {"turnId": turn_id, "mode": "info-chat"}
-    if aside:
-        user_extra["aside"] = True
     if normalized_resources:
         user_extra["resources"] = normalized_resources
     store.append_history(branch_id, "user", user_message, extra=user_extra)
@@ -10377,7 +10827,6 @@ def run_history_chat_turn(
             "turnId": turn_id,
             "artifacts": [],
             "approvalRequests": [],
-            **({"aside": True} if aside else {}),
         },
     )
     turn_commit = internal_git_commit_turn(
@@ -10392,10 +10841,6 @@ def run_history_chat_turn(
     emit_progress(progress, "Refreshing branch view")
     payload = branch_payload(store, branch_id)
     payload["turnCommit"] = turn_commit
-    if aside:
-        # The answer is filtered out of `history`, so hand it back directly —
-        # otherwise the panel that asked has no way to read its own reply.
-        payload["asideAnswer"] = assistant
     return payload
 
 
@@ -11049,7 +11494,7 @@ def build_sequence_agent_prompt(
         f"Current reply number: {reply_index + 1} of at most {maximum}.",
         evaluator_instruction if stop_decider is not None and order == stop_decider else participant_instruction,
         "",
-        *guiding_enforcement_parts(room_guiding_context),
+        *guiding_enforcement_parts(room_guiding_context, inline=False),
     ])
 
 
@@ -13232,6 +13677,8 @@ def branch_payload(store: ContextStore, branch_id: str) -> dict[str, Any]:
         "compactions": compaction_items,
         "guiding": store.branch_guiding_ids(branch_id),
         "knowledge": store.list_knowledge_documents(),
+        "templates": store.branch_template_ids(branch_id),
+        "templateCatalog": store.list_templates(),
         "archives": store.list_archives(branch_id),
         "git": {
             "historyLog": run_git(store.root, ["log", "--oneline", "--", history_path]),
@@ -14024,6 +14471,13 @@ class ServerProjectRegistry:
                     candidates.append(child.resolve())
         elif active_root:
             candidates.append(active_root)
+        # Projects opened earlier are reachable too. Without this the only
+        # project on offer is whatever is open right now, which is no choice at
+        # all for a caller with no browser — see `remember_opened_project`.
+        for path in known_project_roots():
+            resolved = path.resolve()
+            if resolved not in candidates:
+                candidates.append(resolved)
         if active_root and active_root not in candidates:
             candidates.insert(0, active_root)
         used: set[str] = set()
@@ -14032,7 +14486,12 @@ class ServerProjectRegistry:
             payload = project_payload(path)
             payload["id"] = project_registry_id(path, used)
             payload["active"] = active_root is not None and path == active_root
-            payload["source"] = "server" if self.projects_root and path != active_root else "active"
+            if active_root is not None and path == active_root:
+                payload["source"] = "active"
+            elif self.projects_root:
+                payload["source"] = "server"
+            else:
+                payload["source"] = "known"
             projects.append(payload)
         return projects
 
@@ -14245,6 +14704,7 @@ class ProjectState:
         with self._lock:
             self._root = root
         load_project_env(root)
+        remember_opened_project(root)
         return project_payload(root)
 
 
@@ -15078,6 +15538,9 @@ def make_handler(
                     {"branch": branch_id, "text": str(record.get("text") or ""), "createdAt": str(record.get("createdAt") or "")}
                 )
                 return True
+            if parsed.path == "/api/apps":  # ctxgit-apps
+                self.send_json(apps_payload(root))
+                return True
             if parsed.path == "/api/context-chat":
                 self.send_json(context_chat_payload(store))
                 return True
@@ -15188,6 +15651,9 @@ def make_handler(
                                 "createdAt": job.get("createdAt"),
                             }
                             for job in jobs.running_jobs(root)
+                            # A BTW aside is the asking panel's own job; a page
+                            # that adopted it would show the branch as busy.
+                            if str(job.get("mode") or "") != "btw"
                         ]
                     }
                 )
@@ -15207,6 +15673,20 @@ def make_handler(
                     self.send_json({"error": "file_not_found", "message": "File not found."}, status=404)
                 except ValueError as exc:
                     self.send_json({"error": "file_read_failed", "message": str(exc)}, status=400)
+                return True
+            if parsed.path == "/api/templates":
+                branch_id = (query.get("branch") or [""])[0]
+                try:
+                    payload: dict[str, Any] = {"templates": store.list_templates()}
+                    if branch_id:
+                        payload["branch"] = branch_id
+                        payload["selected"] = store.branch_template_ids(branch_id)
+                    self.send_json(payload)
+                except SystemExit as exc:
+                    self.send_json(
+                        die_payload("templates_read_failed", exc),
+                        status=http_status_from_exit(exc, 400),
+                    )
                 return True
             if parsed.path == "/api/knowledge":
                 branch_id = (query.get("branch") or [""])[0]
@@ -16162,6 +16642,40 @@ def make_handler(
                         status=http_status_from_exit(exc, 400),
                     )
                 return
+            if parsed.path == "/api/branch/templates":
+                branch_id = str(body.get("branch") or "")
+                requested = body.get("templates")
+                if not isinstance(requested, list):
+                    self.send_json({"error": "templates_required"}, status=400)
+                    return
+                try:
+                    selected = store.set_branch_templates(
+                        branch_id, [str(item) for item in requested]
+                    )
+                    internal_git_commit_turn(
+                        store,
+                        kind="branch-templates",
+                        actor="user",
+                        summary=(
+                            f"Set templates of {branch_id} to "
+                            f"{', '.join(selected) or '(none)'}"
+                        ),
+                        branch_id=branch_id,
+                        metadata={"branch": branch_id, "templates": selected},
+                    )
+                    self.send_json(
+                        {
+                            "branch": branch_id,
+                            "templates": selected,
+                            "templateCatalog": store.list_templates(),
+                        }
+                    )
+                except SystemExit as exc:
+                    self.send_json(
+                        die_payload("templates_failed", exc),
+                        status=http_status_from_exit(exc, 400),
+                    )
+                return
             if parsed.path == "/api/branch/guiding":
                 branch_id = str(body.get("branch") or "")
                 requested = body.get("docs")
@@ -16759,14 +17273,17 @@ def make_handler(
                 text = str(body.get("text") or "").strip()
                 provider = str(body.get("provider") or "") or None
                 provider = branch_provider_authority(root, branch_id, provider)
-                # A BTW lookup is recorded but kept out of the timeline and out of
-                # later prompts; see run_history_chat_turn.
+                # A BTW lookup answers from the branch and records nothing; see
+                # run_history_chat_turn.
                 aside = body.get("aside") is True
                 resources = request_resource_paths(body)
                 if not text:
                     self.send_json({"error": "message_required"}, status=400)
                     return
-                if branch_is_sequence_room(store, branch_id):
+                # An aside on a sequence room is a question *about* the room, not a
+                # round of it: it reads the room's record and answers, like on any
+                # other branch, instead of putting every seat through a turn.
+                if branch_is_sequence_room(store, branch_id) and not aside:
                     maximum_raw = coerce_nonnegative_int(body.get("maxAgentReplies"), 0)
 
                     def sequence_work(progress: ProgressCallback) -> dict[str, Any]:
@@ -16782,7 +17299,9 @@ def make_handler(
 
                     self.send_json(jobs.create("sequence-room", sequence_work, root=root, branch=branch_id, mode="sequence-room"), status=202)
                     return
-                if provider == "codex-worker" or (jobs.prefer_worker and provider in {None, "codex"}):
+                # A worker round-trips the project snapshot and records the turn;
+                # an aside is answered here so it stays off the record.
+                if not aside and (provider == "codex-worker" or (jobs.prefer_worker and provider in {None, "codex"})):
                     self.send_json(
                         jobs.create_worker(
                             "info-chat",
@@ -16799,6 +17318,8 @@ def make_handler(
                         status=202,
                     )
                     return
+                if aside and provider == "codex-worker":
+                    provider = "codex"
 
                 def work(progress: ProgressCallback) -> dict[str, Any]:
                     return run_history_chat_turn(
@@ -17327,10 +17848,13 @@ TELEGRAM_REMOTE_HELP = "\n".join(
         "/btw <내용> — 도는 턴에 곁말",
         "/stop — 도는 턴 중단",
         "/status — 현재 대상과 진행 상황",
-        "/projects, /project <이름> — 프로젝트 전환",
+        "",
+        "/projects — 열어 본 프로젝트 목록",
+        "/project <이름> — 프로젝트 전환 (브랜치 대상은 초기화됩니다)",
         "",
         "그냥 텍스트는 info-chat(읽기 전용)으로 갑니다.",
         "알림에 답장하면 그 브랜치로 갑니다.",
+        "프로젝트 선택은 이 대화에만 적용되고 브라우저와 따로 움직입니다.",
     ]
 )
 
@@ -17384,13 +17908,44 @@ class TelegramRemote:
             return 0
 
     def _root_for(self, chat_id: str) -> Path:
-        return self._roots.get(chat_id) or self._project_state.root()
+        """The project this chat is driving.
+
+        A chat that picked one with /project keeps it, independently of what the
+        browser has open — two people can work different projects at once. With
+        no pick it follows the open project, and with nothing open at all it
+        falls back to the most recently opened one rather than raising, which
+        used to take the whole poller down after a restart.
+        """
+        chosen = self._roots.get(chat_id)
+        if chosen:
+            return chosen
+        with contextlib.suppress(Exception):
+            return self._project_state.root()
+        known = known_project_roots()
+        if known:
+            return known[0]
+        raise ValueError("No project selected.")
 
     def _branches(self, root: Path) -> list[str]:
         with contextlib.suppress(Exception):
             store = ContextStore(root)
             return [str(item.get("id") or "") for item in store.list_branches() if item.get("id")]
         return []
+
+    def _resolve_project(self, root: Path, name: str) -> Path | None:
+        """Exact name or path, else a unique prefix or substring."""
+        name = name.strip()
+        if not name:
+            return None
+        paths = [Path(str(item.get("path") or "")) for item in self._registry.list_projects(root)]
+        paths = [p for p in paths if str(p)]
+        for path in paths:
+            if path.name == name or str(path) == name:
+                return path
+        matches = [p for p in paths if p.name.startswith(name)] or [
+            p for p in paths if name.lower() in p.name.lower()
+        ]
+        return matches[0] if len(matches) == 1 else None
 
     def _resolve_branch(self, root: Path, name: str) -> str:
         """Exact id, else a unique prefix or substring — phone typing is imprecise."""
@@ -17402,6 +17957,13 @@ class TelegramRemote:
             return name
         matches = [b for b in known if b.startswith(name)] or [b for b in known if name.lower() in b.lower()]
         return matches[0] if len(matches) == 1 else ""
+
+    def _config_root(self) -> Path:
+        """Somewhere to read Telegram config from, open project or not."""
+        with contextlib.suppress(Exception):
+            return self._project_state.root()
+        known = known_project_roots()
+        return known[0] if known else TOOL_REPO_ROOT
 
     # --- the loop ---------------------------------------------------------
 
@@ -17427,11 +17989,11 @@ class TelegramRemote:
                 time.sleep(5)
 
     def _tick(self) -> None:
-        try:
-            root = self._project_state.root()
-        except Exception:  # noqa: BLE001 - no project open yet
-            time.sleep(5)
-            return
+        # The bot token is read from the repo `.env` layer, which applies to
+        # every project root, so polling does not need a project to be open —
+        # it only needs somewhere to read config from. Requiring an open project
+        # here is what made the remote go silent after every restart.
+        root = self._config_root()
         token, chat_id, _ = telegram_remote_config(root)
         if not token or not chat_id:
             time.sleep(15)
@@ -17458,7 +18020,15 @@ class TelegramRemote:
             return
         chat = str((message.get("chat") or {}).get("id") or "")
         sender = int(((message.get("from") or {}).get("id")) or 0)
-        root = self._root_for(chat)
+        try:
+            root = self._root_for(chat)
+        except ValueError:
+            # Authorize against the config root before answering, so an unknown
+            # chat still learns nothing about this machine.
+            _, expected_chat, allowed = telegram_remote_config(self._config_root())
+            if expected_chat and chat == expected_chat and (not allowed or sender in allowed):
+                self._say(token, chat, "열어 둔 프로젝트가 없습니다. 브라우저에서 프로젝트를 한 번 여세요.")
+            return
         expected_token, expected_chat, allowed_users = telegram_remote_config(root)
         # Wrong chat, or a member of the right chat who was never allowed: ignore
         # in silence. Answering would confirm the bot drives something real.
@@ -17484,19 +18054,37 @@ class TelegramRemote:
             self._say(token, chat, TELEGRAM_REMOTE_HELP)
             return
         if command == "projects":
-            rows = self._registry.list_projects(root)
-            names = "\n".join(f"· {Path(str(item.get('path'))).name}" for item in rows) or "(없음)"
-            self._say(token, chat, f"프로젝트:\n{names}\n\n현재: {root.name}")
+            lines = []
+            for item in self._registry.list_projects(root):
+                path = Path(str(item.get("path") or ""))
+                here = path.resolve() == root.resolve()
+                count = len(self._branches(path)) if item.get("initialized") else 0
+                lines.append(
+                    ("▶ " if here else "· ") + path.name
+                    + (f" ({count}개 브랜치)" if count else "")
+                )
+            self._say(
+                token, chat,
+                "프로젝트:\n" + ("\n".join(lines) or "(없음)")
+                + f"\n\n현재: {root.name}\n바꾸려면 /project <이름>",
+            )
             return
         if command == "project":
-            for item in self._registry.list_projects(root):
-                candidate = Path(str(item.get("path") or ""))
-                if candidate.name == rest or str(candidate) == rest:
-                    self._roots[chat] = candidate
-                    self._targets.pop(chat, None)
-                    self._say(token, chat, f"프로젝트: {candidate.name}")
-                    return
-            self._say(token, chat, f"그런 프로젝트가 없습니다: {rest}")
+            if not rest:
+                self._say(token, chat, f"현재: {root.name}\n바꾸려면 /project <이름>")
+                return
+            chosen = self._resolve_project(root, rest)
+            if not chosen:
+                self._say(token, chat, f"그런 프로젝트가 없습니다: {rest}")
+                return
+            self._roots[chat] = chosen
+            # The branch target belonged to the old project.
+            self._targets.pop(chat, None)
+            branches = self._branches(chosen)
+            self._say(
+                token, chat,
+                f"프로젝트: {chosen.name} ({len(branches)}개 브랜치)\n/branches 로 목록, /use <브랜치> 로 대상 지정",
+            )
             return
         if command == "branches":
             running = {str(j.get("branch") or "") for j in self._jobs.running_jobs(root=root)}

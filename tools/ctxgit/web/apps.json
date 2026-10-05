@@ -1,0 +1,11 @@
+{
+  "apps": [
+    {
+      "id": "law-scraper",
+      "name": "Law Studio",
+      "icon": "⚖️",
+      "description": "이 브랜치로 법 공부 세트 생성 · 생성 지도·조인 · 플레이리스트 (law-scraper 브리지 127.0.0.1:8765)",
+      "url": "http://127.0.0.1:8765/ui?branch={branch}"
+    }
+  ]
+}

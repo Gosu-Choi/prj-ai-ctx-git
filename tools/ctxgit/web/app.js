@@ -86,6 +86,8 @@ const state = {
   activeSummaryPath: "",
   knowledge: [],
   guiding: [],
+  templates: [],
+  templateCatalog: [],
   knowledgingSource: null,
 };
 
@@ -194,6 +196,11 @@ const els = {
   guidingDialogNewForm: document.querySelector("#guidingDialogNewForm"),
   guidingDialogNewInput: document.querySelector("#guidingDialogNewInput"),
   guidingDialogStatus: document.querySelector("#guidingDialogStatus"),
+  templateButton: document.querySelector("#templateButton"),
+  templateDialog: document.querySelector("#templateDialog"),
+  templateDialogTarget: document.querySelector("#templateDialogTarget"),
+  templateDialogList: document.querySelector("#templateDialogList"),
+  templateDialogStatus: document.querySelector("#templateDialogStatus"),
   knowledgingDialog: document.querySelector("#knowledgingDialog"),
   knowledgingSource: document.querySelector("#knowledgingSource"),
   knowledgingForm: document.querySelector("#knowledgingForm"),
@@ -1708,6 +1715,116 @@ function openFolderPicker(branch) {
     await setBranchFolder(branch, name); // assigning auto-registers the folder
   };
   dialog.showModal();
+}
+
+// --- Templates --------------------------------------------------------------
+//
+// A template is a package the branch builds *with* — a deck system, a report
+// skeleton — as opposed to guiding knowledge, which is text the branch is bound
+// *by*. The two are switched on independently. Only the manifest and the entry
+// document reach the prompt; the package itself is read from disk.
+
+function templateSizeLabel(bytes) {
+  if (!bytes) return "";
+  const mb = bytes / (1024 * 1024);
+  return mb >= 1 ? `${mb.toFixed(1)}MB` : `${Math.round(bytes / 1024)}KB`;
+}
+
+async function refreshTemplates(branch) {
+  const query = branch ? `?branch=${encodeURIComponent(branch)}` : "";
+  const data = await api(`/api/templates${query}`);
+  state.templateCatalog = Array.isArray(data.templates) ? data.templates : [];
+  if (branch && Array.isArray(data.selected)) state.templates = data.selected;
+  return data;
+}
+
+function renderTemplateList(branch) {
+  const selected = new Set(state.templates || []);
+  const rows = (state.templateCatalog || []).map((item) => {
+    const on = selected.has(item.id);
+    const versions = (item.versions || []).length > 1
+      ? ` · 버전 ${(item.versions || []).map((v) => `v${v}`).join(", ")} 중 v${item.version}`
+      : ` · v${item.version}`;
+    const size = templateSizeLabel(item.bytes);
+    const meta = `${escapeHtml(item.path)}${escapeHtml(versions)} · ${item.files} files${size ? ` · ${size}` : ""}`;
+    return `
+      <button class="knowledge-pick ${on ? "active" : ""}" data-template-id="${escapeHtml(item.id)}" type="button">
+        <span class="knowledge-pick-toggle">${on ? "ON" : "OFF"}</span>
+        <span class="knowledge-pick-body">
+          <span class="knowledge-pick-title">${escapeHtml(item.name)}</span>
+          <span class="knowledge-pick-meta">${meta}</span>
+          ${item.summary ? `<span class="knowledge-pick-meta">${escapeHtml(item.summary)}</span>` : ""}
+        </span>
+      </button>`;
+  });
+  els.templateDialogList.innerHTML =
+    rows.join("") ||
+    '<div class="muted">템플릿이 없습니다. <code>contexts/templates/&lt;id&gt;/v1/</code> 에 패키지를 두고 <code>template.json</code> 을 만들면 여기 나타납니다.</div>';
+  els.templateDialogList.querySelectorAll("[data-template-id]").forEach((button) => {
+    button.addEventListener("click", () => toggleTemplate(branch, button.dataset.templateId));
+  });
+}
+
+async function toggleTemplate(branch, templateId) {
+  const selected = new Set(state.templates || []);
+  if (selected.has(templateId)) selected.delete(templateId);
+  else selected.add(templateId);
+  // Keep catalogue order so the injected prompt order is predictable.
+  const templates = (state.templateCatalog || []).map((item) => item.id).filter((id) => selected.has(id));
+  setTemplateStatus("저장 중…");
+  try {
+    const data = await api("/api/branch/templates", {
+      method: "POST",
+      body: JSON.stringify({ branch, templates }),
+    });
+    state.templates = Array.isArray(data.templates) ? data.templates : templates;
+    if (Array.isArray(data.templateCatalog)) state.templateCatalog = data.templateCatalog;
+    renderTemplateList(branch);
+    setTemplateButton(branch);
+    setTemplateStatus(templateSelectionLabel(), "ok");
+  } catch (error) {
+    setTemplateStatus(`저장 실패: ${error.message}`, "error");
+  }
+}
+
+function templateSelectionLabel() {
+  const count = (state.templates || []).length;
+  return count ? `${count}개 템플릿으로 만듭니다.` : "켜 둔 템플릿이 없습니다.";
+}
+
+function setTemplateStatus(message, kind = "") {
+  if (!els.templateDialogStatus) return;
+  els.templateDialogStatus.textContent = message;
+  els.templateDialogStatus.className = `settings-status ${kind}`.trim();
+}
+
+function setTemplateButton(branchId) {
+  if (!els.templateButton) return;
+  if (!branchId) {
+    els.templateButton.hidden = true;
+    delete els.templateButton.dataset.branch;
+    return;
+  }
+  els.templateButton.dataset.branch = branchId;
+  els.templateButton.hidden = false;
+  const count = (state.templates || []).length;
+  els.templateButton.textContent = count ? `Template · ${count}` : "Template";
+  els.templateButton.setAttribute("aria-pressed", String(count > 0));
+}
+
+async function openTemplateDialog() {
+  const branch = els.templateButton?.dataset.branch || "";
+  if (!branch || !els.templateDialog) return;
+  els.templateDialogTarget.textContent = branch;
+  setTemplateStatus("불러오는 중…");
+  els.templateDialog.showModal();
+  try {
+    await refreshTemplates(branch);
+    renderTemplateList(branch);
+    setTemplateStatus(templateSelectionLabel());
+  } catch (error) {
+    setTemplateStatus(`불러오기 실패: ${error.message}`, "error");
+  }
 }
 
 // --- Guiding knowledge ------------------------------------------------------
@@ -4347,6 +4464,9 @@ async function rehydrateRunningJobs() {
   for (const job of data.jobs || []) {
     if (!job.id || !job.branch) continue;
     if (state.jobs[job.id]) continue; // already tracked this session
+    // A BTW aside belongs to the panel that asked it; adopting it here would
+    // mark the branch busy and swap the composer to Stop for a side question.
+    if (job.mode === "btw") continue;
     rememberJob({ ...job, status: job.status || "running" }, { branch: job.branch, mode: job.mode });
     monitorTrackedJob(job.id).catch((error) => handleMonitorError(state.jobs[job.id] || job, error));
     changed = true;
@@ -7276,22 +7396,38 @@ async function switchRunningTurnMode(swap) {
   }
 }
 
-// BTW is a read-only side conversation while the main turn keeps running.
-// Native steering belongs to the normal composer, not this panel.
+// BTW is a read-only side question about the open branch. It records nothing and
+// does not need a turn to be running — when one is, it runs alongside and the
+// turn keeps going. Native steering belongs to the normal composer, not here.
 function btwTargetJob() {
-  const job = activeBranchRunningJob(activeChatKey());
-  return String(job?.mode || "").startsWith("sequence-room") ? null : job;
+  return activeBranchRunningJob(activeChatKey());
+}
+
+// The branch a BTW question goes to, or "" when there is nothing to ask about:
+// no branch open, an archived one, the contexts chat, or the boss desk. A
+// sequence room counts — the server answers *about* the room from its record
+// rather than running a round of it.
+function btwTargetBranch() {
+  if (state.activeContextChat || isBossChat()) return "";
+  const branch = state.activeBranch;
+  if (!branch || state.payload?.archived === true) return "";
+  return branch;
 }
 
 function renderBtwPanel() {
-  const job = btwTargetJob();
+  const branch = btwTargetBranch();
+  const job = branch ? btwTargetJob() : null;
   const sent = state.btwSent[activeChatKey()] || [];
-  // Nothing here touches the running turn. BTW asks its own side question and the
+  // Nothing here touches a running turn. BTW asks its own side question and the
   // turn keeps going; stopping the turn lives on the composer, where the thing
   // being stopped is the thing you are looking at.
-  els.btwStatus.textContent = job ? "질문 가능" : "실행 중인 턴 없음";
-  els.btwSendButton.disabled = !job || !els.btwInput.value.trim();
-  els.btwInput.disabled = !job;
+  els.btwStatus.textContent = !branch
+    ? "질문할 브랜치 없음"
+    : job
+      ? "실행 중인 턴 옆에서 질문"
+      : "질문 가능";
+  els.btwSendButton.disabled = !branch || !els.btwInput.value.trim();
+  els.btwInput.disabled = !branch;
   els.btwLog.innerHTML =
     sent
       .map(
@@ -7305,18 +7441,18 @@ function renderBtwPanel() {
 
 async function sendBtw() {
   const activeKey = activeChatKey();
-  const job = btwTargetJob();
+  const branch = btwTargetBranch();
   const text = els.btwInput.value.trim();
-  if (!job || !text) return;
+  if (!branch || !text) return;
   els.btwSendButton.disabled = true;
   try {
     const started = await api("/api/info-chat/start", {
       method: "POST",
       body: JSON.stringify({
-        branch: job.branch || activeKey,
+        branch,
         text,
         provider: effectiveProvider(),
-        // Recorded, but kept out of the chat timeline and out of later prompts.
+        // Answered from the branch and never written to it.
         aside: true,
       }),
     });
@@ -7330,16 +7466,9 @@ async function sendBtw() {
       await sleep(400);
       const sideJob = await api(`/api/job?id=${encodeURIComponent(started.id)}`);
       if (sideJob.status === "done") {
-        // A BTW turn is kept out of `history`, so the answer comes back on its own
-        // field. The history scan stays as a fallback for a turn recorded before
-        // asides existed.
-        const history = Array.isArray(sideJob.payload?.history) ? sideJob.payload.history : [];
-        const answer = [...history]
-          .reverse()
-          .find((item) => item.role === "assistant" && item.mode === "info-chat");
-        entry.answer = String(
-          sideJob.payload?.asideAnswer || answer?.content || answer?.text || "(답변 없음)",
-        );
+        // A BTW turn writes nothing to `history`, so the answer comes back on its
+        // own field.
+        entry.answer = String(sideJob.payload?.asideAnswer || "(답변 없음)");
         els.btwStatus.textContent = "완료";
         break;
       }
@@ -7508,8 +7637,10 @@ function setBranchDirButton(branchId) {
   } else {
     delete els.openBranchDirButton.dataset.branch;
     els.openBranchDirButton.hidden = true;
-    // Guiding is branch-scoped; every non-branch view routes through here.
+    // Guiding and Template are branch-scoped; every non-branch view routes
+    // through here.
     setGuidingButton("");
+    setTemplateButton("");
     // No active branch: hide the parent button too (renderBranch re-shows it).
     if (els.parentBranchButton) {
       els.parentBranchButton.hidden = true;
@@ -7860,3 +7991,120 @@ loadAuthStatus()
     els.activeTitle.textContent = "Could not load ctxgit project";
     els.activeMeta.textContent = error.message;
   });
+
+
+// ---------------------------------------------------------------- ctxgit-apps
+// 상단 「Extensions」: 이 기기에서 도는 작업 앱을 지금 브랜치 문맥으로 연다(.ctxgit/apps.json).
+// 앱은 iframe 으로 열리고 url 의 {branch} 가 지금 브랜치 id 로 바뀐다. 사이드바의 커넥터 Extensions 와는 다른 것이다.
+const appsEls = {
+  toggle: document.querySelector("#appsToggle"),
+  menu: document.querySelector("#appsMenu"),
+  frame: document.querySelector("#appFrame"),
+  title: document.querySelector("#appFrameTitle"),
+  branch: document.querySelector("#appFrameBranch"),
+  open: document.querySelector("#appFrameOpen"),
+};
+let openAppId = null;
+let openAppBranch = null;
+
+function appUrl(app) {
+  return app.url.replace("{branch}", encodeURIComponent(state.activeBranch || ""));
+}
+
+async function loadApps() {
+  // 서버의 /api/apps(작업공간 .ctxgit/apps.json)가 먼저. 프로젝트를 아직 안 골랐거나 실패하면 web/apps.json(정적 파일).
+  try {
+    const data = await api("/api/apps");
+    state.apps = data.apps || [];
+    state.appsSource = data.source || "";
+  } catch {
+    state.apps = [];
+  }
+  if (!state.apps.length) {
+    try {
+      const res = await fetch("/apps.json", { cache: "no-store" });
+      const data = res.ok ? await res.json() : { apps: [] };
+      state.apps = (data.apps || []).filter((app) => /^http:\/\/(127\.0\.0\.1|localhost):/.test(app.url || ""));
+      if (state.apps.length) state.appsSource = "web/apps.json";
+    } catch {
+      // 목록 없음 — 메뉴가 등록 방법을 보여 준다
+    }
+  }
+  renderAppsMenu();
+}
+
+function renderAppsMenu() {
+  if (!appsEls.menu) return;
+  appsEls.menu.innerHTML = "";
+  const apps = state.apps || [];
+  if (!apps.length) {
+    const empty = document.createElement("div");
+    empty.className = "apps-empty";
+    empty.textContent = `등록된 앱이 없습니다. ${state.appsSource || ".ctxgit/apps.json"} 에 추가하세요.`;
+    appsEls.menu.append(empty);
+    return;
+  }
+  for (const app of apps) {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "apps-item" + (app.id === openAppId ? " active" : "");
+    const icon = document.createElement("span");
+    icon.className = "apps-icon";
+    icon.textContent = app.icon;
+    const body = document.createElement("span");
+    body.className = "apps-body";
+    const name = document.createElement("b");
+    name.textContent = app.name;
+    const desc = document.createElement("small");
+    desc.textContent = app.description;
+    body.append(name, desc);
+    item.append(icon, body);
+    item.addEventListener("click", () => { closeAppsMenu(); openApp(app.id); });
+    appsEls.menu.append(item);
+  }
+}
+
+function closeAppsMenu() {
+  if (!appsEls.menu) return;
+  appsEls.menu.hidden = true;
+  appsEls.toggle?.setAttribute("aria-expanded", "false");
+}
+
+function openApp(id) {
+  const app = (state.apps || []).find((item) => item.id === id);
+  if (!app || !appsEls.frame) return;
+  openAppId = id;
+  openAppBranch = state.activeBranch || "";
+  const url = appUrl(app);
+  document.querySelectorAll(".tab").forEach((item) => item.classList.remove("active"));
+  document.querySelectorAll(".tab-panel").forEach((item) => item.classList.remove("active"));
+  document.querySelector("#appTab")?.classList.add("active");
+  appsEls.toggle?.classList.add("active");
+  if (appsEls.frame.getAttribute("src") !== url) appsEls.frame.setAttribute("src", url);
+  appsEls.title.textContent = `${app.icon} ${app.name}`;
+  appsEls.branch.textContent = openAppBranch ? `브랜치 · ${openAppBranch}` : "";
+  appsEls.open.href = url;
+}
+
+if (appsEls.toggle) {
+  appsEls.toggle.addEventListener("click", (event) => {
+    event.stopPropagation();
+    const show = appsEls.menu.hidden;
+    if (show) loadApps();
+    appsEls.menu.hidden = !show;
+    appsEls.toggle.setAttribute("aria-expanded", show ? "true" : "false");
+  });
+  document.addEventListener("click", (event) => {
+    if (!appsEls.menu.hidden && !event.target.closest?.(".apps-picker")) closeAppsMenu();
+  });
+  // 다른 탭을 직접 누르면 앱은 내려간다(appPinned 해제). 앱을 띄운 채 브랜치를 바꾸면 ctxgit 이 채팅 탭으로
+  // 돌아가더라도 새 브랜치 문맥으로 앱을 다시 연다.
+  document.querySelectorAll(".tab").forEach((button) => button.addEventListener("click", () => {
+    appsEls.toggle.classList.remove("active");
+    openAppId = null;
+  }));
+  setInterval(() => {
+    if (openAppId && (state.activeBranch || "") !== openAppBranch) openApp(openAppId);
+  }, 500);
+  loadApps();
+}

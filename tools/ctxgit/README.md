@@ -100,11 +100,30 @@ the project. Each branch switches individual documents on from the topbar
 `branch.json`. Switched-on documents are injected verbatim into that branch's
 prompts, so the agent starts every turn already knowing them.
 
-They go in three places, because one was not enough to make them stick: the
-provider's system prompt, the prompt body (ranked above the project instructions
-and above the conversation history), and a short reminder after the user message.
+They go in three places, because one was not enough to make them stick. In the
+prompt body the text runs on from the end of the user's own message with no tag
+or heading between them: placed anywhere else it reads as reference material the
+user happened to paste, and continuing their sentence it reads as part of what is
+being asked. The provider's system prompt carries a second copy, and a short
+reminder after the message says that it outranks the branch's earlier prose.
 History compaction gets them too — a compaction is re-injected into every later
 prompt, so one written without them contradicts them from then on.
+
+## Templates
+
+Guiding decides how a branch writes. Templates decide what it builds with.
+
+A template is a package rather than a document — a deck system's stylesheets,
+starter files, and build scripts — so it lives in `contexts/templates/<id>/v<N>/`
+with a `template.json` naming it and pointing at its entry document. Versions sit
+side by side and a branch pins the one it selected, so shipping v2 never rewrites
+finished work.
+
+Branches switch templates on from the topbar `Template` button, stored as
+`templates` in `branch.json`, independently of `guiding`. Only the manifest and
+the entry document are injected; the package itself stays on disk for the agent to
+open. That is the difference from guiding knowledge, which is small enough to go
+in whole.
 
 Storing knowledge is always explicit: `Knowledging` in a chat message's `...`
 menu opens a modal, and the configured LLM appends one distilled section to the

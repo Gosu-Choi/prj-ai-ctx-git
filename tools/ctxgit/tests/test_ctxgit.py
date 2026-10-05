@@ -16,6 +16,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import unittest
+import unittest.mock
 from pathlib import Path
 
 
@@ -2758,19 +2759,19 @@ class CtxgitTest(unittest.TestCase):
             other_chat = ctxgit.build_chat_prompt(store, "AIdiscipline", "Continue.")
 
             self.assertIn("GUIDING_KNOWLEDGE_FACT", guided_chat)
-            self.assertIn("<guiding_knowledge>", guided_chat)
             self.assertIn("GUIDING_KNOWLEDGE_FACT", guided_info)
             self.assertNotIn("GUIDING_KNOWLEDGE_FACT", other_chat)
-            # A branch with nothing switched on carries no empty guiding block.
-            self.assertNotIn("<guiding_knowledge>", other_chat)
+            # A branch with nothing switched on carries no reminder either.
+            self.assertNotIn("standing instructions at the end", other_chat)
             self.assertEqual(store.branch_guiding_ids("AItrust"), [document["id"]])
 
-    def test_guiding_is_restated_after_the_user_message(self) -> None:
-        """The block near the top is tens of thousands of characters from the answer.
+    def test_guiding_rides_on_the_end_of_the_user_message(self) -> None:
+        """Guiding is attached to the user's own message with no seam.
 
-        What the model reads last has to point back at it, or the branch's own
-        earlier prose in <history> is the most recent style instruction in the
-        prompt.
+        Anywhere else in the prompt it reads as reference material the user
+        happened to paste; continuing their sentence, it reads as part of what
+        is being asked. So there must be no tag, heading, or label between the
+        message and the guiding text — a marked seam undoes the placement.
         """
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2783,21 +2784,44 @@ class CtxgitTest(unittest.TestCase):
             store.set_branch_guiding("AItrust", [document["id"]])
 
             for prompt in (
-                ctxgit.build_chat_prompt(store, "AItrust", "Continue."),
-                ctxgit.build_history_chat_prompt(store, "AItrust", "Continue."),
+                ctxgit.build_chat_prompt(store, "AItrust", "ZZMSGZZ"),
+                ctxgit.build_history_chat_prompt(store, "AItrust", "ZZMSGZZ"),
+                ctxgit.build_continuation_prompt(
+                    store, "AItrust", "ZZMSGZZ",
+                    guiding_context=ctxgit.chat_guiding_context(store, "AItrust"),
+                    guiding_inline=ctxgit.chat_guiding_context(
+                        store, "AItrust", labelled=False
+                    ),
+                ),
             ):
-                self.assertLess(
-                    prompt.index("</user_message>"),
-                    prompt.index("Before answering, check your draft"),
-                )
-                # The reminder is a pointer, not a second copy of the documents.
+                start = prompt.index("ZZMSGZZ") + len("ZZMSGZZ")
+                end = prompt.index("</user_message>")
+                between = prompt[start:end]
+                self.assertIn("GUIDING_KNOWLEDGE_FACT", between)
+                # Nothing may mark where the user stopped and guiding began.
+                self.assertNotIn("<", between)
+                self.assertNotIn("Guiding Document:", between)
+                # The closing reminder points at it without copying it again.
+                self.assertLess(end, prompt.index("standing instructions at the end"))
                 self.assertEqual(prompt.count("GUIDING_KNOWLEDGE_FACT"), 1)
 
-            # A branch with nothing switched on gets no reminder either.
-            self.assertNotIn(
-                "Before answering, check your draft",
-                ctxgit.build_chat_prompt(store, "AIdiscipline", "Continue."),
-            )
+            # A branch with nothing switched on gets no reminder and no suffix.
+            plain = ctxgit.build_chat_prompt(store, "AIdiscipline", "ZZMSGZZ")
+            self.assertNotIn("standing instructions at the end", plain)
+            self.assertIn("ZZMSGZZ\n</user_message>", plain)
+
+    def test_prompts_without_a_user_message_keep_the_labelled_block(self) -> None:
+        """Compaction and sequence rooms have no user message to attach to.
+
+        They carry the labelled <guiding_knowledge> block instead, so their
+        closing reminder has to point at that rather than at a message end.
+        """
+        guiding = "## Guiding Document: `k.md`\n\nRULE"
+        inline = ctxgit.guiding_enforcement_parts(guiding)
+        blocked = ctxgit.guiding_enforcement_parts(guiding, inline=False)
+        self.assertIn("standing instructions at the end", "\n".join(inline))
+        self.assertIn("<guiding_knowledge> above", "\n".join(blocked))
+        self.assertEqual(ctxgit.guiding_enforcement_parts("(none)"), [])
 
     def test_every_prose_prompt_states_the_reading_conditions_last(self) -> None:
         """Shown a chat timeline, a model casts itself as the other party in a live
@@ -4466,9 +4490,14 @@ class SessionContinuityTest(unittest.TestCase):
             store.append_knowledge_entry(document["id"], "## Rule\n\nGUIDING_FACT")
             store.set_branch_guiding("b1", [document["id"]])
             cont = ctxgit.build_continuation_prompt(
-                store, "b1", "next", guiding_context=ctxgit.chat_guiding_context(store, "b1")
+                store, "b1", "next",
+                guiding_context=ctxgit.chat_guiding_context(store, "b1"),
+                guiding_inline=ctxgit.chat_guiding_context(store, "b1", labelled=False),
             )
-            self.assertIn("Before answering, check your draft", cont)
+            self.assertIn("GUIDING_FACT", cont)
+            self.assertIn("standing instructions at the end", cont)
+            # It rides on the message rather than sitting in a block of its own.
+            self.assertLess(cont.index("GUIDING_FACT"), cont.index("</user_message>"))
 
     def test_a_session_is_keyed_so_a_changed_setup_starts_a_new_one(self) -> None:
         base = ctxgit.session_key("b1", "chat", "claude", "opus", "guiding text")
@@ -5883,3 +5912,274 @@ class BossDisplayTextTest(unittest.TestCase):
     def test_prompts_keep_the_marker(self) -> None:
         # The model still has to be told that content was cut.
         self.assertIn("[... truncated ...]", ctxgit.truncate_middle("가" * 500, 100))
+
+
+class TemplateTest(unittest.TestCase):
+    """Templates are packages a branch builds *with*, switched on like guiding.
+
+    Guiding is text the branch is bound by and is small enough to inject whole.
+    A template is a directory of real assets — a deck system runs to megabytes —
+    so what reaches the prompt is the manifest, the entry document, and the
+    path. The two switches are independent: a branch may run either, both, or
+    neither.
+    """
+
+    def _project(self, tmp: str):
+        root = Path(tmp)
+        store = ctxgit.ContextStore(root)
+        store.init()
+        store.create_branch("deck")
+        store.create_branch("other")
+        pkg = root / "contexts" / "templates" / "deck-kit" / "v1"
+        (pkg / "docs").mkdir(parents=True)
+        (pkg / "docs" / "BRIEF.md").write_text(
+            "# Brief\n\nTEMPLATE_ENTRY_FACT\n", encoding="utf-8"
+        )
+        (pkg / "starter.html").write_text("<html></html>", encoding="utf-8")
+        store.register_template(
+            "deck-kit", name="Deck Kit", summary="TEMPLATE_SUMMARY_FACT",
+            entry="docs/BRIEF.md", version=1,
+        )
+        return root, store
+
+    def test_a_registered_package_is_listed_with_its_version(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, store = self._project(tmp)
+            items = store.list_templates()
+            self.assertEqual([item["id"] for item in items], ["deck-kit"])
+            self.assertEqual(items[0]["version"], 1)
+            self.assertEqual(items[0]["versions"], [1])
+            self.assertEqual(items[0]["files"], 2)
+            self.assertTrue(items[0]["path"].endswith("deck-kit/v1"))
+
+    def test_only_branches_that_switched_it_on_see_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, store = self._project(tmp)
+            store.set_branch_templates("deck", ["deck-kit"])
+
+            on = ctxgit.build_chat_prompt(store, "deck", "Continue.")
+            off = ctxgit.build_chat_prompt(store, "other", "Continue.")
+
+            self.assertIn("<templates>", on)
+            self.assertIn("TEMPLATE_SUMMARY_FACT", on)
+            # The entry document comes along; the package itself does not.
+            self.assertIn("TEMPLATE_ENTRY_FACT", on)
+            self.assertIn("contexts/templates/deck-kit/v1", on)
+            self.assertNotIn("<templates>", off)
+            self.assertNotIn("TEMPLATE_SUMMARY_FACT", off)
+
+    def test_templates_and_guiding_are_independent_switches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, store = self._project(tmp)
+            document = store.create_knowledge_document("House Style")
+            store.append_knowledge_entry(document["id"], "## Rule\n\nGUIDING_FACT")
+            store.set_branch_templates("deck", ["deck-kit"])
+            store.set_branch_guiding("other", [document["id"]])
+
+            deck = ctxgit.build_chat_prompt(store, "deck", "Continue.")
+            other = ctxgit.build_chat_prompt(store, "other", "Continue.")
+
+            self.assertIn("TEMPLATE_SUMMARY_FACT", deck)
+            self.assertNotIn("GUIDING_FACT", deck)
+            self.assertIn("GUIDING_FACT", other)
+            self.assertNotIn("TEMPLATE_SUMMARY_FACT", other)
+
+    def test_a_deleted_template_drops_out_instead_of_breaking_the_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            store.set_branch_templates("deck", ["deck-kit"])
+            shutil.rmtree(root / "contexts" / "templates" / "deck-kit")
+            self.assertEqual(store.branch_template_ids("deck"), [])
+            self.assertNotIn("<templates>", ctxgit.build_chat_prompt(store, "deck", "Continue."))
+
+    def test_switching_on_an_unknown_template_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, store = self._project(tmp)
+            with self.assertRaises(SystemExit):
+                store.set_branch_templates("deck", ["no-such-kit"])
+
+    def test_registering_needs_the_version_directory_to_exist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, store = self._project(tmp)
+            with self.assertRaises(SystemExit):
+                store.register_template("deck-kit", name="Deck Kit", version=9)
+            with self.assertRaises(SystemExit):
+                store.register_template(
+                    "deck-kit", name="Deck Kit", entry="docs/MISSING.md", version=1
+                )
+
+    def test_a_branch_pins_the_version_it_selected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            store.set_branch_templates("deck", ["deck-kit"])
+            # A v2 landing beside v1 must not silently move a branch onto it.
+            v2 = root / "contexts" / "templates" / "deck-kit" / "v2"
+            (v2 / "docs").mkdir(parents=True)
+            (v2 / "docs" / "BRIEF.md").write_text("# Brief\n\nV2_FACT\n", encoding="utf-8")
+            item = store.describe_template("deck-kit")
+            self.assertEqual(item["version"], 1)
+            self.assertEqual(item["versions"], [1, 2])
+            self.assertNotIn("V2_FACT", ctxgit.build_chat_prompt(store, "deck", "Continue."))
+
+
+class MultiProjectRemoteTest(unittest.TestCase):
+    """The Telegram remote has to reach more than whatever the browser has open.
+
+    Nothing used to remember which projects existed, so `list_projects` could
+    only ever name the active one and `/project` had nothing to switch to. The
+    poller also read its config through `project_state.root()`, so a restart
+    with no project open took the remote down entirely.
+    """
+
+    def setUp(self) -> None:
+        self._home = tempfile.TemporaryDirectory()
+        self._patch = unittest.mock.patch.object(
+            ctxgit.Path, "home", staticmethod(lambda: Path(self._home.name))
+        )
+        self._patch.start()
+
+    def tearDown(self) -> None:
+        self._patch.stop()
+        self._home.cleanup()
+
+    def _project(self, root: Path) -> Path:
+        root.mkdir(parents=True, exist_ok=True)
+        store = ctxgit.ContextStore(root)
+        store.init()
+        return root
+
+    def test_opened_projects_are_remembered_most_recent_first(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            a = self._project(Path(tmp) / "alpha")
+            b = self._project(Path(tmp) / "beta")
+            ctxgit.remember_opened_project(a)
+            ctxgit.remember_opened_project(b)
+            self.assertEqual([p.name for p in ctxgit.known_project_roots()], ["beta", "alpha"])
+            # Re-opening moves it back to the front instead of duplicating.
+            ctxgit.remember_opened_project(a)
+            self.assertEqual([p.name for p in ctxgit.known_project_roots()], ["alpha", "beta"])
+
+    def test_a_project_that_moved_away_drops_out(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            a = self._project(Path(tmp) / "alpha")
+            ctxgit.remember_opened_project(a)
+            ctxgit.remember_opened_project(Path(tmp) / "never-existed")
+            self.assertEqual([p.name for p in ctxgit.known_project_roots()], ["alpha"])
+
+    def test_the_registry_lists_projects_that_are_not_open(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            a = self._project(Path(tmp) / "alpha")
+            b = self._project(Path(tmp) / "beta")
+            ctxgit.remember_opened_project(a)
+            ctxgit.remember_opened_project(b)
+            registry = ctxgit.ServerProjectRegistry(initial_root=a, projects_root=None)
+            rows = registry.list_projects(a)
+            names = [Path(str(r["path"])).name for r in rows]
+            self.assertIn("alpha", names)
+            self.assertIn("beta", names)
+            active = [r for r in rows if r["source"] == "active"]
+            self.assertEqual([Path(str(r["path"])).name for r in active], ["alpha"])
+
+    def test_a_chat_keeps_its_own_project_independent_of_the_browser(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            a = self._project(Path(tmp) / "alpha")
+            b = self._project(Path(tmp) / "beta")
+            state = ctxgit.ProjectState(a)
+            remote = ctxgit.TelegramRemote(
+                state, ctxgit.ServerProjectRegistry(initial_root=a, projects_root=None), None
+            )
+            self.assertEqual(remote._root_for("chat1").name, "alpha")
+            remote._roots["chat1"] = b
+            # The browser moving on does not drag the chat with it.
+            state.open(str(a))
+            self.assertEqual(remote._root_for("chat1").name, "beta")
+            self.assertEqual(remote._root_for("chat2").name, "alpha")
+
+    def test_the_poller_survives_having_no_project_open(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            a = self._project(Path(tmp) / "alpha")
+            ctxgit.remember_opened_project(a)
+            state = ctxgit.ProjectState(None)
+            remote = ctxgit.TelegramRemote(
+                state, ctxgit.ServerProjectRegistry(initial_root=None, projects_root=None), None
+            )
+            # Both used to raise; the config root is what keeps polling alive.
+            self.assertEqual(remote._config_root().name, "alpha")
+            self.assertEqual(remote._root_for("chat1").name, "alpha")
+
+    def test_a_project_is_matched_by_prefix_like_a_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            a = self._project(Path(tmp) / "alpha")
+            self._project(Path(tmp) / "beta")
+            ctxgit.remember_opened_project(a)
+            ctxgit.remember_opened_project(Path(tmp) / "beta")
+            remote = ctxgit.TelegramRemote(
+                ctxgit.ProjectState(a),
+                ctxgit.ServerProjectRegistry(initial_root=a, projects_root=None), None
+            )
+            self.assertEqual(remote._resolve_project(a, "beta").name, "beta")
+            self.assertEqual(remote._resolve_project(a, "bet").name, "beta")
+            self.assertIsNone(remote._resolve_project(a, "nope"))
+
+
+class PointerAnswerTest(unittest.TestCase):
+    """A reply that refers to the answer instead of carrying it.
+
+    Asked to return JSON, a model that has already written the answer as prose
+    sometimes appends the envelope and fills `assistant` with a back-reference.
+    The envelope parser kept the reference and dropped the prose, so the branch
+    recorded "(위 본문과 같음)" and the answer was gone — while the model
+    considered the turn answered.
+    """
+
+    ENVELOPE = '{"assistant": %s, "artifacts": [], "approvalRequests": []}'
+    PROSE = (
+        "고객이 요구하는 것은 두 가지입니다. 계약 범위를 영상 5편으로 한정하는 것과,\n"
+        "게재처를 한 곳으로 명시하는 것입니다. 편당 길이와 구성도 계약서에 넣자는 뜻입니다."
+    )
+
+    def test_prose_written_before_the_envelope_is_recovered(self) -> None:
+        for pointer in ('"(위 본문과 같음)"', '"위 본문과 동일"', '"as above"', '"[same as above]"'):
+            raw = f"{self.PROSE}\n\n{self.ENVELOPE % pointer}"
+            result = ctxgit.parse_chat_result(raw)
+            self.assertTrue(
+                result["assistant"].startswith("고객이 요구하는"),
+                f"{pointer} did not recover the prose: {result['assistant']!r}",
+            )
+
+    def test_a_fenced_envelope_after_prose_is_handled_too(self) -> None:
+        raw = f"{self.PROSE}\n\n```json\n{self.ENVELOPE % '\"(위 본문과 같음)\"'}\n```"
+        self.assertTrue(ctxgit.parse_chat_result(raw)["assistant"].startswith("고객이 요구하는"))
+
+    def test_a_pointer_with_nothing_to_point_at_is_not_recorded_as_the_answer(self) -> None:
+        # Nothing to recover: the turn produced no answer, and saying so leaves
+        # it resendable instead of recording a reference to text never written.
+        result = ctxgit.parse_chat_result(self.ENVELOPE % '"(위 본문과 같음)"')
+        self.assertEqual(result["assistant"], "")
+
+    def test_a_real_answer_is_never_replaced(self) -> None:
+        real = "위 조건이면 계약 가능합니다. 다만 게재처를 한 곳으로 한정하면 단가 조정이 필요합니다."
+        self.assertEqual(ctxgit.parse_chat_result(self.ENVELOPE % json.dumps(real, ensure_ascii=False))["assistant"], real)
+        # Long enough to be content, even though it opens with a pointer word.
+        self.assertFalse(ctxgit.answer_is_a_pointer(real))
+        self.assertFalse(ctxgit.answer_is_a_pointer(""))
+        self.assertFalse(ctxgit.answer_is_a_pointer("위에서 말씀드린 대로\n두 번째 줄이 있습니다"))
+
+    def test_a_stray_line_before_the_envelope_does_not_replace_the_answer(self) -> None:
+        # Too slight to be an answer, so the envelope's own value stands.
+        raw = f"OK\n\n{self.ENVELOPE % json.dumps('진짜 답변이 여기 있습니다. 충분히 깁니다.', ensure_ascii=False)}"
+        self.assertTrue(ctxgit.parse_chat_result(raw)["assistant"].startswith("진짜 답변"))
+
+    def test_artifacts_survive_the_recovery(self) -> None:
+        envelope = (
+            '{"assistant": "(위 본문과 같음)", '
+            '"artifacts": [{"kind": "note", "title": "t", "body": "b"}], '
+            '"approvalRequests": []}'
+        )
+        result = ctxgit.parse_chat_result(f"{self.PROSE}\n\n{envelope}")
+        self.assertTrue(result["assistant"].startswith("고객이 요구하는"))
+        self.assertEqual(len(result["artifacts"]), 1)
+
+    def test_every_envelope_prompt_forbids_pointing(self) -> None:
+        source = Path(ctxgit.__file__).read_text(encoding="utf-8")
+        self.assertEqual(source.count("it must carry the answer itself"), 3)
