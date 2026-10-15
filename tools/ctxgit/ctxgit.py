@@ -337,6 +337,39 @@ def load_json(path: Path) -> dict[str, Any]:
         die(f"invalid JSON in {path}: {exc}")
 
 
+def replace_file(source: str | Path, target: str | Path) -> None:
+    """`os.replace`, retried briefly on Windows.
+
+    Windows refuses to replace a file another thread or process has open — a
+    reader of the same branch metadata, or an antivirus scan of the new file — and
+    raises PermissionError for what is only a momentary lock. POSIX never does.
+    """
+    if os.name != "nt":
+        os.replace(source, target)
+        return
+    for attempt in range(20):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if attempt == 19:
+                raise
+            time.sleep(0.05 * (attempt + 1))
+
+
+def split_command(text: str) -> list[str]:
+    """Split a configured command line into argv.
+
+    POSIX `shlex` treats a backslash as an escape, which eats the separators of a
+    Windows path (`C:\\Users\\me\\claude.exe` -> `C:Usersmeclaude.exe`). On Windows
+    split without escapes and drop the quotes that kept a spaced path together.
+    """
+    if os.name != "nt":
+        return shlex.split(text)
+    return [part[1:-1] if len(part) >= 2 and part[0] == part[-1] == '"' else part
+            for part in shlex.split(text, posix=False)]
+
+
 def dump_json(path: Path, data: dict[str, Any]) -> None:
     """Write JSON by atomic replace.
 
@@ -360,7 +393,7 @@ def dump_json(path: Path, data: dict[str, Any]) -> None:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(handle.name, path)
+        replace_file(handle.name, path)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(handle.name)
@@ -708,14 +741,14 @@ def extensions_git_info() -> dict[str, Any]:
     try:
         log = subprocess.run(
             ["git", "-C", str(root), "log", "-1", "--format=%h%x1f%cI%x1f%s", "--", str(root)],
-            capture_output=True, text=True, timeout=5, check=False,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5, check=False,
         )
         if log.returncode == 0 and log.stdout.strip():
             short, date, subject = (log.stdout.strip().split("\x1f", 2) + ["", ""])[:3]
             info = {"hash": short, "date": date, "subject": subject}
             status = subprocess.run(
                 ["git", "-C", str(root), "status", "--porcelain", "--", str(root)],
-                capture_output=True, text=True, timeout=5, check=False,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5, check=False,
             )
             # Uncommitted edits make the commit date a misleading "last updated".
             info["dirty"] = bool(status.returncode == 0 and status.stdout.strip())
@@ -854,6 +887,16 @@ def run_extension_mcp_server(ext_id: str, server_id: str) -> int:
             os.chdir(cwd)
         except OSError as exc:
             die(f"cannot enter {cwd} for {ext_id}/{server_id}: {exc}")
+    if os.name == "nt":
+        # Windows has no exec: os.execvpe starts a child and this process exits at
+        # once, so the agent sees its MCP server die. It also cannot start `npx`,
+        # which is `npx.cmd` there. Resolve through PATHEXT and stay attached,
+        # stdio passed straight through, until the server exits.
+        resolved = shutil.which(command, path=env.get("PATH")) or command
+        try:
+            return subprocess.call([resolved, *args], env=env)
+        except OSError as exc:
+            die(f"cannot start {ext_id}/{server_id} ({command}): {exc}")
     try:
         os.execvpe(command, [command, *args], env)
     except OSError as exc:
@@ -1381,7 +1424,7 @@ def ensure_internal_git(root: Path) -> Path:
         git_dir = internal_git_dir(root)
         if not (git_dir / "HEAD").exists():
             git_dir.parent.mkdir(parents=True, exist_ok=True)
-            subprocess.run(["git", "init", "--bare", str(git_dir)], cwd=root, check=True, text=True, capture_output=True)
+            subprocess.run(["git", "init", "--bare", str(git_dir)], cwd=root, check=True, text=True, encoding="utf-8", errors="replace", capture_output=True)
         info = git_dir / "info"
         info.mkdir(parents=True, exist_ok=True)
         exclude_path = info / "exclude"
@@ -1674,7 +1717,7 @@ def internal_git_commit_turn(
             ["git", f"--git-dir={internal_git_dir(root)}", f"--work-tree={root.resolve()}", *commit_args],
             cwd=root,
             check=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             capture_output=True,
             env=env,
         )
@@ -3884,7 +3927,7 @@ class ContextStore:
                 ["pdftotext", "-layout", str(path), "-"],
                 cwd=self.root,
                 check=False,
-                text=True,
+                text=True, encoding="utf-8", errors="replace",
                 capture_output=True,
                 timeout=60,
             )
@@ -6186,7 +6229,7 @@ def call_opencode_synthesis(
             cmd,
             cwd=root,
             check=False,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             capture_output=True,
             timeout=args.timeout,
         )
@@ -6245,7 +6288,7 @@ def hybrid_research_to_markdown(
 def resolve_opencode_command() -> list[str]:
     override = os.environ.get("CTXGIT_OPENCODE_BIN")
     if override:
-        return shlex.split(override)
+        return split_command(override)
     return ["opencode"]
 
 
@@ -6532,12 +6575,12 @@ def bundled_codex_binary() -> Path | None:
 def resolve_codex_command(root: Path) -> list[str]:
     override = os.environ.get("CTXGIT_CODEX_BIN")
     if override:
-        return shlex.split(override)
+        return split_command(override)
     llm = read_llm_config(root)
     codex_config = llm.get("codex") if isinstance(llm.get("codex"), dict) else {}
     configured = str(codex_config.get("bin") or "").strip()
     if configured and configured.lower() not in {"codex", "codex.exe"}:
-        return shlex.split(configured)
+        return split_command(configured)
     executable = configured or "codex"
     resolved = shutil.which(executable)
     if resolved:
@@ -6545,7 +6588,7 @@ def resolve_codex_command(root: Path) -> list[str]:
     bundled = bundled_codex_binary()
     if bundled:
         return [str(bundled)]
-    return shlex.split(configured) if configured else ["codex"]
+    return split_command(configured) if configured else ["codex"]
 
 
 def display_codex_command(root: Path) -> str:
@@ -6581,7 +6624,7 @@ def codex_app_server_supported(root: Path) -> bool:
 def resolve_claude_command(root: Path) -> list[str]:
     override = os.environ.get("CTXGIT_CLAUDE_BIN")
     if override:
-        return shlex.split(override)
+        return split_command(override)
     llm = read_llm_config(root)
     claude_config = llm.get("claude") if isinstance(llm.get("claude"), dict) else {}
     configured = str(claude_config.get("bin") or "claude").strip()
@@ -6591,7 +6634,7 @@ def resolve_claude_command(root: Path) -> list[str]:
     native = Path.home() / ".local" / "bin" / ("claude.exe" if os.name == "nt" else "claude")
     if native.exists():
         return [str(native)]
-    return shlex.split(configured)
+    return split_command(configured)
 
 
 def claude_login_status(root: Path) -> dict[str, Any]:
@@ -6707,7 +6750,7 @@ def codex_login_status(root: Path) -> dict[str, Any]:
             cmd,
             cwd=root,
             check=False,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             capture_output=True,
             timeout=20,
         )
@@ -11941,7 +11984,7 @@ def call_opencode_research(
             cmd,
             cwd=root,
             check=False,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             capture_output=True,
             timeout=args.timeout,
         )
@@ -12185,7 +12228,7 @@ def run_snapshot(root: Path, message: str, include_tools: bool = False) -> None:
         ["git", "status", "--porcelain", "--", *existing],
         cwd=root,
         check=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         capture_output=True,
     )
     if not status.stdout.strip():
@@ -14096,7 +14139,7 @@ def upload_project_file_chunk(
     if complete:
         if partial.stat().st_size != total_size:
             raise ValueError("final upload size does not match declared file size")
-        os.replace(partial, target)
+        replace_file(partial, target)
         return {
             "complete": True,
             "nextOffset": next_offset,
@@ -14593,13 +14636,15 @@ def choose_directory_with_tkinter(initial: Path) -> str:
         )
         root.destroy()
         if selected:
+            # The parent decodes UTF-8; a piped stdout on Windows defaults to the ANSI code page.
+            sys.stdout.reconfigure(encoding="utf-8")
             print(selected)
         """
     )
     completed = subprocess.run(
         [sys.executable, "-c", script, str(initial)],
         check=False,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         capture_output=True,
     )
     if completed.returncode != 0:
@@ -14608,14 +14653,20 @@ def choose_directory_with_tkinter(initial: Path) -> str:
 
 
 def choose_directory_with_powershell(initial: Path) -> str:
+    # The initial directory travels in an environment variable: with -Command,
+    # every later argument is appended to the script text and executed, so a path
+    # placed after it broke the whole script. Output is forced to UTF-8 so a
+    # Korean folder name survives the pipe.
     script = textwrap.dedent(
         """\
+        [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
         Add-Type -AssemblyName System.Windows.Forms
         $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
         $dialog.Description = "Open ctxgit project directory"
         $dialog.ShowNewFolderButton = $true
-        if ($args[0] -and (Test-Path -LiteralPath $args[0])) {
-          $dialog.SelectedPath = (Resolve-Path -LiteralPath $args[0]).Path
+        $initial = $env:CTXGIT_DIALOG_INITIAL
+        if ($initial -and (Test-Path -LiteralPath $initial)) {
+          $dialog.SelectedPath = (Resolve-Path -LiteralPath $initial).Path
         }
         $result = $dialog.ShowDialog()
         if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
@@ -14624,10 +14675,11 @@ def choose_directory_with_powershell(initial: Path) -> str:
         """
     )
     completed = subprocess.run(
-        ["powershell", "-NoProfile", "-STA", "-Command", script, str(initial)],
+        ["powershell", "-NoProfile", "-STA", "-Command", script],
         check=False,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         capture_output=True,
+        env={**os.environ, "CTXGIT_DIALOG_INITIAL": str(initial)},
     )
     if completed.returncode != 0:
         raise RuntimeError((completed.stderr or completed.stdout or "").strip())
@@ -14694,7 +14746,7 @@ class ProjectState:
         if not root.exists() or not root.is_dir():
             raise ValueError(f"directory does not exist: {root}")
         if init_git and not is_git_project(root):
-            subprocess.run(["git", "init"], cwd=root, check=True, text=True, capture_output=True)
+            subprocess.run(["git", "init"], cwd=root, check=True, text=True, encoding="utf-8", errors="replace", capture_output=True)
         store = ContextStore(root)
         if init:
             store.init()
@@ -18415,7 +18467,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "init":
         if args.git and not args.no_git and not is_git_project(root):
-            subprocess.run(["git", "init"], cwd=root, check=True, text=True, capture_output=True)
+            subprocess.run(["git", "init"], cwd=root, check=True, text=True, encoding="utf-8", errors="replace", capture_output=True)
         store.init()
         internal_git_commit_turn(
             store,
