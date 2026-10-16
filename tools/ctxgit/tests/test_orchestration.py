@@ -7,6 +7,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _home_guard  # noqa: E402,F401  (must precede loading ctxgit: keeps tests out of the real ~/.ctxgit)
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import orchestration as orch  # noqa: E402

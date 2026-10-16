@@ -16,6 +16,9 @@ import unittest
 import unittest.mock
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _home_guard  # noqa: E402,F401  (must precede loading ctxgit: keeps tests out of the real ~/.ctxgit)
+
 MODULE_PATH = Path(__file__).resolve().parents[1] / "ctxgit.py"
 sys.path.insert(0, str(MODULE_PATH.parent))
 spec = importlib.util.spec_from_file_location("ctxgit_windows_compat", MODULE_PATH)
