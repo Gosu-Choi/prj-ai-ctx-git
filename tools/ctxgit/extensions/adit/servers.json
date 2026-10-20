@@ -86,6 +86,17 @@
       "requires": [
         "ABLAB_MCP_SECRET"
       ]
+    },
+    {
+      "id": "lawgo",
+      "label": "한국법 (law.go.kr 조문·판례 찾기, 키 없음)",
+      "enabled": true,
+      "command": "node",
+      "args": [
+        "bin/mcp.mjs"
+      ],
+      "root": "/Users/gosu/Developer/Adit-ctxgit-package/adit-context/contexts/Rdod-Corporation",
+      "cwd": "law-scraper"
     }
   ]
 }
