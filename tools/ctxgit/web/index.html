@@ -59,11 +59,33 @@
 
         <section class="sidebar-section">
           <div class="section-title">Notifications</div>
-          <label class="checkbox-label">
-            <input id="telegramNotifyInput" type="checkbox" />
-            <span>Telegram on completion</span>
-          </label>
+          <div class="checkbox-row">
+            <label class="checkbox-label">
+              <input id="telegramNotifyInput" type="checkbox" />
+              <span>Telegram on completion</span>
+            </label>
+            <button
+              id="telegramSettingsButton"
+              class="row-gear-button"
+              type="button"
+              title="텔레그램 봇 토큰 넣기"
+              aria-label="텔레그램 봇 토큰 넣기"
+              aria-expanded="false"
+              aria-controls="telegramSettingsForm"
+            >⚙</button>
+          </div>
           <div id="telegramNotifyStatus" class="settings-status"></div>
+          <form id="telegramSettingsForm" class="telegram-settings-form" hidden>
+            <label for="telegramTokenInput">봇 토큰</label>
+            <input id="telegramTokenInput" type="password" autocomplete="off" spellcheck="false" placeholder="123456789:ABC…" required />
+            <label for="telegramChatIdInput">채팅 ID <span class="muted-hint">(비우면 지금 값 유지)</span></label>
+            <input id="telegramChatIdInput" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" placeholder="예: 123456789" />
+            <div class="telegram-settings-actions">
+              <button id="telegramSettingsSave" type="submit">저장</button>
+              <button id="telegramSettingsCancel" type="button">닫기</button>
+            </div>
+            <div id="telegramSettingsStatus" class="settings-status"></div>
+          </form>
         </section>
 
         <section class="sidebar-section">

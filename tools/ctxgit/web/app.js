@@ -315,6 +315,13 @@ const els = {
   refreshButton: document.querySelector("#refreshButton"),
   telegramNotifyInput: document.querySelector("#telegramNotifyInput"),
   telegramNotifyStatus: document.querySelector("#telegramNotifyStatus"),
+  telegramSettingsButton: document.querySelector("#telegramSettingsButton"),
+  telegramSettingsForm: document.querySelector("#telegramSettingsForm"),
+  telegramTokenInput: document.querySelector("#telegramTokenInput"),
+  telegramChatIdInput: document.querySelector("#telegramChatIdInput"),
+  telegramSettingsSave: document.querySelector("#telegramSettingsSave"),
+  telegramSettingsCancel: document.querySelector("#telegramSettingsCancel"),
+  telegramSettingsStatus: document.querySelector("#telegramSettingsStatus"),
   outputHumanizeInput: document.querySelector("#outputHumanizeInput"),
   outputHumanizeStatus: document.querySelector("#outputHumanizeStatus"),
   sequenceRoomCreateButton: document.querySelector("#sequenceRoomCreateButton"),
@@ -7927,7 +7934,7 @@ async function loadNotificationSettings() {
   if (els.telegramNotifyStatus) {
     els.telegramNotifyStatus.textContent = settings.telegramConfigured
       ? ""
-      : "Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env to enable.";
+      : "봇 토큰이 없습니다. ⚙ 를 눌러 넣으세요.";
   }
   if (els.outputHumanizeInput) {
     els.outputHumanizeInput.checked = settings.outputHumanizeEnabled === true;
@@ -7966,6 +7973,58 @@ els.telegramNotifyInput?.addEventListener("change", () => {
     "telegramNotifyEnabled",
     "알림 설정 저장 실패",
   );
+});
+
+// Telegram bot token entry. The server checks the token and chat against
+// Telegram before writing .env, and never sends the token back, so the field
+// always starts empty.
+function setTelegramSettingsOpen(open) {
+  if (!els.telegramSettingsForm || !els.telegramSettingsButton) return;
+  els.telegramSettingsForm.hidden = !open;
+  els.telegramSettingsButton.setAttribute("aria-expanded", String(open));
+  if (open) {
+    els.telegramSettingsStatus.textContent = "";
+    els.telegramSettingsStatus.className = "settings-status";
+    els.telegramTokenInput.value = "";
+    els.telegramTokenInput.focus();
+  } else {
+    els.telegramTokenInput.value = "";
+  }
+}
+
+els.telegramSettingsButton?.addEventListener("click", () => {
+  setTelegramSettingsOpen(els.telegramSettingsForm.hidden);
+});
+
+els.telegramSettingsCancel?.addEventListener("click", () => setTelegramSettingsOpen(false));
+
+els.telegramSettingsForm?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const status = els.telegramSettingsStatus;
+  els.telegramSettingsSave.disabled = true;
+  status.className = "settings-status";
+  status.textContent = "텔레그램에 확인하는 중…";
+  try {
+    const result = await api("/api/settings/telegram", {
+      method: "POST",
+      body: JSON.stringify({
+        token: els.telegramTokenInput.value.trim(),
+        chatId: els.telegramChatIdInput.value.trim(),
+      }),
+    });
+    els.telegramTokenInput.value = "";
+    status.className = "settings-status ok";
+    status.textContent = result.botUsername ? `저장됨 · @${result.botUsername}` : "저장됨";
+    await loadNotificationSettings();
+  } catch (error) {
+    status.className = "settings-status error";
+    status.textContent =
+      error.status === 404
+        ? "서버가 아직 옛 버전입니다. ctxgit 을 다시 띄운 뒤 쓰세요."
+        : error.message;
+  } finally {
+    els.telegramSettingsSave.disabled = false;
+  }
 });
 
 els.outputHumanizeInput?.addEventListener("change", () => {

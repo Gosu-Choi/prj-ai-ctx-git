@@ -1112,6 +1112,116 @@ def send_telegram_message(
     return int(((payload.get("result") or {}).get("message_id")) or 0)
 
 
+TELEGRAM_TOKEN_RE = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
+TELEGRAM_CHAT_ID_RE = re.compile(r"^-?\d{3,}$")
+
+
+def telegram_bot_call(token: str, method: str, fields: dict[str, Any] | None = None, timeout: int = 10) -> dict[str, Any]:
+    """Call one Bot API method and return its `result`; raise ValueError with Telegram's reason."""
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    data = urllib.parse.urlencode(fields or {}).encode("utf-8")
+    request = urllib.request.Request(url, data=data, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as exc:
+        try:
+            payload = json.loads(exc.read().decode("utf-8") or "{}")
+        except Exception:  # noqa: BLE001 - fall back to the status line
+            payload = {}
+        raise ValueError(str(payload.get("description") or f"HTTP {exc.code}")) from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise ValueError(f"Telegram unreachable: {exc}") from exc
+    if not payload.get("ok"):
+        raise ValueError(str(payload.get("description") or "Telegram rejected the request"))
+    return payload.get("result") or {}
+
+
+def telegram_env_target(root: Path) -> Path:
+    """The env file the Telegram settings are read from, so a save takes effect.
+
+    Values are layered (repo `.env`, then the project's files), and a later file
+    wins. Writing to the repo file while a project file still held the old token
+    would save without effect, so the save goes to the last file that already
+    sets a Telegram key, and to the repo `.env` when none does.
+    """
+    target = TOOL_REPO_ROOT / ".env"
+    keys = {"TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"}
+    for path, _label in iter_env_file_candidates(root):
+        if not path.is_file():
+            continue
+        for line in read_text(path).splitlines():
+            parsed = parse_env_assignment(line)
+            if parsed and parsed[0] in keys:
+                target = path
+                break
+    return target
+
+
+def upsert_env_values(path: Path, values: dict[str, str]) -> None:
+    """Set `KEY=value` lines in an env file, keeping every other line as it was."""
+    lines = read_text(path).splitlines() if path.exists() else []
+    written: set[str] = set()
+    out: list[str] = []
+    for line in lines:
+        parsed = parse_env_assignment(line)
+        if parsed and parsed[0] in values:
+            if parsed[0] not in written:
+                out.append(f"{parsed[0]}={values[parsed[0]]}")
+                written.add(parsed[0])
+            continue
+        out.append(line)
+    out.extend(f"{key}={value}" for key, value in values.items() if key not in written)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp", delete=False
+    )
+    try:
+        with handle:
+            handle.write("\n".join(out) + "\n")
+        with contextlib.suppress(OSError):
+            os.chmod(handle.name, 0o600)
+        replace_file(handle.name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(handle.name)
+        raise
+
+
+def save_telegram_settings(root: Path, token: str, chat_id: str) -> dict[str, Any]:
+    """Check a bot token (and chat) against Telegram, then store them.
+
+    Nothing is written unless Telegram accepts the token and the bot can see the
+    chat, so a typo cannot replace a working token with a dead one. An empty chat
+    id keeps the stored one. The token is never sent back.
+    """
+    token = str(token or "").strip()
+    chat_id = str(chat_id or "").strip()
+    if not TELEGRAM_TOKEN_RE.match(token):
+        raise ValueError("봇 토큰 형식이 아닙니다(123456789:ABC… 꼴).")
+    if chat_id and not TELEGRAM_CHAT_ID_RE.match(chat_id):
+        raise ValueError("채팅 ID 는 숫자여야 합니다(그룹이면 - 로 시작).")
+    if not chat_id:
+        _, chat_id = telegram_config_for_root(root)
+    if not chat_id:
+        raise ValueError("채팅 ID 가 아직 없습니다. 함께 넣어 주세요.")
+    try:
+        bot = telegram_bot_call(token, "getMe")
+    except ValueError as exc:
+        raise ValueError(f"텔레그램이 이 토큰을 거부했습니다({exc}). BotFather 에서 받은 최신 토큰인지 보세요.") from exc
+    try:
+        telegram_bot_call(token, "getChat", {"chat_id": chat_id})
+    except ValueError as exc:
+        raise ValueError(f"봇이 이 채팅을 못 봅니다: {exc}. 텔레그램에서 봇에게 /start 를 먼저 보내세요.") from exc
+    target = telegram_env_target(root)
+    upsert_env_values(target, {"TELEGRAM_BOT_TOKEN": token, "TELEGRAM_CHAT_ID": chat_id})
+    return {
+        "telegramConfigured": True,
+        "botUsername": str(bot.get("username") or ""),
+        "envFile": str(target),
+    }
+
+
 def send_telegram_document(
     token: str,
     chat_id: str,
@@ -16573,6 +16683,19 @@ def make_handler(
                         "outputHumanizeEnabled": bool(settings.get("outputHumanizeEnabled", False)),
                     }
                 )
+                return
+            if parsed.path == "/api/settings/telegram":
+                try:
+                    result = save_telegram_settings(
+                        root, str(body.get("token") or ""), str(body.get("chatId") or "")
+                    )
+                except ValueError as exc:
+                    self.send_json({"error": "telegram_invalid", "message": str(exc)}, status=400)
+                    return
+                except OSError as exc:
+                    self.send_json({"error": "settings_write_failed", "message": str(exc)}, status=500)
+                    return
+                self.send_json(result)
                 return
             if parsed.path == "/api/branch/new":
                 # An empty sibling of the branch you pointed at.

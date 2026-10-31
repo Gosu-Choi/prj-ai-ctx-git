@@ -406,6 +406,75 @@ textarea {
   accent-color: var(--accent);
 }
 
+.checkbox-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.row-gear-button {
+  flex: none;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.row-gear-button:hover,
+.row-gear-button[aria-expanded="true"] {
+  border-color: var(--line);
+  background: var(--panel);
+  color: var(--text);
+}
+
+.telegram-settings-form {
+  display: grid;
+  gap: 4px;
+  margin-top: 6px;
+  font-size: 12px;
+  word-break: keep-all;
+}
+
+.telegram-settings-form input {
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  font: inherit;
+}
+
+.telegram-settings-form[hidden] {
+  display: none;
+}
+
+.telegram-settings-form .muted-hint {
+  color: var(--muted);
+}
+
+.telegram-settings-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.telegram-settings-actions button {
+  padding: 5px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+}
+
 .settings-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 72px;
