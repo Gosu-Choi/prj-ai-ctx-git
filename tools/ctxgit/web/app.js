@@ -2178,7 +2178,17 @@ function renderBranches() {
     `;
   });
   branchHtml += ungrouped.map(buildBranchRow).join("");
+  // The list is rebuilt by timers (job polling every 5s), and rebuilding used to
+  // drop an open ⋯ menu a couple of seconds after it opened. Keep it open.
+  const openMenuBranch =
+    els.branchList.querySelector(".branch-row.open [data-branch-options]")?.dataset.branchOptions || "";
   els.branchList.innerHTML = branchHtml || '<div class="muted">No branches yet</div>';
+  if (openMenuBranch) {
+    els.branchList
+      .querySelector(`[data-branch-options="${CSS.escape(openMenuBranch)}"]`)
+      ?.closest(".branch-row")
+      ?.classList.add("open");
+  }
   els.branchList.querySelectorAll("[data-folder]").forEach((button) => {
     button.addEventListener("click", () => toggleFolderCollapsed(button.dataset.folder));
   });
