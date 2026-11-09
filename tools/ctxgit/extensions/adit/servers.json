@@ -97,6 +97,19 @@
       ],
       "root": "/Users/gosu/Developer/Adit-ctxgit-package/adit-context/contexts/Rdod-Corporation",
       "cwd": "law-scraper"
+    },
+    {
+      "id": "lens-studio",
+      "label": "Lens Studio 캠페인(사람 단추와 같은 도구 — 기록에 「에이전트」로 남음)",
+      "enabled": true,
+      "command": "node",
+      "args": [
+        "scripts/lens-studio/mcp.mjs"
+      ],
+      "cwd": ".worktrees/backend-lens-server",
+      "env": {
+        "LENS_STUDIO_AGENT_NAME": "ctxgit"
+      }
     }
   ]
 }
