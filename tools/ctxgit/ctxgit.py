@@ -7789,6 +7789,7 @@ def build_continuation_prompt(
     guiding_context: str = "",
     guiding_inline: str = "",
     resource_paths: list[str] | None = None,
+    unseen_records: list[dict[str, Any]] | None = None,
 ) -> str:
     """What a resumed session gets: the new turn, and nothing it already holds.
 
@@ -7797,6 +7798,13 @@ def build_continuation_prompt(
     rebuilt prompt would stack the branch history one copy deeper per turn and bury
     the current standing rules among superseded ones — which is exactly what went
     wrong the first time sessions were resumed here.
+
+    "Already holds" is only true of what went *through* this session. A branch
+    also moves outside it — Info chat answers, turns sent from Telegram, a Boss
+    dispatch, a message the user revised — and the session has none of that.
+    `unseen_records` is exactly that gap (see `continuation_delta`), and it goes in
+    here as the branch's own record, not as something the user pasted, so "do it
+    that way" can point at an answer this session never wrote.
 
     Guiding is the exception and is restated every turn. It is the one thing that
     has to win against everything earlier in the session, and position is what
@@ -7811,6 +7819,26 @@ def build_continuation_prompt(
         f"Branch: {branch_id}",
         "",
     ]
+    unseen = [record for record in (unseen_records or []) if str(record.get("text") or "").strip()]
+    if unseen:
+        codex_config = active_llm_provider_config(store.root)
+        budget = history_budget_from_config(codex_config, "historyBudgetCharacters")
+        shown = select_history_for_budget(unseen, max(8000, budget // 2))
+        omitted = len(unseen) - len(shown)
+        parts.extend(
+            [
+                "Since your last turn here, the branch gained the following outside this",
+                "session — answers given in Info chat, turns sent from elsewhere, edits the",
+                "user made. You did not write these, but they are part of this branch's record",
+                "now, and the user's message below may refer to them. Read them as the",
+                "conversation's current state before answering.",
+                "<history_since_your_last_turn>",
+                *([f"- [ctxgit omitted {omitted} older record(s) that did not fit]"] if omitted else []),
+                *(format_history_record(record) for record in shown),
+                "</history_since_your_last_turn>",
+                "",
+            ]
+        )
     current_attachments = current_turn_attachment_section(store, branch_id, resource_paths)
     if current_attachments and current_attachments != "(none)":
         parts.extend(
@@ -9172,17 +9200,54 @@ def read_session_store(root: Path) -> dict[str, Any]:
     return store if isinstance(store, dict) else {}
 
 
-def remembered_session(root: Path, key: str) -> str:
+def remembered_session_entry(root: Path, key: str) -> dict[str, Any]:
+    """The remembered session under `key`, as a dict, or {} when there is none.
+
+    Older stores kept a bare session id; those come back as {"id": ...} with no
+    watermark, which `continuation_delta` treats as "seen nothing since".
+    """
     entry = read_session_store(root).get(key)
-    return str(entry or "") if isinstance(entry, str) else ""
+    if isinstance(entry, str):
+        return {"id": entry} if entry else {}
+    if isinstance(entry, dict) and str(entry.get("id") or ""):
+        return dict(entry)
+    return {}
 
 
-def remember_session(root: Path, key: str, session_id: str) -> None:
+def remembered_session(root: Path, key: str) -> str:
+    return str(remembered_session_entry(root, key).get("id") or "")
+
+
+def remember_session(
+    root: Path,
+    key: str,
+    session_id: str,
+    *,
+    turn_id: str = "",
+    seen_count: int | None = None,
+    seen_fingerprint: str = "",
+) -> None:
+    """Remember a session, and how much of the branch it has been shown.
+
+    `seen_count`/`seen_fingerprint` are the branch's visible history at the moment
+    this turn's prompt was built, and `turn_id` is the turn that prompt belongs to.
+    Together they let the next continuation work out what the branch gained
+    *outside* this session — an info-chat answer, a Telegram turn, a Boss dispatch,
+    a revised message — and send exactly that, instead of assuming the session
+    saw everything because it saw the beginning.
+    """
     if not key or not session_id:
         return
     path = root.joinpath(*SESSION_STORE_RELPATH)
     store = read_session_store(root)
-    store[key] = session_id
+    entry: dict[str, Any] = {"id": session_id}
+    if turn_id:
+        entry["turnId"] = turn_id
+    if seen_count is not None:
+        entry["seenCount"] = int(seen_count)
+    if seen_fingerprint:
+        entry["seenFingerprint"] = seen_fingerprint
+    store[key] = entry
     # Unbounded growth would keep every session a branch ever had; the recent ones
     # are the only resumable ones anyway.
     if len(store) > 200:
@@ -9207,6 +9272,56 @@ def session_continuity_enabled(config: dict[str, Any]) -> bool:
     switch stays so the behaviour can be turned off without editing code.
     """
     return config.get("sessionContinuity") is not False
+
+
+def history_watermark(records: list[dict[str, Any]]) -> tuple[int, str]:
+    """How much of a branch a session is being shown: (count, fingerprint).
+
+    The fingerprint covers the records' identities and text, so a later revise,
+    delete, or cut anywhere in that range changes it — and a session that was
+    shown the old text is not continued over the new one.
+    """
+    digest = hashlib.sha256()
+    for record in records:
+        digest.update(history_record_fingerprint(record).encode("utf-8"))
+        digest.update(b"\0")
+    return len(records), digest.hexdigest()[:16]
+
+
+def continuation_delta(
+    records: list[dict[str, Any]],
+    entry: dict[str, Any],
+    *,
+    current_turn_id: str = "",
+) -> tuple[bool, list[dict[str, Any]]]:
+    """What a resumed session has not seen, or (False, []) when it cannot be resumed.
+
+    Observed on popscraping: three Info chat turns proposed a change, then a Send
+    turn said "do it that way" — and the resumed Send session answered that it
+    could not see any proposal. It was right. Info chat runs outside the session,
+    so the session's copy of the branch ended at its own previous turn, and the
+    continuation prompt told it nothing new had happened.
+
+    `records` is the branch's visible history now. `entry` is the remembered
+    session. Everything past the session's watermark is new to it, except what the
+    session itself produced (its last turn's records) and the message being sent
+    now (it travels as the user message). If the watermark's fingerprint no longer
+    matches, the history was rewritten under the session — a revised message, a
+    cut, a delete — and the honest move is a fresh session with the full prompt.
+    """
+    seen_count = entry.get("seenCount")
+    if not isinstance(seen_count, int) or seen_count < 0:
+        # No watermark (an entry from before watermarks): treat the session as
+        # having seen everything, which is what the old code assumed.
+        return True, []
+    if seen_count > len(records):
+        return False, []
+    _, fingerprint = history_watermark(records[:seen_count])
+    if str(entry.get("seenFingerprint") or "") != fingerprint:
+        return False, []
+    skip = {turn for turn in (str(entry.get("turnId") or ""), current_turn_id) if turn}
+    delta = [record for record in records[seen_count:] if str(record.get("turnId") or "") not in skip]
+    return True, delta
 
 
 def codex_steerable_progress(progress: ProgressCallback | None) -> ProgressCallback | None:
@@ -9317,8 +9432,10 @@ def run_codex_app_server_turn(
     # resumed thread would hold all of that again from every previous turn. By
     # turn N the branch history is nested N deep and guiding has N copies, the
     # newest buried among superseded ones, which is what standing instructions
-    # stop surviving. Claude runs `--no-session-persistence` for the same reason;
-    # this keeps the two providers on one model of where context lives.
+    # stop surviving. (Claude does resume, but only because its continuation
+    # prompt sends just the new turn plus what the session missed — see
+    # call_claude_chat. Nothing equivalent is wired for Codex threads yet, so
+    # call_codex_chat always sends the full prompt and never passes an id here.)
     resume_thread_id = ""
     thread_start_params: dict[str, Any] = {}
     try:
@@ -9477,6 +9594,7 @@ def call_codex_chat(
     resource_paths: list[str] | None = None,
     progress: ProgressCallback | None = None,
     output_schema: dict[str, Any] | None = None,
+    turn_id: str = "",
 ) -> dict[str, Any]:
     emit_progress(progress, "Checking Codex login")
     status = codex_login_status(root)
@@ -9487,35 +9605,23 @@ def call_codex_chat(
     timeout_seconds = coerce_positive_int(codex_config.get("timeoutSeconds"), 900)
     emit_progress(progress, "Building context prompt")
     guiding = chat_guiding_context(store, branch_id)
-    guiding_inline = chat_guiding_context(store, branch_id, labelled=False)
     writable_dirs = external_writable_dirs(root, approved_external_paths or [])
     live_progress = codex_steerable_progress(progress)
     if live_progress and not codex_app_server_supported(root):
         live_progress = None
-    # Only the app-server transport can resume; `codex exec` reads stdin once and
-    # forgets, so that path always gets the full prompt.
-    key = session_key(
-        branch_id, "chat", "codex", str(codex_config.get("model") or ""), guiding
+    # Every Codex turn is a fresh thread (run_codex_app_server_turn does not
+    # resume; `codex exec` cannot), so every Codex turn gets the full prompt. A
+    # continuation prompt here would tell a thread that has seen nothing that it
+    # already holds the branch — which is what happened once a thread id had been
+    # remembered: turn two arrived with no history at all.
+    resuming = ""
+    prompt = build_chat_prompt(
+        store,
+        branch_id,
+        user_message,
+        approved_external_paths=approved_external_paths,
+        resource_paths=resource_paths,
     )
-    resuming = (
-        remembered_session(root, key)
-        if live_progress and session_continuity_enabled(codex_config)
-        else ""
-    )
-    if resuming:
-        prompt = build_continuation_prompt(
-            store, branch_id, user_message,
-            guiding_context=guiding, guiding_inline=guiding_inline,
-            resource_paths=resource_paths,
-        )
-    else:
-        prompt = build_chat_prompt(
-            store,
-            branch_id,
-            user_message,
-            approved_external_paths=approved_external_paths,
-            resource_paths=resource_paths,
-        )
     if live_progress:
         try:
             raw = run_codex_app_server_turn(
@@ -9530,11 +9636,6 @@ def call_codex_chat(
                 developer_extra=guiding_system_directive(guiding),
                 writable_roots=writable_dirs,
                 resume_thread_id=resuming,
-                on_thread=(
-                    (lambda thread_id: remember_session(root, key, thread_id))
-                    if session_continuity_enabled(codex_config)
-                    else None
-                ),
             )
         except subprocess.TimeoutExpired as exc:
             raise codex_timeout_error("Codex", timeout_seconds) from exc
@@ -10639,18 +10740,35 @@ def call_claude_chat(
     resource_paths: list[str] | None = None,
     progress: ProgressCallback | None = None,
     output_schema: dict[str, Any] | None = None,
+    turn_id: str = "",
 ) -> dict[str, Any]:
     config = read_llm_config(root, branch_id).get("claude", {})
     guiding = chat_guiding_context(store, branch_id)
     guiding_inline = chat_guiding_context(store, branch_id, labelled=False)
     key = session_key(branch_id, "chat", "claude", str(config.get("model") or ""), guiding)
-    resuming = remembered_session(root, key) if session_continuity_enabled(config) else ""
+    continuity = session_continuity_enabled(config)
+    # What the branch says right now, aside from BTW lookups. The user message for
+    # this turn is normally already in it (run_chat_turn records first); it is
+    # passed separately, so the delta leaves it out by turn id.
+    visible = visible_history_records(list(store.iter_history(branch_id)))
+    seen_count, seen_fingerprint = history_watermark(visible)
+    entry = remembered_session_entry(root, key) if continuity else {}
+    resuming = str(entry.get("id") or "")
+    unseen: list[dict[str, Any]] = []
     if resuming:
-        # The session already holds the branch; send only what is new.
+        intact, unseen = continuation_delta(visible, entry, current_turn_id=turn_id)
+        if not intact:
+            # The history was rewritten under this session (revise, cut, delete).
+            # It is holding text the branch no longer says; start over.
+            forget_session(root, key)
+            resuming = ""
+    if resuming:
+        # The session already holds the branch; send only what is new — including
+        # what arrived outside the session since its last turn.
         prompt = build_continuation_prompt(
             store, branch_id, user_message,
             guiding_context=guiding, guiding_inline=guiding_inline,
-            resource_paths=resource_paths,
+            resource_paths=resource_paths, unseen_records=unseen,
         )
         session = (resuming, "resume")
     else:
@@ -10659,7 +10777,7 @@ def call_claude_chat(
             approved_external_paths=approved_external_paths,
             resource_paths=resource_paths,
         )
-        session = (str(uuid.uuid4()), "new") if session_continuity_enabled(config) else None
+        session = (str(uuid.uuid4()), "new") if continuity else None
     writable = str(config.get("sandbox") or DEFAULT_CODEX_SANDBOX) != "read-only"
     result = call_claude_prompt(
         root, prompt, cwd=root, writable=writable,
@@ -10669,7 +10787,10 @@ def call_claude_chat(
         session=session,
     )
     if session:
-        remember_session(root, key, session[0])
+        remember_session(
+            root, key, session[0],
+            turn_id=turn_id, seen_count=seen_count, seen_fingerprint=seen_fingerprint,
+        )
     return result
 
 
@@ -10837,6 +10958,7 @@ def run_chat_turn(
         approved_external_paths=approved_external_paths,
         resource_paths=normalized_resources,
         progress=stream_capturing_progress(stream, progress),
+        turn_id=turn_id,
     )
     orchestration_log = None
     if stream.has_delegations:

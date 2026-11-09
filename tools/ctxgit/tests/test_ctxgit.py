@@ -4525,6 +4525,112 @@ class SessionContinuityTest(unittest.TestCase):
         self.assertTrue(ctxgit.session_continuity_enabled({}))
         self.assertFalse(ctxgit.session_continuity_enabled({"sessionContinuity": False}))
 
+    # --- What the session did not see -------------------------------------------
+    #
+    # Observed on popscraping: three Info chat turns worked out a proposal, then a
+    # Send turn said "그렇게 해서 해줘". The Send session was resumed with the thin
+    # continuation prompt and answered that it could not see any proposal — which
+    # was true. Info chat runs outside the session, so the session's copy of the
+    # branch ended at its own previous turn.
+
+    def _resumed_claude_turn(self, root, store, message, turn_id):
+        """Run call_claude_chat with the provider faked; return the prompt it sent."""
+        seen: dict[str, Any] = {}
+
+        def fake_prompt(root_, prompt, **kwargs):
+            seen["prompt"] = prompt
+            seen["session"] = kwargs.get("session")
+            return {"assistant": "ok", "artifacts": [], "approvalRequests": []}
+
+        original = ctxgit.call_claude_prompt
+        ctxgit.call_claude_prompt = fake_prompt
+        try:
+            store.append_history("b1", "user", message, extra={"turnId": turn_id, "mode": "chat"})
+            ctxgit.call_claude_chat(root, store, "b1", message, turn_id=turn_id)
+            store.append_history(
+                "b1", "assistant", f"ANSWER_TO_{turn_id}", extra={"turnId": turn_id, "provider": "claude"}
+            )
+        finally:
+            ctxgit.call_claude_prompt = original
+        return seen
+
+    def test_a_resumed_send_sees_the_info_chat_answers_it_was_not_part_of(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            ctxgit.write_provider_config(root, {"provider": "claude"})
+            first = self._resumed_claude_turn(root, store, "first send", "turn_1")
+            self.assertEqual(first["session"][1], "new")
+            self.assertIn("EARLIER_TURN", first["prompt"])
+
+            # Outside the session: an Info chat exchange proposes something.
+            store.append_history("b1", "user", "가능한가?", extra={"turnId": "info_1", "mode": "info-chat"})
+            store.append_history(
+                "b1", "assistant", "THE_PROPOSAL: enrichMagazine 를 쓰면 됩니다",
+                extra={"turnId": "info_1", "mode": "info-chat", "provider": "claude"},
+            )
+
+            second = self._resumed_claude_turn(root, store, "그렇게 해서 해줘", "turn_2")
+            self.assertEqual(second["session"][1], "resume", "same session, continued")
+            prompt = second["prompt"]
+            self.assertIn("Continuing the same ctxgit branch", prompt)
+            self.assertIn("THE_PROPOSAL", prompt, "the answer given outside the session")
+            self.assertIn("<history_since_your_last_turn>", prompt)
+            # Still a continuation: nothing the session already holds is repeated.
+            self.assertNotIn("EARLIER_TURN", prompt)
+            self.assertNotIn("ANSWER_TO_turn_1", prompt, "the session wrote this itself")
+            self.assertNotIn("<branch_report>", prompt)
+            # The message being sent travels once, as the user message.
+            self.assertEqual(prompt.count("그렇게 해서 해줘"), 1)
+
+    def test_a_resumed_send_with_nothing_in_between_gets_the_bare_continuation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            ctxgit.write_provider_config(root, {"provider": "claude"})
+            self._resumed_claude_turn(root, store, "first", "turn_1")
+            second = self._resumed_claude_turn(root, store, "second", "turn_2")
+            self.assertEqual(second["session"][1], "resume")
+            self.assertNotIn("<history_since_your_last_turn>", second["prompt"])
+
+    def test_a_rewritten_history_starts_a_fresh_session(self) -> None:
+        # Revise/cut/delete change what the branch says; a session holding the old
+        # text is not continued over it.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            ctxgit.write_provider_config(root, {"provider": "claude"})
+            first = self._resumed_claude_turn(root, store, "first", "turn_1")
+            # The rewrite itself (revise/cut/delete all end here): the file now
+            # says something else where the session was shown EARLIER_TURN.
+            records = list(store.iter_history("b1"))
+            records[0]["text"] = "EARLIER_TURN_REVISED"
+            store.branch_paths("b1").history.write_text(
+                store.serialize_history_records(records), encoding="utf-8"
+            )
+            second = self._resumed_claude_turn(root, store, "second", "turn_2")
+            self.assertEqual(second["session"][1], "new")
+            self.assertNotEqual(second["session"][0], first["session"][0])
+            self.assertIn("EARLIER_TURN_REVISED", second["prompt"], "full prompt, current text")
+
+    def test_an_entry_without_a_watermark_still_resumes(self) -> None:
+        # Stores written before watermarks hold a bare id.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = self._project(tmp)
+            ctxgit.remember_session(root, "k", "sess-old")
+            # Simulate the pre-watermark on-disk shape.
+            path = root.joinpath(*ctxgit.SESSION_STORE_RELPATH)
+            path.write_text(json.dumps({"k": "sess-old"}), encoding="utf-8")
+            self.assertEqual(ctxgit.remembered_session(root, "k"), "sess-old")
+            intact, delta = ctxgit.continuation_delta([{"text": "x"}], ctxgit.remembered_session_entry(root, "k"))
+            self.assertTrue(intact)
+            self.assertEqual(delta, [])
+
+    def test_codex_never_sends_a_continuation_prompt(self) -> None:
+        # Codex threads are not resumed, so a thin prompt would reach a thread
+        # that has seen nothing.
+        source = Path(ctxgit.__file__).read_text(encoding="utf-8")
+        codex_chat = source[source.index("def call_codex_chat("):source.index("def call_codex_history_chat(")]
+        self.assertNotIn("build_continuation_prompt", codex_chat)
+        self.assertIn("build_chat_prompt", codex_chat)
+
 
 class CodexOutputDepthTest(unittest.TestCase):
     """Codex answers short because its models ship that way, not because we asked.
