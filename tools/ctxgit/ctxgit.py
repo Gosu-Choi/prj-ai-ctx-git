@@ -213,6 +213,10 @@ class ChatTimeoutError(RuntimeError):
     pass
 
 
+class ClaudeSessionLostError(RuntimeError):
+    """`--resume` named a session Claude Code no longer has a transcript for."""
+
+
 def codex_timeout_error(what: str, timeout_seconds: int) -> ChatTimeoutError:
     """Every Codex timeout should tell the user which knob to turn.
 
@@ -10080,6 +10084,17 @@ def claude_error_summary(raw: str, stderr: str, returncode: int) -> str:
     return f"Claude Code failed with exit code {returncode}"
 
 
+def claude_session_lost(stdout: str, stderr: str) -> bool:
+    """Whether a resume failed because the session's transcript is gone.
+
+    Claude Code deletes transcripts older than its `cleanupPeriodDays` (30 by
+    default), and a transcript can also be removed by hand or live on another
+    machine. ctxgit's own record of the session id outlives all of those, so a
+    branch left alone for a month comes back holding an id nothing answers to.
+    """
+    return "No conversation found with session ID" in f"{stdout}\n{stderr}"
+
+
 def claude_structured_output_retry_failed(stdout: str, stderr: str) -> bool:
     detail = "\n".join(part for part in [stdout.strip(), stderr.strip()] if part)
     if not detail:
@@ -10293,6 +10308,15 @@ def call_claude_prompt(
     except subprocess.TimeoutExpired as exc:
         raise ChatTimeoutError(f"Claude Code timed out after {timeout_seconds} seconds") from exc
     raw = completed.stdout.strip()
+    if (
+        completed.returncode != 0
+        and session
+        and session[1] == "resume"
+        and claude_session_lost(raw, completed.stderr)
+    ):
+        raise ClaudeSessionLostError(
+            f"Claude Code no longer has session {session[0]}; it cannot be resumed."
+        )
     if completed.returncode != 0 and claude_structured_output_retry_failed(raw, completed.stderr):
         fallback_cmd = build_cmd(strict_schema=False)
         fallback_prompt = "\n".join([
@@ -10779,13 +10803,32 @@ def call_claude_chat(
         )
         session = (str(uuid.uuid4()), "new") if continuity else None
     writable = str(config.get("sandbox") or DEFAULT_CODEX_SANDBOX) != "read-only"
-    result = call_claude_prompt(
-        root, prompt, cwd=root, writable=writable,
-        approved_external_paths=approved_external_paths,
-        progress=progress, output_schema=output_schema,
-        system_extra=guiding_system_directive(guiding),
-        session=session,
-    )
+
+    def run(prompt_text: str, session_arg: tuple[str, str] | None) -> dict[str, Any]:
+        return call_claude_prompt(
+            root, prompt_text, cwd=root, writable=writable,
+            approved_external_paths=approved_external_paths,
+            progress=progress, output_schema=output_schema,
+            system_extra=guiding_system_directive(guiding),
+            session=session_arg,
+        )
+
+    try:
+        result = run(prompt, session)
+    except ClaudeSessionLostError:
+        # The remembered session is gone on Claude Code's side. Left as it was,
+        # the id stays remembered and every later turn on this branch fails the
+        # same way. Nothing is lost by starting over: the branch history is the
+        # record, and the full prompt rebuilds the context from it.
+        forget_session(root, key)
+        emit_progress(progress, "Previous Claude Code session is gone; starting a new one")
+        prompt = build_chat_prompt(
+            store, branch_id, user_message,
+            approved_external_paths=approved_external_paths,
+            resource_paths=resource_paths,
+        )
+        session = (str(uuid.uuid4()), "new")
+        result = run(prompt, session)
     if session:
         remember_session(
             root, key, session[0],

@@ -4610,6 +4610,45 @@ class SessionContinuityTest(unittest.TestCase):
             self.assertNotEqual(second["session"][0], first["session"][0])
             self.assertIn("EARLIER_TURN_REVISED", second["prompt"], "full prompt, current text")
 
+    def test_a_session_claude_code_no_longer_has_starts_a_fresh_one(self) -> None:
+        # Observed on adit-context/docs: the branch sat for a month, Claude Code
+        # cleaned up the transcript, and every Send after that failed with
+        # "Claude Code error: error_during_execution" because the dead id stayed
+        # remembered and was resumed again each time.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp)
+            ctxgit.write_provider_config(root, {"provider": "claude"})
+            first = self._resumed_claude_turn(root, store, "first", "turn_1")
+            calls: list[dict[str, Any]] = []
+
+            def fake_prompt(root_, prompt, **kwargs):
+                calls.append({"prompt": prompt, "session": kwargs.get("session")})
+                if kwargs["session"][1] == "resume":
+                    raise ctxgit.ClaudeSessionLostError("gone")
+                return {"assistant": "ok", "artifacts": [], "approvalRequests": []}
+
+            original = ctxgit.call_claude_prompt
+            ctxgit.call_claude_prompt = fake_prompt
+            try:
+                store.append_history("b1", "user", "second", extra={"turnId": "turn_2", "mode": "chat"})
+                result = ctxgit.call_claude_chat(root, store, "b1", "second", turn_id="turn_2")
+            finally:
+                ctxgit.call_claude_prompt = original
+            self.assertEqual(result["assistant"], "ok")
+            self.assertEqual([c["session"][1] for c in calls], ["resume", "new"])
+            self.assertEqual(calls[0]["session"][0], first["session"][0])
+            self.assertNotEqual(calls[1]["session"][0], first["session"][0])
+            self.assertIn("ANSWER_TO_turn_1", calls[1]["prompt"], "full prompt, not the thin continuation")
+            # The new session is what the branch remembers, so the next turn resumes it.
+            third = self._resumed_claude_turn(root, store, "third", "turn_3")
+            self.assertEqual(third["session"], (calls[1]["session"][0], "resume"))
+
+    def test_a_missing_transcript_is_told_apart_from_other_failures(self) -> None:
+        self.assertTrue(ctxgit.claude_session_lost(
+            "", "No conversation found with session ID: c132df37-0509-4f32-9e2c-665225680b15"
+        ))
+        self.assertFalse(ctxgit.claude_session_lost("", "API Error: 529 Overloaded"))
+
     def test_an_entry_without_a_watermark_still_resumes(self) -> None:
         # Stores written before watermarks hold a bare id.
         with tempfile.TemporaryDirectory() as tmp:
