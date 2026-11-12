@@ -4981,6 +4981,39 @@ class TelegramRemoteTest(unittest.TestCase):
             remote._handle(self._msg("/use alpha", user=7), "t")
             self.assertTrue(sent)
 
+    def test_a_reply_to_a_context_chat_notice_is_answered_not_run(self) -> None:
+        # 11-10: such a reply resolved to the context chat's job key, a turn was
+        # started on it, validate_id raised SystemExit and the poller died.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project(
+                tmp, "TELEGRAM_BOT_TOKEN=t\nTELEGRAM_CHAT_ID=42\nTELEGRAM_ALLOWED_USER_IDS=7\n"
+            )
+            remote, jobs, sent = self._remote(root)
+            with unittest.mock.patch.object(ctxgit, "branch_for_telegram_reply", return_value="__contexts__"):
+                remote._handle(self._msg("이어서 해 줘"), "t")
+            self.assertEqual(jobs.created, [])
+            self.assertTrue(any("컨텍스트 챗" in text for text in sent), sent)
+
+    def test_an_update_that_exits_does_not_end_the_poller(self) -> None:
+        # die() raises CtxgitExit, a SystemExit; the loop must survive it and say so.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project(
+                tmp, "TELEGRAM_BOT_TOKEN=t\nTELEGRAM_CHAT_ID=42\nTELEGRAM_ALLOWED_USER_IDS=7\n"
+            )
+            remote, jobs, sent = self._remote(root)
+            remote._config_root = lambda: root
+            remote._api = lambda token, method, params, timeout=70: {
+                "result": [{"update_id": 5, **self._msg("x")}]
+            }
+
+            def boom(update, token):
+                raise ctxgit.CtxgitExit("invalid branch", 1)
+
+            remote._handle = boom
+            remote._tick()  # must not raise
+            self.assertEqual(remote._offset, 6)
+            self.assertTrue(any("invalid branch" in text for text in sent), sent)
+
     def test_plain_text_is_read_only_and_send_is_the_writable_one(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = self._project(

@@ -1305,6 +1305,9 @@ def job_branch_label(job: dict[str, Any]) -> str:
 #: notification in the chat addresses that branch without naming it. Kept on disk
 #: because the notification usually outlives the server process that sent it.
 TELEGRAM_REPLY_MAP_RELPATH = (".ctxgit", "telegram-replies.json")
+# Job key the context chat (the project-wide chat, not a branch) runs under; its
+# completion notices are recorded in the reply map under this key.
+TELEGRAM_CONTEXT_CHAT_BRANCH = "__contexts__"
 
 
 def telegram_reply_map_path(root: Path) -> Path:
@@ -18313,7 +18316,10 @@ class TelegramRemote:
             try:
                 self._tick()
                 failures = 0
-            except Exception as exc:  # noqa: BLE001 - never take the server down
+            # SystemExit too: die() raises CtxgitExit (a SystemExit), and on 11-10 one
+            # such error escaped `except Exception` and ended this thread for good —
+            # the server stayed up, the remote went silent.
+            except (Exception, SystemExit) as exc:  # noqa: BLE001 - never take the server down
                 failures += 1
                 # Telegram allows one getUpdates at a time and answers a second
                 # caller with 409, so a stray probe (or a second ctxgit) shows up
@@ -18345,13 +18351,20 @@ class TelegramRemote:
             self._offset = max(self._offset, int(update.get("update_id") or 0) + 1)
             try:
                 self._handle(update, token)
-            except Exception as exc:  # noqa: BLE001 - one bad update must not stop the loop
+            except (Exception, SystemExit) as exc:  # noqa: BLE001 - one bad update must not stop the loop
+                reason = str(getattr(exc, "message", "") or exc)[:200]
                 print(
                     f"telegram remote: update {update.get('update_id')} failed "
-                    f"({type(exc).__name__}: {str(exc)[:200]})",
+                    f"({type(exc).__name__}: {reason})",
                     file=sys.stderr,
                     flush=True,
                 )
+                # Say so in the chat too; a message that silently does nothing reads
+                # the same as a dead remote.
+                chat = str(((update.get("message") or update.get("edited_message") or {}).get("chat") or {}).get("id") or "")
+                if chat:
+                    with contextlib.suppress(Exception):
+                        self._say(token, chat, f"처리하지 못했습니다: {reason}")
 
     def _handle(self, update: dict[str, Any], token: str) -> None:
         message = update.get("message") or update.get("edited_message") or {}
@@ -18443,6 +18456,17 @@ class TelegramRemote:
             self._say(token, chat, f"대상: {resolved}")
             return
 
+        if reply_branch == TELEGRAM_CONTEXT_CHAT_BRANCH:
+            # A reply to a context-chat notification maps to the context chat's job
+            # key, which is not a branch; starting a turn on it raised and, before the
+            # loop caught SystemExit, killed the remote (11-10).
+            self._say(
+                token,
+                chat,
+                "컨텍스트 챗 알림에는 답장으로 이어 쓸 수 없습니다. 브라우저에서 이어 가거나 /use <브랜치> 로 브랜치를 고르세요.",
+                reply_to=message_id,
+            )
+            return
         branch = reply_branch or self._targets.get(chat, "")
         if command == "b":
             wanted, _, body = rest.partition(" ")
