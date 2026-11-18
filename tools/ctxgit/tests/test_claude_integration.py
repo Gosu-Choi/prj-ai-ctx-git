@@ -83,6 +83,51 @@ class ClaudeCommandTest(unittest.TestCase):
             self.assertIn("--verbose", cmd)
             self.assertIn("--json-schema", cmd)
 
+    def test_a_writable_turn_waits_in_the_turn_and_has_the_browser(self) -> None:
+        # Measured on a development branch: half of a turn's wall time was
+        # waiting — timer naps (ScheduleWakeup) longer than the deploy, and a
+        # nested `claude -p --chrome` per browser look because the session had none.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp, sandbox="danger-full-access")
+            cmd = self._capture_chat_command(root, store, "b1")
+            denied = cmd[cmd.index("--disallowedTools") + 1].split(",")
+            self.assertIn("ScheduleWakeup", denied)
+            self.assertIn("CronCreate", denied)
+            self.assertIn("--chrome", cmd)
+            self.assertIn("mcp__claude-in-chrome", cmd[cmd.index("--allowedTools") + 1].split(","))
+            system = cmd[cmd.index("--append-system-prompt") + 1]
+            self.assertIn(ctxgit.TURN_PACING_DIRECTIVE.strip(), system)
+            self.assertIn(ctxgit.TURN_CHROME_DIRECTIVE.strip(), system)
+            # Left alone unless asked for.
+            self.assertNotIn("--autocompact", cmd)
+
+    def test_chrome_and_autocompact_are_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp, sandbox="danger-full-access")
+            config_path = root / ".ctxgit" / "config.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["llm"]["claude"].update({"chrome": False, "autocompactTokens": 300000})
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            cmd = self._capture_chat_command(root, store, "b1")
+            self.assertNotIn("--chrome", cmd)
+            self.assertNotIn(
+                ctxgit.TURN_CHROME_DIRECTIVE.strip(), cmd[cmd.index("--append-system-prompt") + 1]
+            )
+            self.assertEqual(cmd[cmd.index("--autocompact") + 1], "300000")
+
+    def test_a_read_only_turn_gets_no_browser(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, store = self._project(tmp, sandbox="read-only")
+            cmd = self._capture_chat_command(root, store, "b1")
+            self.assertNotIn("--chrome", cmd)
+            self.assertNotIn(
+                ctxgit.TURN_PACING_DIRECTIVE.strip(), cmd[cmd.index("--append-system-prompt") + 1]
+            )
+
+    def test_autocompact_never_goes_under_what_the_cli_accepts(self) -> None:
+        self.assertEqual(ctxgit.claude_autocompact_tokens({}), 0)
+        self.assertEqual(ctxgit.claude_autocompact_tokens({"autocompactTokens": 5000}), 100_000)
+
     def test_orchestration_mode_gates_task_agents_and_protocol(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, store = self._project(tmp, orchestration="omc")

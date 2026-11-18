@@ -6364,3 +6364,72 @@ class PointerAnswerTest(unittest.TestCase):
     def test_every_envelope_prompt_forbids_pointing(self) -> None:
         source = Path(ctxgit.__file__).read_text(encoding="utf-8")
         self.assertEqual(source.count("it must carry the answer itself"), 3)
+
+
+class QueuedMessageTest(unittest.TestCase):
+    """A message typed while a turn runs waits, then goes out as a Send."""
+
+    def _jobs(self, tmp: str):
+        root = Path(tmp).resolve()
+        store = ctxgit.ContextStore(root)
+        store.init(create_initial_branch=False)
+        store.create_branch("b1")
+        jobs = ctxgit.JobStore(ctxgit.ProjectState(root))
+        return root, store, jobs
+
+    def test_the_queue_is_ordered_and_survives_a_new_store(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _store, jobs = self._jobs(tmp)
+            first = jobs.queue_message(root, "b1", "one")
+            jobs.queue_message(root, "b1", "two")
+            self.assertEqual([i["text"] for i in jobs.queued_messages(root, "b1")], ["one", "two"])
+            # A restarted server reads the same file.
+            again = ctxgit.JobStore(ctxgit.ProjectState(root))
+            self.assertEqual(again.queued_messages(root)["b1"][0]["id"], first["id"])
+            self.assertEqual(again.take_queued_message(root, "b1")["text"], "one")
+            self.assertEqual(again.take_queued_message(root, "b1", "nope"), None)
+            self.assertEqual(again.take_queued_message(root, "b1")["text"], "two")
+            self.assertFalse((root / ".ctxgit" / "queue.json").exists())
+            with self.assertRaises(ValueError):
+                jobs.queue_message(root, "b1", "   ")
+
+    def test_a_finished_turn_sends_the_next_queued_message_as_a_send(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _store, jobs = self._jobs(tmp)
+            sent: list[tuple[str, str]] = []
+            original = ctxgit.run_chat_turn
+
+            def fake_turn(root_, store_, branch_id, text, **_kwargs):
+                sent.append((branch_id, text))
+                return {"assistant": "ok"}
+
+            ctxgit.run_chat_turn = fake_turn
+            jobs.on_job_done = lambda job: ctxgit.dispatch_queued_message(jobs, job)
+            try:
+                jobs.queue_message(root, "b1", "after this")
+                jobs.queue_message(root, "b1", "and then this")
+                jobs.create("chat", lambda progress: {"assistant": "first"}, root=root, branch="b1", mode="chat")
+                deadline = time.monotonic() + 5
+                while len(sent) < 2 and time.monotonic() < deadline:
+                    time.sleep(0.02)
+            finally:
+                ctxgit.run_chat_turn = original
+            # One at a time, in order, each as its own chat turn.
+            self.assertEqual(sent, [("b1", "after this"), ("b1", "and then this")])
+            self.assertEqual(jobs.queued_messages(root, "b1"), [])
+
+    def test_a_failed_or_side_turn_leaves_the_queue_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _store, jobs = self._jobs(tmp)
+            jobs.queue_message(root, "b1", "still waiting")
+            base = {"branch": "b1", "projectPath": str(root)}
+            self.assertIsNone(ctxgit.dispatch_queued_message(jobs, {**base, "mode": "btw"}))
+            self.assertIsNone(ctxgit.dispatch_queued_message(jobs, {**base, "mode": "research"}))
+
+            def boom(progress):
+                raise RuntimeError("no")
+
+            jobs.on_job_done = lambda job: ctxgit.dispatch_queued_message(jobs, job)
+            jobs.create("chat", boom, root=root, branch="b1", mode="chat")
+            time.sleep(0.2)
+            self.assertEqual([i["text"] for i in jobs.queued_messages(root, "b1")], ["still waiting"])

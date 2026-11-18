@@ -3220,6 +3220,8 @@ function attachProgressPanel() {
 function replaceMessageListHtml(html) {
   els.messageList.innerHTML = html;
   attachProgressPanel();
+  // Every full redraw wipes the queued rows with the rest; put them back.
+  renderQueuedMessages();
 }
 
 function appendMessageListHtml(html) {
@@ -3557,6 +3559,118 @@ function activeBranchRunningJob(branch = activeChatKey()) {
   return job?.status === "running" ? job : null;
 }
 
+// --- Queued messages ------------------------------------------------------
+// A message typed while a turn runs is queued rather than pushed into the turn.
+// It goes out as an ordinary Send when the turn finishes (the server does that,
+// so it works with this tab closed); "Send now" hands it to the running turn at
+// once. Sequence rooms and the contexts chat keep the direct interjection.
+function queuesWhileRunning() {
+  return (
+    !state.activeContextChat &&
+    !isBossChat() &&
+    Boolean(state.activeBranch) &&
+    state.payload?.meta?.kind !== "sequence-room"
+  );
+}
+
+function setQueuedMessages(branch, items) {
+  if (!state.queued) state.queued = {};
+  if (Array.isArray(items) && items.length) state.queued[branch] = items;
+  else delete state.queued[branch];
+  renderQueuedMessages();
+}
+
+function renderQueuedMessages() {
+  els.messageList.querySelectorAll(".queued-message").forEach((node) => node.remove());
+  const branch = state.activeBranch;
+  if (!branch || state.activeContextChat || isBossChat()) return;
+  const items = state.queued?.[branch] || [];
+  if (!items.length) return;
+  const running = Boolean(activeBranchRunningJob(branch));
+  // Below everything, the live progress panel included: these have not been
+  // said yet, so they sit after what is happening now.
+  els.messageList.insertAdjacentHTML(
+    "beforeend",
+    items
+      .map(
+        (item) => `
+      <article class="message message-user queued-message" data-queued-message="${escapeHtml(item.id)}">
+        <div class="message-header">
+          <span class="message-role">user</span>
+          <span class="message-meta-actions">
+            <span class="queued-label">queued</span>
+            <button class="queued-send-now" data-queue-send="${escapeHtml(item.id)}" type="button"
+              title="${running ? "기다리지 않고 지금 도는 턴에 바로 전달합니다" : "지금 Send 로 보냅니다"}">Send now</button>
+            <button class="queued-remove" data-queue-remove="${escapeHtml(item.id)}" type="button"
+              title="보내지 않고 지웁니다" aria-label="Remove queued message">×</button>
+          </span>
+        </div>
+        <div class="message-text">${renderMessageText(item.text)}</div>
+      </article>`,
+      )
+      .join(""),
+  );
+}
+
+async function queueComposerMessage(branch, text) {
+  try {
+    const payload = await api("/api/queue/add", {
+      method: "POST",
+      body: JSON.stringify({ branch, text }),
+    });
+    clearDraft(branch);
+    els.messageInput.value = "";
+    resizeMessageInput();
+    setQueuedMessages(branch, payload.queued || []);
+    updateComposerState();
+    if (activeChatKey() === branch) scrollChatToBottom();
+  } catch (error) {
+    showChatError(`Queue 실패: ${error.message}`);
+  }
+}
+
+els.messageList.addEventListener("click", async (event) => {
+  const sendButton = event.target.closest("[data-queue-send]");
+  const removeButton = event.target.closest("[data-queue-remove]");
+  if (!sendButton && !removeButton) return;
+  event.preventDefault();
+  const branch = state.activeBranch;
+  if (!branch) return;
+  const button = sendButton || removeButton;
+  button.disabled = true;
+  try {
+    if (removeButton) {
+      const payload = await api("/api/queue/remove", {
+        method: "POST",
+        body: JSON.stringify({ branch, id: removeButton.dataset.queueRemove }),
+      });
+      setQueuedMessages(branch, payload.queued || []);
+      return;
+    }
+    const payload = await api("/api/queue/send-now", {
+      method: "POST",
+      body: JSON.stringify({ branch, id: sendButton.dataset.queueSend }),
+    });
+    setQueuedMessages(branch, payload.queued || []);
+    if (payload.delivery === "started" && payload.job?.id) {
+      const remembered = rememberJob(payload.job, { branch, mode: "chat" });
+      monitorTrackedJob(remembered.id).catch((error) => handleMonitorError(remembered, error));
+    } else {
+      els.progressTitle.textContent = "끼어들기 전달됨";
+    }
+    if (activeChatKey() === branch) {
+      renderBranch(await api(`/api/branch?id=${encodeURIComponent(branch)}`));
+      updateComposerState();
+      scrollChatToBottom();
+    }
+  } catch (error) {
+    showChatError(`Send now 실패: ${error.message}`);
+    rehydrateRunningJobs().catch(() => {});
+  } finally {
+    button.disabled = false;
+  }
+});
+
 async function interjectSequenceRoom(branch, job) {
   const text = els.messageInput.value.trim();
   if (!text) return;
@@ -3670,7 +3784,9 @@ function updateComposerState() {
     ? "Archived"
     : running
       ? els.messageInput.value.trim()
-        ? "Interrupt"
+        ? queuesWhileRunning()
+          ? "Queue"
+          : "Interrupt"
         : "Stop"
       : "Send";
   els.contextResetButton.textContent = busyMode === "context-chat" ? "Busy" : "Reset";
@@ -4477,6 +4593,11 @@ async function rehydrateRunningJobs() {
     return;
   }
   state.jobsRehydrated = true;
+  const queuedNow = data.queued && typeof data.queued === "object" ? data.queued : {};
+  if (JSON.stringify(queuedNow) !== JSON.stringify(state.queued || {})) {
+    state.queued = queuedNow;
+    renderQueuedMessages();
+  }
   let changed = false;
   for (const job of data.jobs || []) {
     if (!job.id || !job.branch) continue;
@@ -7032,6 +7153,10 @@ async function sendComposerMessage({ mode, runningAction = "stop", stopWhenEmpty
       }
       if (isSequenceRoom) {
         await interjectSequenceRoom(branch, runningJob);
+        return;
+      }
+      if (queuesWhileRunning()) {
+        await queueComposerMessage(branch, text);
         return;
       }
       try {

@@ -1102,6 +1102,54 @@ button.section-toggle[aria-expanded="false"] .section-toggle-caret {
   background: #fbfbf8;
 }
 
+/* Queued while a turn runs: not said yet, so it reads fainter than what was. */
+.message.queued-message {
+  opacity: 0.55;
+  border-style: dashed;
+  transition: opacity 120ms ease;
+}
+
+.message.queued-message:hover,
+.message.queued-message:focus-within {
+  opacity: 0.9;
+}
+
+.queued-label {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.queued-send-now,
+.queued-remove {
+  padding: 3px 10px;
+  border: 1px solid currentColor;
+  border-radius: 5px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.queued-remove {
+  padding: 3px 7px;
+  border-color: transparent;
+}
+
+.queued-send-now:hover {
+  background: #f4f4f5;
+  color: #17181c;
+}
+
+.queued-send-now:disabled,
+.queued-remove:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 /* Your own messages: black background, white text, to stand out from agents. */
 .message-user {
   background: #17181c;

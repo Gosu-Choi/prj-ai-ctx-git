@@ -8972,6 +8972,31 @@ def terminate_process_tree(process: "subprocess.Popen[str]") -> None:
         process.kill()
 
 
+def keep_awake_while(process: "subprocess.Popen[str]") -> None:
+    """Hold off macOS idle sleep for as long as a provider process is alive.
+
+    ctxgit is the tool you start and walk away from, and walking away is what lets
+    the Mac idle-sleep: a turn then freezes mid-request ("Connection lost while
+    your computer was asleep"), wakes for a moment every ~15 minutes, and a
+    40-minute job takes seven hours. `caffeinate -w` exits on its own when the
+    process does, so there is nothing to clean up. Best effort — a missing
+    binary or a non-mac host must never fail the turn.
+    """
+    if sys.platform != "darwin":
+        return
+    binary = shutil.which("caffeinate")
+    if not binary:
+        return
+    with contextlib.suppress(OSError, ValueError):
+        subprocess.Popen(
+            [binary, "-i", "-s", "-w", str(process.pid)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+
 def run_process_with_progress(
     cmd: list[str],
     cwd: Path,
@@ -9000,6 +9025,7 @@ def run_process_with_progress(
         # Its own process group, so cancelling can reach the whole tree.
         start_new_session=os.name != "nt",
     )
+    keep_awake_while(process)
     events: queue.Queue[tuple[str, str | None]] = queue.Queue()
 
     def reader(name: str, pipe: Any) -> None:
@@ -9386,6 +9412,7 @@ def run_codex_app_server_turn(
         bufsize=1,
         start_new_session=os.name != "nt",
     )
+    keep_awake_while(process)
     events: queue.Queue[tuple[str, str | None]] = queue.Queue()
 
     def reader(name: str, pipe: Any) -> None:
@@ -10125,6 +10152,14 @@ def claude_structured_output_retry_failed(stdout: str, stderr: str) -> bool:
 #: allowlist into the equivalent denylist — `--tools` would express the same
 #: restriction in one flag, but it also drops MCP tools (see
 #: claude_disallowed_tools), so the restriction has to be stated the long way.
+#: Tools that make a turn wait on a timer instead of on the thing it is waiting
+#: for. Measured on a real branch (2026-11): the agent parked 25 deploy waits on
+#: ScheduleWakeup at 20-30 minutes each for deploys that take 6-10, and a turn
+#: that ended with a wakeup still pending lost it — ctxgit closes the process on
+#: the result, so the promised check never ran. A `-p` turn has nobody to come
+#: back to; it waits by polling in the foreground (see TURN_PACING_DIRECTIVE).
+CLAUDE_TURN_PARKING_TOOLS = ("ScheduleWakeup", "CronCreate")
+
 CLAUDE_BUILTIN_TOOLS = [
     "Read", "Glob", "Grep",
     "Edit", "Write", "Bash", "NotebookEdit", "KillShell", "BashOutput",
@@ -10165,8 +10200,56 @@ def claude_disallowed_tools(*, writable: bool, web_search: bool, subagents: bool
         disallowed.extend(["WebSearch", "WebFetch"])
     if not subagents:
         disallowed.append("Task")
+    disallowed.extend(CLAUDE_TURN_PARKING_TOOLS)
     disallowed.extend(SUPERSEDED_HOST_MCP_SERVERS)
     return ",".join(disallowed)
+
+
+#: How a writable Claude turn spends its waiting time. Kept apart from
+#: ctxgit_runtime_directive, which is the cross-provider contract; this one is
+#: about Claude Code's own tools. Each sentence answers a measured loss on a real
+#: development branch: timer naps longer than the deploy, commands auto-moved to
+#: the background at the 10-minute Bash cap, turns that ended on "queued, will
+#: check" with no one left to check, and a nested `claude -p --chrome` spawned for
+#: every browser look (2-8 minutes each) because the session had no browser.
+TURN_PACING_DIRECTIVE = (
+    " Nobody is at the keyboard and this process ends with your final answer, so"
+    " nothing scheduled for later will run. When you wait on CI, a merge, a deploy"
+    " or any job you started, wait for it inside this turn: poll the real signal"
+    " (a version endpoint, `gh pr view`, a log file) every 15-20 seconds in a"
+    " foreground Bash command and keep each single command under 9 minutes — a"
+    " command that runs longer is moved to the background and you lose the direct"
+    " result; if the wait is not over, issue the next polling command. Do useful"
+    " work in the gaps, but do not finish the turn while something you launched and"
+    " mean to verify is still pending. Collect fixes and ship them in one push"
+    " rather than one release per fix."
+)
+
+TURN_CHROME_DIRECTIVE = (
+    " The user's Chrome is attached to this session (mcp__claude-in-chrome__*"
+    " tools, loaded through ToolSearch). To look at a page, use those tools"
+    " directly; do not spawn a nested `claude -p` for browser checks."
+)
+
+
+def claude_chrome_enabled(claude_config: dict[str, Any], *, writable: bool) -> bool:
+    """Whether a turn gets `--chrome`. On for writable turns unless switched off.
+
+    Read-only turns stay without it: a browser signed in as the user is a way to
+    act on the outside world, which is what read-only promises not to do.
+    """
+    return writable and claude_config.get("chrome") is not False
+
+
+def claude_autocompact_tokens(claude_config: dict[str, Any]) -> int:
+    """`llm.claude.autocompactTokens`, or 0 to leave Claude Code's own default.
+
+    A branch session is resumed for weeks; on a 1M-context model it otherwise
+    grows to ~960k tokens before compacting, and every request in the turn pays
+    for that. Claude Code refuses values under 100k.
+    """
+    value = coerce_nonnegative_int(claude_config.get("autocompactTokens"), 0)
+    return max(value, 100_000) if value else 0
 
 
 def call_claude_prompt(
@@ -10207,9 +10290,19 @@ def call_claude_prompt(
     active_exts = active_extensions()
     allowed_names = active_extension_mcp_tool_names()
     allowed_tools = ",".join([tools, *allowed_names]) if allowed_names else tools
+    if claude_chrome_enabled(config, writable=writable):
+        # Under the auto permission mode an unlisted MCP tool waits on a prompt
+        # nobody can answer; naming the server allows all of its tools.
+        allowed_tools += ",mcp__claude-in-chrome"
     system_prompt = (
         ctxgit_runtime_directive(writable=writable) + RECORD_VOICE_SYSTEM_DIRECTIVE
     )
+    chrome = claude_chrome_enabled(config, writable=writable)
+    if writable:
+        system_prompt += TURN_PACING_DIRECTIVE
+    if chrome:
+        system_prompt += TURN_CHROME_DIRECTIVE
+    autocompact_tokens = claude_autocompact_tokens(config)
     if active_exts:
         names = ", ".join(f"{ext.NAME} (mcp__{ext.ID}__*)" for ext in active_exts)
         system_prompt += (
@@ -10254,6 +10347,10 @@ def call_claude_prompt(
             command.extend(["--resume", session_id] if session_mode == "resume" else ["--session-id", session_id])
         else:
             command.append("--no-session-persistence")
+        if chrome:
+            command.append("--chrome")
+        if autocompact_tokens:
+            command.extend(["--autocompact", str(autocompact_tokens)])
         command.extend([
             "--permission-mode", claude_permission_mode(config, writable=writable),
             "--allowedTools", allowed_tools,
@@ -15043,6 +15140,77 @@ class ReusableThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPS
     allow_reuse_address = True
 
 
+def start_chat_job(
+    jobs: "JobStore",
+    root: Path,
+    store: "ContextStore",
+    branch_id: str,
+    text: str,
+    *,
+    provider: str | None = None,
+    resources: list[str] | None = None,
+) -> dict[str, Any]:
+    """Start an ordinary Send turn on a branch. One path for the composer and the queue."""
+    if provider == "codex-worker" or (jobs.prefer_worker and provider in {None, "codex"}):
+        return jobs.create_worker(
+            "chat",
+            {
+                "kind": "chat",
+                "mode": "chat",
+                "branch": branch_id,
+                "text": text,
+                "provider": provider,
+                "resources": resources or [],
+            },
+            root=root,
+        )
+
+    def work(progress: ProgressCallback) -> dict[str, Any]:
+        return run_chat_turn(
+            root,
+            store,
+            branch_id,
+            text,
+            provider=provider,
+            resource_paths=resources or [],
+            progress=progress,
+        )
+
+    return jobs.create("chat", work, root=root, branch=branch_id, mode="chat")
+
+
+#: Turns after which the next queued message goes out. A BTW aside or a research
+#: run finishing says nothing about whether the branch's conversation is free.
+QUEUE_ADVANCING_MODES = {"chat", "info-chat"}
+
+
+def dispatch_queued_message(jobs: "JobStore", job: dict[str, Any]) -> dict[str, Any] | None:
+    """After a turn finishes, send the branch's oldest queued message as a Send.
+
+    Only a turn that finished cleanly advances the queue: after a stop or a
+    failure the user is looking at something unexpected, and firing the next
+    message into that would act on a state they have not seen. What is queued
+    stays queued, with "Send now" on it.
+    """
+    branch_id = str(job.get("branch") or "")
+    project_path = str(job.get("projectPath") or "")
+    if not branch_id or not project_path or str(job.get("mode") or "") not in QUEUE_ADVANCING_MODES:
+        return None
+    root = Path(project_path).expanduser().resolve()
+    if any(str(other.get("branch") or "") == branch_id for other in jobs.running_jobs(root)):
+        return None
+    item = jobs.take_queued_message(root, branch_id)
+    if not item:
+        return None
+    try:
+        store = ContextStore(root)
+        provider = branch_provider_authority(root, branch_id, None)
+        return start_chat_job(jobs, root, store, branch_id, str(item.get("text") or ""), provider=provider)
+    except BaseException:
+        jobs.requeue_message(root, branch_id, item)
+        raise
+
+
 class JobStore:
     def __init__(self, project_state: ProjectState, prefer_worker: bool = False) -> None:
         self._project_state = project_state
@@ -15050,6 +15218,82 @@ class JobStore:
         self._lock = threading.RLock()
         self._jobs: dict[str, dict[str, Any]] = {}
         self._workers: dict[str, dict[str, Any]] = {}
+        #: Called with the job after a turn finishes cleanly; the server uses it
+        #: to send the next queued message (see dispatch_queued_message).
+        self.on_job_done: Callable[[dict[str, Any]], None] | None = None
+
+    # -- queued messages ---------------------------------------------------
+    # A message typed while a turn runs waits here instead of being pushed into
+    # the turn. It is sent as an ordinary Send when the turn finishes, or handed
+    # to the running turn early when the user presses "Send now". Kept on disk so
+    # a server restart does not silently drop what the user thought was lined up.
+
+    @staticmethod
+    def _queue_path(root: Path) -> Path:
+        return root / ".ctxgit" / "queue.json"
+
+    def _read_queue_locked(self, root: Path) -> dict[str, list[dict[str, Any]]]:
+        try:
+            data = json.loads(self._queue_path(root).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {
+            str(branch): [item for item in items if isinstance(item, dict) and item.get("id")]
+            for branch, items in data.items()
+            if isinstance(items, list)
+        }
+
+    def _write_queue_locked(self, root: Path, data: dict[str, list[dict[str, Any]]]) -> None:
+        path = self._queue_path(root)
+        cleaned = {branch: items for branch, items in data.items() if items}
+        if not cleaned:
+            with contextlib.suppress(OSError):
+                path.unlink()
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + ".tmp")
+        temporary.write_text(json.dumps(cleaned, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(temporary, path)
+
+    def queued_messages(self, root: Path, branch: str | None = None) -> Any:
+        """All queued messages by branch, or one branch's list."""
+        with self._lock:
+            data = self._read_queue_locked(root)
+        return data if branch is None else data.get(branch, [])
+
+    def queue_message(self, root: Path, branch: str, text: str) -> dict[str, Any]:
+        text = str(text or "").strip()
+        if not text:
+            raise ValueError("message is required")
+        item = {"id": uuid.uuid4().hex[:12], "text": text, "createdAt": utc_now()}
+        with self._lock:
+            data = self._read_queue_locked(root)
+            data.setdefault(branch, []).append(item)
+            self._write_queue_locked(root, data)
+        return item
+
+    def take_queued_message(
+        self, root: Path, branch: str, item_id: str | None = None
+    ) -> dict[str, Any] | None:
+        """Remove and return one queued message: the named one, or the oldest."""
+        with self._lock:
+            data = self._read_queue_locked(root)
+            items = data.get(branch) or []
+            for index, item in enumerate(items):
+                if item_id is None or item.get("id") == item_id:
+                    taken = items.pop(index)
+                    self._write_queue_locked(root, data)
+                    return taken
+        return None
+
+    def requeue_message(self, root: Path, branch: str, item: dict[str, Any]) -> None:
+        """Put a taken message back at the front (its send did not go through)."""
+        with self._lock:
+            data = self._read_queue_locked(root)
+            data.setdefault(branch, []).insert(0, item)
+            self._write_queue_locked(root, data)
 
     def new_job_id(self) -> str:
         job_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
@@ -15117,6 +15361,11 @@ class JobStore:
                     job.setdefault("events", []).append({"message": "완료됨", "createdAt": job["updatedAt"]})
                     self.persist_locked(job)
                 notify_job_completion_telegram(job)
+                if self.on_job_done:
+                    # A queued message must never turn a finished turn into a
+                    # failed one, so whatever goes wrong here stays here.
+                    with contextlib.suppress(Exception):
+                        self.on_job_done(job)
             except ChatTimeoutError as exc:
                 self.fail(job_id, "timeout", str(exc))
             except JobCancelledError:
@@ -15512,6 +15761,7 @@ def make_handler(
         active_root = None
     registry = project_registry or ServerProjectRegistry(active_root)
     jobs = JobStore(project_state, prefer_worker=prefer_worker)
+    jobs.on_job_done = lambda job: dispatch_queued_message(jobs, job)
     worker_token = worker_token or os.environ.get("CTXGIT_WORKER_TOKEN", "")
     auth_store = AuthStore(auth_root or active_root or TOOL_REPO_ROOT)
 
@@ -15984,7 +16234,8 @@ def make_handler(
                             # A BTW aside is the asking panel's own job; a page
                             # that adopted it would show the branch as busy.
                             if str(job.get("mode") or "") != "btw"
-                        ]
+                        ],
+                        "queued": jobs.queued_messages(root),
                     }
                 )
                 return True
@@ -17555,6 +17806,69 @@ def make_handler(
                 except Exception as exc:
                     self.send_json({"error": "research_failed", "message": str(exc)}, status=500)
                 return
+            if parsed.path == "/api/queue/add":
+                branch_id = str(body.get("branch") or "").strip()
+                text = str(body.get("text") or "").strip()
+                if not branch_id or not text:
+                    self.send_json({"error": "message_required"}, status=400)
+                    return
+                item = jobs.queue_message(root, branch_id, text)
+                self.send_json({"item": item, "queued": jobs.queued_messages(root, branch_id)})
+                return
+            if parsed.path == "/api/queue/remove":
+                branch_id = str(body.get("branch") or "").strip()
+                jobs.take_queued_message(root, branch_id, str(body.get("id") or ""))
+                self.send_json({"queued": jobs.queued_messages(root, branch_id)})
+                return
+            if parsed.path == "/api/queue/send-now":
+                # "Send now" does not wait for the turn: a running turn hears the
+                # message immediately (an interjection); with nothing running it
+                # simply starts the Send it was waiting to become.
+                branch_id = str(body.get("branch") or "").strip()
+                item = jobs.take_queued_message(root, branch_id, str(body.get("id") or ""))
+                if not item:
+                    self.send_json(
+                        {"error": "queue_item_not_found", "message": "이미 보내졌거나 지워진 메시지입니다.",
+                         "queued": jobs.queued_messages(root, branch_id)},
+                        status=404,
+                    )
+                    return
+                text = str(item.get("text") or "")
+                running = [
+                    job for job in jobs.running_jobs(root)
+                    if str(job.get("branch") or "") == branch_id and str(job.get("mode") or "") != "btw"
+                ]
+                try:
+                    if running:
+                        job_id = str(running[0].get("id") or "")
+                        result = jobs.interject(job_id, text, root=root)
+                        if result.get("error") == "job_not_running":
+                            running = []
+                        elif result.get("error"):
+                            raise RuntimeError(str(result.get("message") or result.get("error")))
+                        else:
+                            with contextlib.suppress(Exception):
+                                store.append_history(
+                                    branch_id, "user", text,
+                                    extra={"interjection": True, "jobId": job_id},
+                                )
+                            self.send_json(
+                                {"delivery": "interjected", "job": result,
+                                 "queued": jobs.queued_messages(root, branch_id)}
+                            )
+                            return
+                    provider = branch_provider_authority(root, branch_id, None)
+                    started = start_chat_job(jobs, root, store, branch_id, text, provider=provider)
+                except (Exception, SystemExit) as exc:
+                    jobs.requeue_message(root, branch_id, item)
+                    self.send_json({"error": "queue_send_failed", "message": str(exc)}, status=400)
+                    return
+                self.send_json(
+                    {"delivery": "started", "job": started,
+                     "queued": jobs.queued_messages(root, branch_id)},
+                    status=202,
+                )
+                return
             if parsed.path == "/api/chat/start":
                 branch_id = str(body.get("branch") or "")
                 text = str(body.get("text") or "").strip()
@@ -17580,36 +17894,12 @@ def make_handler(
 
                     self.send_json(jobs.create("sequence-room", sequence_work, root=root, branch=branch_id, mode="sequence-room"), status=202)
                     return
-                if provider == "codex-worker" or (jobs.prefer_worker and provider in {None, "codex"}):
-                    self.send_json(
-                        jobs.create_worker(
-                            "chat",
-                            {
-                                "kind": "chat",
-                                "mode": "chat",
-                                "branch": branch_id,
-                                "text": text,
-                                "provider": provider,
-                                "resources": resources,
-                            },
-                            root=root,
-                        ),
-                        status=202,
-                    )
-                    return
-
-                def work(progress: ProgressCallback) -> dict[str, Any]:
-                    return run_chat_turn(
-                        root,
-                        store,
-                        branch_id,
-                        text,
-                        provider=provider,
-                        resource_paths=resources,
-                        progress=progress,
-                    )
-
-                self.send_json(jobs.create("chat", work, root=root, branch=branch_id, mode="chat"), status=202)
+                self.send_json(
+                    start_chat_job(
+                        jobs, root, store, branch_id, text, provider=provider, resources=resources
+                    ),
+                    status=202,
+                )
                 return
             if parsed.path in {"/api/history-chat/start", "/api/info-chat/start"}:
                 branch_id = str(body.get("branch") or "")
